@@ -1,0 +1,38 @@
+[streaming]
+encoder_full_range = false
+bitrate_mbps = 50
+resolution_scale = 1.0
+video_codec = "h265"
+encoder_preset = "balanced"
+passthrough_enabled = true
+app_alpha_blend_passthrough = true
+[logging]
+file_logging = true
+
+pacing_spin_ms = 0
+
+pacing_thread = "realtime"
+
+foveated_encoding_preset = "medium_plus"
+
+abr_mode = "off"
+
+refresh_rate_hz = 90
+
+render_device = "steam_frame_native"
+# VideoToolbox low-latency rate control: an option, off here. Measured slower live on our stream (encode callback
+# p50 8.7 vs 7.4 ms, 2026-10-24), faster in a sole-stream encoder bench; it also needs a per-frame range conversion.
+encoder_low_latency = false
+encoder_min_qp = 12
+foveation_box_filter = false
+pose_prediction = "fixed"
+pose_prediction_horizon_ms = 0.005
+pose_prediction_position_scale = 1.0
+send_pacing_ms = 3
+send_pacing_keyframe_ms = 8
+keyframe_interval_sec = 10
+pacing_lock_wait_ms = 16
+# Fetch lock (runtime 0039/0040, v1 fold-in 2026-10-28): steer by the age of the newest tracking sample at pose fetch,
+# not the queue wait. About 7 ms less head-to-photon at 90 Hz on the stand (about 48 against 52 ms); no change at 80.
+pacing_lock_on = "tracking"
+pacing_lock_age_ms = 3

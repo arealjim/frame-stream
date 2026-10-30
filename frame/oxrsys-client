@@ -1,0 +1,61 @@
+#!/bin/bash
+# OXRSys Steam Frame client as a systemd user unit (installed at ~/.local/bin/oxrsys-client by frame/install.sh).
+# Environment knobs are passed through when set:
+#   FRAME_CLIENT_DECODER=hevc_v4l2m2m      hardware decode, the default since 2026-10-22 (software hevc keeps up with about
+#                                          45 fps, and the socket backs up behind it into seconds of lag); hevc = software
+#   FRAME_CLIENT_THREADS=<n>               software-decode threads
+#   FRAME_CLIENT_DUMP_DECODED=<path.ppm>   write decoded frame 200 (off-head picture check)
+#   FRAME_CLIENT_TEST_DROP_CONNECT=<n>     swallow the first n ClientConnect sends (tests the resend path)
+#   FRAME_CLIENT_APP_GONE_S=<s>            go back to SteamVR home after s seconds with no video once it had started (default 20, 0 = off)
+#   FRAME_CLIENT_BLACK_PASSTHROUGH_S=<s>   show the passthrough after s seconds with no real picture, until the next one (default 2, 0 = off)
+#   FRAME_CLIENT_RGBA=1                    force the CPU sws RGBA path instead of NV12-on-the-GPU (A/B)
+#   FRAME_CLIENT_PASSTHROUGH="F DOWN BASE D"   render from the passthrough cameras through its plane (patch 0011);
+#                                          live: the file frame-passthrough in $XDG_RUNTIME_DIR (see frame-stream passthrough)
+#   FRAME_CLIENT_DUMP=1                    one swapchain readback (frame_client_eye0.rgba) + the first decoded frame
+#                                          (frame_client_decoded.nv12), both into $XDG_RUNTIME_DIR (patch 0016; was /tmp)
+#   FRAME_CLIENT_DUMP_FRAMES=<n>           n consecutive fresh frames' luma + pts to $XDG_RUNTIME_DIR/frame-dump.{bin,pts}
+#   FRAME_CLIENT_VIDEO_STALL_S=<s>         video watchdog (patch 0031): s seconds with no new video while datagrams sit unread
+#                                          reconnects; a stuck receive thread exits 4 and this unit restarts it (default 2; 0 = off)
+#   FRAME_CLIENT_RECONNECT_S=<s>           reconnect when the server announces again while we are connected (it restarted, or
+#                                          dropped us after 3 s without tracking), when the USB link closes, or when no video
+#                                          at all arrives within s seconds of a connect (default 5; 0 = reconnect off: the
+#                                          last frame stays up for ever). An idle server (no app) is left alone. The search
+#                                          gives up after 600 s; frame-stream down stops the client at any point (patch 0016, M4)
+# Live tuning files (frame-predict-ms, frame-passthrough, frame-stamp-lead-ms) are read from $XDG_RUNTIME_DIR
+# (/run/user/1000 on the Frame), then /dev/shm as a fallback that is honoured only when the file is a regular file
+# owned by the client's own user (patch 0016, review M11).
+#   FRAME_CLIENT_SYNC_GPU=1                wait the GPU every frame (fallback; default keeps two frames in flight)
+#   FRAME_CLIENT_FULL_RANGE=0/1            convert the stream as limited/full range (frame-stream sets it from the Mac config)
+#   FRAME_CLIENT_PREDICT_MS=<ms>           pose prediction horizon (default 0 = off since 2026-10-22; patch 0018 made 0 the binary default too)
+#   FRAME_CLIENT_STAMP_POS_LIVE=0/1        stamp the displayed eye position (default 1; 0 = the render position, planar warp)
+#   FRAME_CLIENT_SRGB_LINEARIZE=0/1        1 (default) = linearise the gamma video before the sRGB swapchain's own encode; 0 = the
+#                                          double-encoded picture of before 2026-10-21 (lifted blacks), for an A/B wear
+#   FRAME_CLIENT_ACCEPT_ANY_SOURCE=1       accept video datagrams from any address, not only the server's (default: server only)
+#   FRAME_CLIENT_PREDICT_DEADBAND="v0 v1"   head speed (m/s) below which the horizon is 0 and above which it is full (default "0 0" = off since 2026-10-21)
+#                                          (default 0.02 0.12, patch 0012; "0 0" = always the full horizon)
+#   FRAME_CLIENT_PREDICT_POS_MS=<ms>       with PREDICT_POS=0: extrapolate the position that far by a low-passed velocity
+#                                          (FRAME_CLIENT_PREDICT_POS_TAU_MS, default 100; patch 0014); 0 = position at now
+#   FRAME_CLIENT_PREDICT_POS=0/1           0 = orientation only, the position sampled now (default since the 2026-10-20
+#                                          wear, patch 0013; the warp corrects rotation, never position); 1 = predict both
+# Every FRAME_CLIENT_* variable in the environment is forwarded into the unit.
+case "$1" in
+  start) shift
+      export FRAME_CLIENT_DECODER=${FRAME_CLIENT_DECODER:-hevc_v4l2m2m}
+      # Prediction off (worn, 2026-10-22): 40 ms made head-locked content jitter at rest; at 0 the chart is still
+      # and fast turns are clean, the rate lock having fixed what prediction was for.
+      export FRAME_CLIENT_PREDICT_MS=${FRAME_CLIENT_PREDICT_MS:-0}
+      setenv=()
+      while IFS= read -r kv; do setenv+=("--setenv=$kv"); done < <(env | grep '^FRAME_CLIENT_')
+      # Exit status 4 is the client's video watchdog finding its receive thread stuck (patch 0031): restart on that
+      # status only, never on a plain exit or a failed start, and at most 5 times a minute.
+      systemd-run --user --unit=oxrsys-client --collect -p Slice=session.slice \
+      -p RestartForceExitStatus=4 -p RestartSec=1 -p StartLimitIntervalSec=60 -p StartLimitBurst=5 \
+      --property=EnvironmentFile=/usr/share/deckard/mesavars.sh \
+      --setenv=LD_LIBRARY_PATH=/opt/steamvr/bin/linuxarm64 --setenv=DISPLAY=:0 \
+      "${setenv[@]}" \
+      "$HOME/games/oxrsys/launch-oxrsys-client" "$@" ;;
+  stop) systemctl --user stop oxrsys-client ;;
+  status) systemctl --user status oxrsys-client --no-pager | head -8 ;;
+  log) shift; journalctl --user -u oxrsys-client --no-pager --output=cat "$@" ;;
+  *) echo "usage: oxrsys-client start <server-ip>|stop|status|log [-f|-n N]"; exit 2 ;;
+esac

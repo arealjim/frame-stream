@@ -1,0 +1,75 @@
+From 846ac4a0644807902e3a0581e2ef27829fd08fc1 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 21:07:01 +0000
+Subject: [PATCH] Config: fork the adb children with signals blocked and
+ handlers reset, so a SIGTERM before exec cannot run the parent's handlers in
+ the child (2 child crashes in 250 logcat-test runs,
+ _os_unfair_lock_corruption_abort)
+
+---
+ runtime/src/Config.cpp | 33 +++++++++++++++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index d5021fc..c1e84c8 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -16,6 +16,7 @@
+ #include <thread>
+ 
+ #include <fcntl.h>
++#include <pthread.h>
+ #include <signal.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
+@@ -144,9 +145,37 @@ void TerminateProcessGroup(pid_t pid)
+     }
+ }
+ 
+-bool RunAdbLogcatClear(const std::string& adbPath, std::chrono::milliseconds timeout)
++// fork() for a child that only execs. Every signal stays blocked across the fork and the child puts each handler back
++// to the default before it unblocks: otherwise a SIGTERM that lands before exec runs the parent's handlers (Catch's,
++// an engine's crash reporter) inside the child while malloc's fork-child locks are still being reset - 2 in 250 runs
++// of the logcat test on 2026-10-25, _os_unfair_lock_corruption_abort in an orphaned oxrsys_runtime_tests.
++pid_t ForkForExec()
+ {
++    sigset_t all;
++    sigset_t old;
++    sigfillset(&all);
++    pthread_sigmask(SIG_SETMASK, &all, &old);
+     const pid_t pid = fork();
++    if (pid == 0)
++    {
++        struct sigaction dfl = {};
++        dfl.sa_handler = SIG_DFL;
++        sigemptyset(&dfl.sa_mask);
++        for (int sig = 1; sig < NSIG; ++sig)
++        {
++            if (sig != SIGKILL && sig != SIGSTOP)
++            {
++                sigaction(sig, &dfl, nullptr);
++            }
++        }
++    }
++    pthread_sigmask(SIG_SETMASK, &old, nullptr);
++    return pid;
++}
++
++bool RunAdbLogcatClear(const std::string& adbPath, std::chrono::milliseconds timeout)
++{
++    const pid_t pid = ForkForExec();
+     if (pid < 0)
+     {
+         return false;
+@@ -892,7 +921,7 @@ void Config::StartLogcatCapture()
+         return;
+     }
+ 
+-    const pid_t pid = fork();
++    const pid_t pid = ForkForExec();
+     if (pid < 0)
+     {
+         spdlog::warn("Failed to fork adb logcat capture");
+-- 
+2.50.1 (Apple Git-155)
+

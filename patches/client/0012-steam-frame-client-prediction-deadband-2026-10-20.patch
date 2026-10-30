@@ -1,0 +1,71 @@
+From 416e6ee5d6f90e6a6af5e29b05a1e0198456d753 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 21:09:50 +0000
+Subject: [PATCH] steam-frame client: velocity deadband on the prediction
+ horizon - zero below 0.02 m/s, the full FRAME_CLIENT_PREDICT_MS above 0.12
+ m/s, smoothstep between (FRAME_CLIENT_PREDICT_DEADBAND=v0 v1); per-second log
+ of the mean horizon and the share of frames at rest and at full. Three wears
+ 2026-10-20: the 40 ms horizon is fine jitter at rest, no horizon is rubber
+ banding on movement.
+
+---
+ clients/steam-frame/src/main.cpp | 43 +++++++++++++++++++++++++++++++-
+ 1 file changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 661c9d2..4c71c5d 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -1227,7 +1227,48 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+             }
+         }
+     }
+-    const XrTime tLocate = kPredictMs > 0 ? t + (XrTime)(kPredictMs * 1e6) : t;
++    // Velocity deadband (2026-10-20, patch 0012). Three wears, 2026-10-20: the 40 ms runtime horizon is
++    // fine jitter at rest (the tracker's predictor amplifies its noise by the horizon) and no runtime horizon is
++    // rubber banding in motion. So the horizon follows the head speed: zero below v0, the full kPredictMs above
++    // v1, a smoothstep between. Speed = |linear| + 0.1 m * |angular| from the runtime's velocity at NOW.
++    // FRAME_CLIENT_PREDICT_DEADBAND="v0 v1" in m/s (default 0.02 0.12; "0 0" = the always-on horizon of before).
++    static float kDeadV0 = 0.02f, kDeadV1 = 0.12f;
++    static bool deadbandParsed = false;
++    if (!deadbandParsed) {
++        deadbandParsed = true;
++        if (const char* d = getenv("FRAME_CLIENT_PREDICT_DEADBAND")) {
++            float a = 0, b = 0;
++            if (sscanf(d, "%f %f", &a, &b) == 2 && a >= 0.0f && b >= a) { kDeadV0 = a; kDeadV1 = b; }
++        }
++        LOG_INFO("prediction deadband: horizon 0 below %.3f m/s, full %.1f ms above %.3f m/s (FRAME_CLIENT_PREDICT_DEADBAND)",
++                 kDeadV0, kPredictMs, kDeadV1);
++    }
++    float horizonMs = kPredictMs;
++    if (kPredictMs > 0 && kDeadV1 > 0 && app.viewSpace) {
++        XrSpaceVelocity hvNow = {XR_TYPE_SPACE_VELOCITY};
++        XrSpaceLocation hlNow = {XR_TYPE_SPACE_LOCATION, &hvNow};
++        if (XR_SUCCEEDED(xrLocateSpace(app.viewSpace, app.stageSpace, t, &hlNow))) {
++            float lin = 0, ang = 0;
++            if (hvNow.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT)
++                lin = sqrtf(hvNow.linearVelocity.x * hvNow.linearVelocity.x + hvNow.linearVelocity.y * hvNow.linearVelocity.y + hvNow.linearVelocity.z * hvNow.linearVelocity.z);
++            if (hvNow.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)
++                ang = sqrtf(hvNow.angularVelocity.x * hvNow.angularVelocity.x + hvNow.angularVelocity.y * hvNow.angularVelocity.y + hvNow.angularVelocity.z * hvNow.angularVelocity.z);
++            const float speed = lin + 0.1f * ang;
++            const float span = (kDeadV1 - kDeadV0) > 1e-6f ? (kDeadV1 - kDeadV0) : 1e-6f;
++            float k = (speed - kDeadV0) / span;
++            k = k < 0.0f ? 0.0f : (k > 1.0f ? 1.0f : k);
++            k = k * k * (3.0f - 2.0f * k);
++            horizonMs = kPredictMs * k;
++            static double horizonSum = 0; static uint32_t horizonN = 0, horizonRest = 0, horizonFull = 0;
++            horizonSum += horizonMs; horizonN++; if (k <= 0.0f) horizonRest++; if (k >= 1.0f) horizonFull++;
++            if (horizonN >= 90) {
++                LOG_INFO("prediction horizon: mean %.1f ms, %u%% at rest, %u%% full (speed now %.3f m/s)",
++                         horizonSum / horizonN, horizonRest * 100 / horizonN, horizonFull * 100 / horizonN, speed);
++                horizonSum = 0; horizonN = 0; horizonRest = 0; horizonFull = 0;
++            }
++        }
++    }
++    const XrTime tLocate = horizonMs > 0.5f ? t + (XrTime)(horizonMs * 1e6) : t;
+     XrSpaceVelocity hv = {XR_TYPE_SPACE_VELOCITY};
+     XrSpaceLocation hl = {XR_TYPE_SPACE_LOCATION, &hv};
+     if (app.viewSpace &&
+-- 
+2.44.0
+

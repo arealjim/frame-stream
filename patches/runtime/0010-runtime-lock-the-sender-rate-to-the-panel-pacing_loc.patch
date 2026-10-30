@@ -1,0 +1,227 @@
+From f4bb21330dc6868deef757c2db52c4b271fa0087 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 07:44:30 +0000
+Subject: [PATCH 10/23] runtime: lock the sender rate to the panel
+ (pacing_lock_age_ms), steam_frame render profiles
+
+- Session::WaitFrame trims its period by a PI loop on the client-reported displayed-frame age
+  (setpoint pacing_lock_age_ms, default 15; clamp 0.5 percent; reset on reconnect). Measured on the
+  Steam Frame 2026-10-18: unlocked, the age walked 6 -> 19 ms every ~2 min with a repaint or a
+  skip at every wrap; locked, 15.0 +/- 0.3 ms and 0-2 repaints per 720 frames. A setpoint below
+  the client floor (8.3 ms) pins the trim and starves the client - the band is [floor, floor + period).
+- StreamingServer: GetClientDisplayedFrameAgeMs, GetClientLatencyReportCount (reset on disconnect).
+- render_device steam_frame (1728x1728, SteamVR recommended) and steam_frame_native (2160x2160).
+  The parser whitelists names, so a new profile needs both the table and the whitelist.
+- pacing log line: lock err and trim (ppm).
+---
+ runtime/oxrsys-runtime.toml     |  2 +-
+ runtime/src/Config.cpp          | 18 +++++++++++++-
+ runtime/src/Config.h            | 10 +++++++-
+ runtime/src/Session.cpp         | 43 +++++++++++++++++++++++++++++++--
+ runtime/src/StreamingServer.cpp |  2 ++
+ runtime/src/StreamingServer.h   |  5 ++++
+ 6 files changed, 75 insertions(+), 5 deletions(-)
+
+diff --git a/runtime/oxrsys-runtime.toml b/runtime/oxrsys-runtime.toml
+index aea87a8..f7cc713 100644
+--- a/runtime/oxrsys-runtime.toml
++++ b/runtime/oxrsys-runtime.toml
+@@ -24,7 +24,7 @@ resolution_scale = 0.75
+ 
+ # Target headset for the per-eye render resolution: "quest2", "quest3", or "avp".
+ # Sets the resolution the runtime renders at (quest2=1440x1584, quest3=1512x1680,
+-# avp=3024x3360 per eye). Pick the headset you are streaming to; use resolution_scale
++# avp=3024x3360, steam_frame=1728x1728 per eye). Pick the headset you are streaming to; use resolution_scale
+ # above to trim how much of it is encoded and streamed.
+ render_device = "quest3"
+ 
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index 51868c1..a93175d 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -358,7 +358,7 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             else if (key == "render_device")
+             {
+                 value = ParseString(value);
+-                if (value == "quest2" || value == "quest3" || value == "avp")
++                if (value == "quest2" || value == "quest3" || value == "avp" || value == "steam_frame" || value == "steam_frame_native")
+                 {
+                     values.renderDevice = value;
+                 }
+@@ -404,6 +404,10 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+                 value = ParseString(value);
+                 values.pacingThread = (value == "qos" || value == "realtime") ? value : "default";
+             }
++            else if (key == "pacing_lock_age_ms")
++            {
++                values.pacingLockAgeMs = std::max(0.0f, std::min(30.0f, std::stof(value)));
++            }
+             else if (key == "pacing_spin_ms")
+             {
+                 values.pacingSpinMs = std::max(0.0f, std::min(8.0f, std::stof(value)));
+@@ -711,6 +715,18 @@ EyeResolution DeviceBaseEyeResolution(const std::string& device)
+     {
+         return {3024, 3360};
+     }
++    if (device == "steam_frame")
++    {
++        // SteamVR's own GetRecommendedRenderTargetSize for an app on the Frame (2160x2160 panel,
++        // "raw ideal render target scale 0.64", vrcompositor log 2026-10-18).
++        return {1728, 1728};
++    }
++    if (device == "steam_frame_native")
++    {
++        // The Frame's panel, one render pixel per display pixel (encode cost at 72 Hz needs a
++        // foveated preset above "light"; measured 2026-10-18).
++        return {2160, 2160};
++    }
+     // "quest3" and any unknown value fall back to the default base.
+     return {1512, 1680};
+ }
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index b182d7c..d0364fa 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -19,7 +19,7 @@ struct ConfigValues
+     uint32_t refreshRateHz = 72;    // Preferred headset refresh rate
+     float resolutionScale = 0.75f;  // Encode resolution multiplier (0.25-1.0)
+     float dynamicResolutionMinScale = 0.50f; // Lowest ABR full-mode encode scale
+-    std::string renderDevice = "quest3"; // Per-eye render resolution target: "quest2", "quest3", "avp"
++    std::string renderDevice = "quest3"; // Per-eye render resolution target: "quest2", "quest3", "avp", "steam_frame"
+     uint32_t keyframeIntervalSec = 2; // Seconds between forced keyframes
+     std::string videoCodec = "h265"; // "h265", "h264", "auto"
+     std::string encoderPreset = "balanced"; // "quality", "balanced", "speed"
+@@ -34,6 +34,14 @@ struct ConfigValues
+     // pacing_thread: "default" | "qos" (USER_INTERACTIVE QoS on the app thread that calls WaitFrame)
+     // | "realtime" (Mach time-constraint policy: period = frame, computation 2 ms, constraint 5 ms).
+     std::string pacingThread = "default";
++    // pacing_lock_age_ms: hold the client's reported displayed-frame age at this value by trimming
++    // the WaitFrame period (PI, clamped to 0.5% of the period); locks the sender's rate to the
++    // panel's. 0 = off. Measured 2026-10-18 on the Frame: unlocked, the age walks 6 -> 19 ms
++    // every ~2 min. The achievable band is [floor, floor + period) where floor is the client's
++    // decode + pickup time (8.3 ms at 1728x1728); a setpoint below the floor drives the sender
++    // slower and slower and starves the client (trim pinned, 0.5% repaints, first try at 8 ms).
++    // Aim for the middle of the band: 15 ms here.
++    float pacingLockAgeMs = 15.0f;
+     // Feed the low-latency (rtvc) or software session the BGRA surface directly
+     // instead of a BT.709 video-range 4:2:0 conversion of each frame (about 1 ms
+     // of submit per frame, measured 2026-10-17). Those sessions then write a
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index c7fb6d6..0cdec2b 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -450,6 +450,9 @@ void Session::GetDebugUtilsLabels(std::vector<XrDebugUtilsLabelEXT>& labels, std
+     }
+ }
+ 
++// Rate-lock state for the pacing log line (see WaitFrame).
++static double s_lockErrMs = 0.0, s_lockTrimPpm = 0.0;
++
+ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState* frameState)
+ {
+     if (frameWaitInfo != nullptr && frameWaitInfo->type != XR_TYPE_FRAME_WAIT_INFO)
+@@ -566,6 +569,42 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+         }
+         nextFrameDeadline_ += targetFrameTime;
+ 
++        // Rate lock to the panel (2026-10-18). This grid and the headset's display run on
++        // different crystals (72.000 vs 72.1 Hz measured): their phase slides through a period
++        // every ~2 min, and the client's displayed-frame age (decoded -> shown) walks 6 -> 19 ms
++        // and back, with a repaint or a skipped frame at every wrap - "the boxes slow down
++        // cyclically". The client reports that age about once a second; hold it at
++        // pacing_lock_age_ms by trimming the period: age too large means we run early, so
++        // lengthen. PI, trim clamped to 0.5% of the period (far more than the 0.14% drift),
++        // reset whenever the client's report counter restarts (reconnect) or nobody is connected.
++        {
++            static uint32_t lastReportCount = 0;
++            static double integralMs = 0.0;
++            static double trimNs = 0.0;
++            const float setpoint = Config::Get().GetValues().pacingLockAgeMs;
++            if (setpoint > 0.0f && streamingServer_ && streamingServer_->IsClientConnected())
++            {
++                const uint32_t count = streamingServer_->GetClientLatencyReportCount();
++                if (count != lastReportCount)
++                {
++                    if (count < lastReportCount) { integralMs = 0.0; trimNs = 0.0; }
++                    lastReportCount = count;
++                    const double errMs = (double)streamingServer_->GetClientDisplayedFrameAgeMs() - setpoint;
++                    integralMs = std::clamp(integralMs + errMs, -15.0, 15.0);   // anti-windup: at most 0.15% from the integral
++                    const double periodNs = (double)targetFrameTime.count();
++                    const double maxTrim = 0.005 * periodNs;
++                    trimNs = std::clamp((0.0006 * errMs + 0.0001 * integralMs) * periodNs, -maxTrim, maxTrim);
++                    s_lockErrMs = errMs;
++                    s_lockTrimPpm = trimNs / periodNs * 1e6;
++                }
++            }
++            else
++            {
++                lastReportCount = 0; integralMs = 0.0; trimNs = 0.0; s_lockErrMs = 0.0; s_lockTrimPpm = 0.0;
++            }
++            nextFrameDeadline_ += std::chrono::nanoseconds((long long)trimNs);
++        }
++
+         // If we fell far behind (a hitch, a stall, or the app pausing), snap the grid
+         // back to the present rather than firing a burst of catch-up frames.
+         if (now - nextFrameDeadline_ > 2 * targetFrameTime)
+@@ -596,13 +635,13 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+             auto mm = std::minmax_element(intervalSamplesMs.begin(), intervalSamplesMs.end());
+             spdlog::info("OXRSys: Session::WaitFrame pacing target={}Hz ({:.2f}ms) "
+                          "actual mean={:.2f}ms stddev={:.2f}ms min/max={:.2f}/{:.2f}ms (n={}) "
+-                         "sleep overshoot mean={:.2f}ms max={:.2f}ms ({} slept) app late {} (mean {:.2f}ms) spin={:.1f}ms",
++                         "sleep overshoot mean={:.2f}ms max={:.2f}ms ({} slept) app late {} (mean {:.2f}ms) spin={:.1f}ms lock err={:+.1f}ms trim={:+.0f}ppm",
+                          targetRefreshHz,
+                          std::chrono::duration<double, std::milli>(targetFrameTime).count(),
+                          mean, stddev, *mm.first, *mm.second, intervalSamplesMs.size(),
+                          pacing.slept ? pacing.overshootSum / pacing.slept : 0.0, pacing.overshootMax, pacing.slept,
+                          pacing.appLate, pacing.appLate ? pacing.lateSum / pacing.appLate : 0.0,
+-                         Config::Get().GetValues().pacingSpinMs);
++                         Config::Get().GetValues().pacingSpinMs, s_lockErrMs, s_lockTrimPpm);
+             pacing = PacingDiag{};
+             intervalSamplesMs.clear();
+             lastPacingLog = now;
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index 6e2292e..9c5028f 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -2221,6 +2221,7 @@ void StreamingServer::HandleClientDisconnect()
+         ResetPendingStreamConfigLocked();
+     }
+     clientDisplayedFrameAgeMs_.store(0.0f);
++    clientLatencyReportCount_.store(0);
+     clientReprojectedFramesDelta_.store(0);
+     clientStaleFrameReusesDelta_.store(0);
+     clientRenderPoseFallbacksDelta_.store(0);
+@@ -2263,6 +2264,7 @@ void StreamingServer::HandleLatencyReport(const oxr::protocol::LatencyReport& re
+     clientDecodeLatencyMs_.store(report.decodeLatencyMs);
+     clientCompositorLatencyMs_.store(report.compositorLatencyMs);
+     clientDisplayedFrameAgeMs_.store(report.displayedFrameAgeMs);
++    clientLatencyReportCount_.fetch_add(1);
+     clientReprojectedFramesDelta_.store(report.reprojectedFrames);
+     clientStaleFrameReusesDelta_.store(report.staleFrameReuses);
+     clientRenderPoseFallbacksDelta_.store(report.renderPoseFallbacks);
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index b283746..3d5f635 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -84,6 +84,10 @@ class StreamingServer
+     bool IsClientConnected() const { return state_.load() == State::Connected; }
+     State GetState() const { return state_.load(); }
+     uint32_t GetTargetRefreshRateHz() const { return targetRefreshRateHz_.load(); }
++    // The client's latest displayed-frame age (decoded -> shown, ms) and a count of the reports
++    // that carried it, so a reader can act once per report. Both reset on disconnect.
++    float GetClientDisplayedFrameAgeMs() const { return clientDisplayedFrameAgeMs_.load(); }
++    uint32_t GetClientLatencyReportCount() const { return clientLatencyReportCount_.load(); }
+ 
+     // Get the connected client info
+     std::string GetClientName() const;
+@@ -247,6 +251,7 @@ class StreamingServer
+     oxr::protocol::StreamConfigUpdate pendingStreamConfigUpdate_ = {};
+     oxrsys::streaming_reconfigure::PendingState streamConfigPending_;
+     std::atomic<float> clientDisplayedFrameAgeMs_{0.0f};
++    std::atomic<uint32_t> clientLatencyReportCount_{0};
+     std::atomic<uint32_t> clientReprojectedFramesDelta_{0};
+     std::atomic<uint32_t> clientStaleFrameReusesDelta_{0};
+     std::atomic<uint32_t> clientRenderPoseFallbacksDelta_{0};
+-- 
+2.43.0
+

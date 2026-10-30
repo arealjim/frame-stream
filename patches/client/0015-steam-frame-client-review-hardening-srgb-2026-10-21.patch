@@ -1,0 +1,425 @@
+From 4d6696ff539c2cd05fe4ae4c6df7e037f952d4f6 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 00:33:02 +0000
+Subject: [PATCH] steam-frame client: review hardening and the sRGB double
+ encode (2026-10-21)
+
+Adversarial review of the client, 2026-10-21. Fixes, in the order of the findings:
+
+- H1: the video carries gamma-encoded values (the server re-encodes linear to sRGB before VideoToolbox) and the
+  R8G8B8A8_SRGB swapchain encoded them again on store, so the compositor was handed sRGB(sRGB(x)). The shader now
+  linearises when the attachment is an sRGB format (push constant srgbTarget). FRAME_CLIENT_SRGB_LINEARIZE=0 restores
+  the old picture for an A/B.
+- H2: the worn defaults live in the binary: PREDICT_MS 40, PREDICT_POS 0, PREDICT_POS_MS 40, STAMP_POS_LIVE 1,
+  deadband off. The launcher no longer has to set them.
+- H3/H4: video datagrams from any address other than the server are dropped (FRAME_CLIENT_ACCEPT_ANY_SOURCE=1 to
+  allow); headers with totalPackets 0 or above 4096, payloadSize above the packet payload, or a data packetIndex
+  past totalPackets are dropped before the assembler sizes anything; the access unit is capped at 2 MB (cleared and a
+  keyframe requested on overflow).
+- H5: render poses off the wire are checked finite, within 100 m and a unit quaternion within 10 percent, then
+  normalised; xrEndFrame failures are logged (rate limited).
+- H6: with FRAME_CLIENT_SERVER pinned, only that address's announce is accepted.
+- H7: the discovery result is copied under a mutex and published after the copy; StopDiscovery wakes the recvfrom
+  with shutdown and joins the thread, so nothing writes into the caller's frame after Connect returns.
+- H8: Stop shuts the sockets down, joins, then closes (close alone does not wake a blocked recv on Linux).
+- M1: Ctrl-C leaves the loop when the exit request fails or EXITING does not come within 3 s.
+
+692 unit checks pass. Built on the headset; not yet worn.
+---
+ clients/steam-frame/shaders/sample.frag       |  8 +-
+ clients/steam-frame/src/NetworkReceiver.cpp   | 94 ++++++++++++++++---
+ clients/steam-frame/src/main.cpp              | 34 +++++--
+ clients/steam-frame/src/stream_connection.cpp | 15 ++-
+ clients/steam-frame/src/video_decoder.cpp     | 10 ++
+ clients/steam-frame/src/video_decoder.h       |  2 +
+ 6 files changed, 138 insertions(+), 25 deletions(-)
+
+diff --git a/clients/steam-frame/shaders/sample.frag b/clients/steam-frame/shaders/sample.frag
+index c33d570..e287f43 100644
+--- a/clients/steam-frame/shaders/sample.frag
++++ b/clients/steam-frame/shaders/sample.frag
+@@ -19,8 +19,14 @@ layout(push_constant) uniform Push {
+     int  nv12;           // 1 = binding 0 is luma, binding 1 chroma; convert here
+     int  fullRange;      // 1 = the stream signals full range (encoder_full_range): no 16-235 scaling
+     int  alphaKey;       // 1 = passthrough frame: alpha from a black key, as oxrsys's Quest client does
++    int  srgbTarget;     // 1 = the attachment is an sRGB format: the store re-encodes, so hand it LINEAR light
+ } pc;
+ 
++// The video carries ordinary gamma-encoded (sRGB/BT.709) values: the server re-encodes linear to sRGB before
++// VideoToolbox (VideoEncoder.mm). An sRGB swapchain image applies linear->sRGB again on store, and the
++// compositor decodes it once, so without this the panel showed sRGB(sRGB(x)): lifted blacks, flat contrast.
++vec3 srgbToLinear(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }
++
+ // Axis-aligned foveated-encoding forward map (matches oxrsys / ALVR AADT).
+ // CPU mirror + accuracy test: tests/foveation_warp.h (keep the two in sync).
+ float compressAxis(float eyeUv, float centerSize, float centerShift, float edgeRatio) {
+@@ -96,5 +102,5 @@ void main() {
+     vec3 c = sampleVideo(sourceUv);
+     float a = 1.0;
+     if (pc.alphaKey != 0) a = smoothstep(0.02, 0.10, max(c.r, max(c.g, c.b)));   // black = the app's transparent clear
+-    outColor = vec4(c, a);
++    outColor = vec4(pc.srgbTarget != 0 ? srgbToLinear(c) : c, a);
+ }
+diff --git a/clients/steam-frame/src/NetworkReceiver.cpp b/clients/steam-frame/src/NetworkReceiver.cpp
+index 0fa2acf..18322c4 100644
+--- a/clients/steam-frame/src/NetworkReceiver.cpp
++++ b/clients/steam-frame/src/NetworkReceiver.cpp
+@@ -9,6 +9,8 @@
+ #include <chrono>
+ #include <cstring>
+ #include <cerrno>
++#include <cmath>
++#include <thread>
+ #include <iterator>
+ #include <netinet/in.h>
+ #include <netinet/tcp.h>
+@@ -78,6 +80,23 @@ bool ReadTcpRecord(int socket, protocol::TcpRecordHeader& header, std::vector<ui
+     return ReadAll(socket, payload.data(), payload.size());
+ }
+ 
++// Review 2026-10-21 (H5): pose floats off the wire reach xrEndFrame; a NaN or a non-unit quaternion fails the
++// frame (XR_ERROR_POSE_INVALID) and the picture vanishes. Finite, |p| <= 100 m, |q| within 10 % of 1, then normalised.
++bool SanitizePose(float* p, float* q)
++{
++    for (int i = 0; i < 3; ++i) if (!std::isfinite(p[i]) || std::fabs(p[i]) > 100.0f) return false;
++    float n2 = 0.0f;
++    for (int i = 0; i < 4; ++i) { if (!std::isfinite(q[i])) return false; n2 += q[i] * q[i]; }
++    if (n2 < 0.81f || n2 > 1.21f) return false;
++    const float inv = 1.0f / std::sqrt(n2);
++    for (int i = 0; i < 4; ++i) q[i] *= inv;
++    return true;
++}
++
++// Review 2026-10-21 (H3/H4): a header is trusted for its sizes before this. 4096 packets is ~5.7 MB per NAL, far
++// above any frame at 50 Mbit/s; a totalPackets of 0 opened a frame nothing could complete and so a keyframe stall.
++constexpr uint32_t kMaxPacketsPerFrame = 4096;
++
+ void ConfigureTcpSocket(int socket)
+ {
+     int nodelay = 1;
+@@ -166,6 +185,15 @@ void NetworkReceiver::DiscoveryThread(OnServerFoundCallback callback)
+         socklen_t addrLen = sizeof(senderAddr);
+         ssize_t received = recvfrom(discoverySocket_, buffer, sizeof(buffer), 0,
+                                      (sockaddr*)&senderAddr, &addrLen);
++        // Review 2026-10-21 (H6): with a pinned server (FRAME_CLIENT_SERVER) only its announce counts; the first
++        // announcer otherwise received the wearer's head and eye tracking and could feed the video.
++        if (received > 0 && haveDirectServer_ && senderAddr.sin_addr.s_addr != directServer_.sin_addr.s_addr)
++        {
++            static uint32_t ignored = 0; ignored++;
++            char who[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &senderAddr.sin_addr, who, sizeof(who));
++            if (ignored <= 5 || ignored % 100 == 0) LOGE("Ignored announce from %s: server pinned (%u so far)", who, ignored);
++            continue;
++        }
+         if (received >= (ssize_t)protocol::SERVER_ANNOUNCE_BASE_SIZE)
+         {
+             protocol::ServerAnnounce hello = {};
+@@ -344,8 +372,11 @@ bool NetworkReceiver::StartReceivingTcp(uint16_t videoPort, OnNalUnitCallback ca
+ void NetworkReceiver::StopDiscovery()
+ {
+     discovering_.store(false);
+-    // Don't close socket or join thread here — may be called from the discovery thread itself
+-    LOGI("Discovery stop requested");
++    // Review 2026-10-21 (H7): the caller's callback captures live only until this returns, so the thread must be
++    // gone by then. shutdown() wakes the recvfrom; the join is skipped only when called from the thread itself.
++    if (discoverySocket_ >= 0) shutdown(discoverySocket_, SHUT_RDWR);
++    if (discoveryThread_.joinable() && discoveryThread_.get_id() != std::this_thread::get_id()) discoveryThread_.join();
++    LOGI("Discovery stopped");
+ }
+ 
+ void NetworkReceiver::ReceiveThread(OnNalUnitCallback callback)
+@@ -356,10 +387,22 @@ void NetworkReceiver::ReceiveThread(OnNalUnitCallback callback)
+     timeval tv = {0, 1000};  // 1ms timeout — low latency packet receive
+     setsockopt(videoSocket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+ 
++    // Review 2026-10-21 (H3): the socket is bound on every interface, so a datagram from anywhere was a video
++    // packet. Only the connected server's address passes; FRAME_CLIENT_ACCEPT_ANY_SOURCE=1 restores the old behaviour.
++    const bool acceptAny = !haveVideoServer_ || (getenv("FRAME_CLIENT_ACCEPT_ANY_SOURCE") && atoi(getenv("FRAME_CLIENT_ACCEPT_ANY_SOURCE")) != 0);
++    uint32_t foreign = 0, malformed = 0;
+     while (receiving_.load())
+     {
+         PunchVideoPath();
+-        ssize_t received = recv(videoSocket_, buffer, sizeof(buffer), 0);
++        sockaddr_in from = {};
++        socklen_t fromLen = sizeof(from);
++        ssize_t received = recvfrom(videoSocket_, buffer, sizeof(buffer), 0, (sockaddr*)&from, &fromLen);
++        if (received > 0 && !acceptAny && from.sin_addr.s_addr != videoServer_.sin_addr.s_addr)
++        {
++            foreign++;
++            if (foreign <= 5 || foreign % 1000 == 0) { char who[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &from.sin_addr, who, sizeof(who)); LOGE("Dropped video datagram from %s (not the server; %u so far)", who, foreign); }
++            continue;
++        }
+         if (received < (ssize_t)sizeof(protocol::VideoPacketHeader))
+         {
+             // 1 ms receive timeout: let a parked NAL retransmit wait expire even when nothing arrives.
+@@ -391,6 +434,16 @@ void NetworkReceiver::ReceiveThread(OnNalUnitCallback callback)
+             continue;
+         }
+ 
++        // Review 2026-10-21 (H3/H4): bound the header before the assembler sizes anything from it. Parity packets
++        // carry their group index in packetIndex, so only data packets get the index check.
++        if (header->totalPackets == 0 || header->totalPackets > kMaxPacketsPerFrame ||
++            header->payloadSize > protocol::MAX_PACKET_PAYLOAD ||
++            (!(header->flags & protocol::VIDEO_FLAG_FEC) && header->packetIndex >= header->totalPackets))
++        {
++            malformed++;
++            if (malformed <= 5 || malformed % 1000 == 0) LOGE("Dropped malformed video packet: frame=%u pkt=%u/%u payload=%u (%u so far)", header->frameIndex, header->packetIndex, header->totalPackets, header->payloadSize, malformed);
++            continue;
++        }
+         alphaBlend_.store((header->flags & protocol::VIDEO_FLAG_ALPHA_BLEND) != 0);
+         assembler_.SetInterleaved(fecInterleaved_.load());
+         assembler_.ProcessPacket(*header, payload, payloadSize);
+@@ -477,6 +530,12 @@ void NetworkReceiver::StoreRenderPose(const protocol::VideoPacketHeader& header,
+     pose.presentationTimeUs = header.presentationTimeNs / 1000;
+     memcpy(pose.position, poseData, sizeof(float) * 3);
+     memcpy(pose.orientation, poseData + 3, sizeof(float) * 4);
++    if (!SanitizePose(pose.position, pose.orientation))
++    {
++        static uint32_t bad = 0; bad++;
++        if (bad <= 5 || bad % 1000 == 0) LOGE("Dropped render pose with non-finite or non-unit values (frame %u, %u so far)", header.frameIndex, bad);
++        return;
++    }
+     if (header.flags & protocol::VIDEO_FLAG_FOVEATION_CENTER)
+     {
+         pose.hasFoveationCenter = true;
+@@ -512,6 +571,12 @@ void NetworkReceiver::StoreRenderPose(const protocol::TcpRenderPose& tcpPose)
+     pose.presentationTimeUs = tcpPose.presentationTimeNs / 1000;
+     memcpy(pose.position, tcpPose.position, sizeof(float) * 3);
+     memcpy(pose.orientation, tcpPose.orientation, sizeof(float) * 4);
++    if (!SanitizePose(pose.position, pose.orientation))
++    {
++        static uint32_t bad = 0; bad++;
++        if (bad <= 5 || bad % 1000 == 0) LOGE("Dropped TCP render pose with non-finite or non-unit values (frame %u, %u so far)", tcpPose.frameIndex, bad);
++        return;
++    }
+     pose.hasFoveationCenter = tcpPose.hasFoveationCenter != 0;
+     pose.foveationCenterX = tcpPose.foveationCenterX;
+     pose.foveationCenterY = tcpPose.foveationCenterY;
+@@ -650,6 +715,20 @@ void NetworkReceiver::Stop()
+     discovering_.store(false);
+     receiving_.store(false);
+ 
++    // Review 2026-10-21 (H8): close() does not wake a thread blocked in recv on Linux (the USB/TCP path has no
++    // timeout), and a closed fd number can be reused under the still-running thread. Wake, join, then close.
++    if (discoverySocket_ >= 0) shutdown(discoverySocket_, SHUT_RDWR);
++    if (videoSocket_ >= 0) shutdown(videoSocket_, SHUT_RDWR);
++
++    if (discoveryThread_.joinable())
++    {
++        discoveryThread_.join();
++    }
++    if (receiveThread_.joinable())
++    {
++        receiveThread_.join();
++    }
++
+     if (discoverySocket_ >= 0)
+     {
+         close(discoverySocket_);
+@@ -661,15 +740,6 @@ void NetworkReceiver::Stop()
+         videoSocket_ = -1;
+     }
+ 
+-    if (discoveryThread_.joinable())
+-    {
+-        discoveryThread_.join();
+-    }
+-    if (receiveThread_.joinable())
+-    {
+-        receiveThread_.join();
+-    }
+-
+     {
+         std::lock_guard<std::mutex> lock(renderPoseMutex_);
+         latestRenderPose_ = {};
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index c67ca54..a8244dc 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -158,6 +158,7 @@ struct PushConstants {
+     int32_t nv12;
+     int32_t fullRange;
+     int32_t alphaKey;    // 1 = passthrough frame: alpha from a black key (smoothstep 0.02..0.10 of max(rgb)), like oxrsys's Quest client
++    int32_t srgbTarget;  // 1 = sRGB attachment: the shader linearises the gamma video so the store's encode is the only one
+ };
+ 
+ static VideoDecoder g_decoder;
+@@ -1103,6 +1104,14 @@ static bool RenderEye(App& app, uint32_t eye, uint32_t imageIndex)
+         pc.nv12 = app.videoNv12 ? 1 : 0;
+         pc.fullRange = app.videoFullRange ? 1 : 0;
+         pc.alphaKey = (g_streamMode && g_alphaBlendSupported && g_stream.AlphaBlend()) ? 1 : 0;
++        // Review 2026-10-21 (H1): the video is gamma-encoded and an sRGB attachment encodes again on store, so the
++        // compositor was handed sRGB(sRGB(x)). Linearise first when the swapchain is an sRGB format.
++        // FRAME_CLIENT_SRGB_LINEARIZE=0 restores the old double-encoded picture for an A/B wear.
++        static const bool kSrgbLinearize = !getenv("FRAME_CLIENT_SRGB_LINEARIZE") || atoi(getenv("FRAME_CLIENT_SRGB_LINEARIZE")) != 0;
++        const int64_t scFormat = app.swapchains[eye].format;
++        pc.srgbTarget = (kSrgbLinearize && (scFormat == VK_FORMAT_R8G8B8A8_SRGB || scFormat == VK_FORMAT_B8G8R8A8_SRGB)) ? 1 : 0;
++        static bool srgbLogged = false;
++        if (!srgbLogged) { srgbLogged = true; LOG_INFO("swapchain colour: %s (FRAME_CLIENT_SRGB_LINEARIZE)", pc.srgbTarget ? "sRGB attachment, video linearised before the store" : (kSrgbLinearize ? "UNORM attachment, video stored as is" : "sRGB attachment, linearisation OFF (double encode)")); }
+         pc.centerSize[0] = fv.centerSize[0]; pc.centerSize[1] = fv.centerSize[1];
+         pc.centerShift[0] = fv.centerShift[0]; pc.centerShift[1] = fv.centerShift[1];
+         pc.edgeRatio[0] = fv.edgeRatio[0]; pc.edgeRatio[1] = fv.edgeRatio[1];
+@@ -1214,7 +1223,8 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+     // headset's runtime for the head pose that far in the FUTURE (its own tracker's predictor, the one
+     // the compositor's panels get) and send zero velocity, so the server renders exactly that pose and
+     // extrapolates nothing. The layer is still stamped with the pose the server rendered from.
+-    static float kPredictMs = getenv("FRAME_CLIENT_PREDICT_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_MS")) : 0.0f;
++    // Default 40 ms since 2026-10-21 (review H2): the wears' setting, previously only in the launcher.
++    static float kPredictMs = getenv("FRAME_CLIENT_PREDICT_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_MS")) : 40.0f;
+     static bool predictLogged = false;
+     if (kPredictMs > 0 && !predictLogged) { predictLogged = true; LOG_INFO("head pose sampled %.1f ms ahead by the runtime (FRAME_CLIENT_PREDICT_MS); velocity sent as zero", kPredictMs); }
+     // Live override (2026-10-19): /dev/shm/frame-predict-ms, read once a second, so a wear can tune the horizon.
+@@ -1231,8 +1241,9 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+     // fine jitter at rest (the tracker's predictor amplifies its noise by the horizon) and no runtime horizon is
+     // rubber banding in motion. So the horizon follows the head speed: zero below v0, the full kPredictMs above
+     // v1, a smoothstep between. Speed = |linear| + 0.1 m * |angular| from the runtime's velocity at NOW.
+-    // FRAME_CLIENT_PREDICT_DEADBAND="v0 v1" in m/s (default 0.02 0.12; "0 0" = the always-on horizon of before).
+-    static float kDeadV0 = 0.02f, kDeadV1 = 0.12f;
++    // FRAME_CLIENT_PREDICT_DEADBAND="v0 v1" in m/s. Default "0 0" = off (the ramp smeared when worn, 2026-10-20);
++    // "0.02 0.12" was the setting tried.
++    static float kDeadV0 = 0.0f, kDeadV1 = 0.0f;
+     static bool deadbandParsed = false;
+     if (!deadbandParsed) {
+         deadbandParsed = true;
+@@ -1281,7 +1292,7 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+         // harmless; position is not warped, so 40 ms of predicted position carries the tracker's velocity noise
+         // straight to the eye (the at-rest vibration, better at 0 ms when worn) and a ramped horizon smeared
+         // (patch 0012). Position is sampled at NOW instead; translation then lags the pipeline, as it does at 0 ms.
+-        static int kPredictPos = getenv("FRAME_CLIENT_PREDICT_POS") ? atoi(getenv("FRAME_CLIENT_PREDICT_POS")) : 1;
++        static int kPredictPos = getenv("FRAME_CLIENT_PREDICT_POS") ? atoi(getenv("FRAME_CLIENT_PREDICT_POS")) : 0;   // default orientation-only since the 2026-10-20 wear
+         static bool predictPosLogged = false;
+         if (!predictPosLogged) { predictPosLogged = true; LOG_INFO("prediction applies to: %s (FRAME_CLIENT_PREDICT_POS)", kPredictPos ? "orientation and position" : "orientation only, position sampled now"); }
+         if (!kPredictPos && tLocate != t) {
+@@ -1295,7 +1306,7 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+                 // smear; near zero at rest, so the tracker's velocity noise does not reach the eye the way the
+                 // runtime's predicted position did (patches 0008/0012). Tether wear: the cube lagged the keyboard
+                 // on movement by the position's ~39 ms sample-to-display path. 0 = off (position at now).
+-                static float kPosMs = getenv("FRAME_CLIENT_PREDICT_POS_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_POS_MS")) : 0.0f;
++                static float kPosMs = getenv("FRAME_CLIENT_PREDICT_POS_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_POS_MS")) : 40.0f;   // the tether wear's default
+                 static float kPosTau = getenv("FRAME_CLIENT_PREDICT_POS_TAU_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_POS_TAU_MS")) : 100.0f;
+                 static bool posMsLogged = false;
+                 if (!posMsLogged) { posMsLogged = true; LOG_INFO("position extrapolation: %.1f ms by a %.0f ms low-passed velocity (FRAME_CLIENT_PREDICT_POS_MS/_TAU_MS)", kPosMs, kPosTau); }
+@@ -1790,7 +1801,7 @@ static void RenderFrame(App& app)
+             // FRAME_CLIENT_STAMP_POS_LIVE=1 keeps the RENDER orientation on the stamp (the compositor still warps
+             // rotation, which is what keeps it steady) but puts the DISPLAYED eye position on it, so the compositor
+             // applies no positional warp and its depth guess cannot exaggerate the parallax.
+-            static const bool kStampPosLive = getenv("FRAME_CLIENT_STAMP_POS_LIVE") && atoi(getenv("FRAME_CLIENT_STAMP_POS_LIVE")) != 0;
++            static const bool kStampPosLive = !getenv("FRAME_CLIENT_STAMP_POS_LIVE") || atoi(getenv("FRAME_CLIENT_STAMP_POS_LIVE")) != 0;   // default on since 2026-10-21 (review H2)
+             static bool stampPosLiveLogged = false;
+             if (kStampPosLive && !stampPosLiveLogged) { stampPosLiveLogged = true; LOG_INFO("stamp-pos-live: render orientation + displayed eye position on the stamp (FRAME_CLIENT_STAMP_POS_LIVE), compositor warps rotation only"); }
+             static bool stampLiveLogged = false;
+@@ -2028,7 +2039,11 @@ static void RenderFrame(App& app)
+     ei.layers = submitLayer ? layers : nullptr;
+     if (cmdOpen) { EndFrameCommands(app); cmdOpen = false; }   // an upload with nothing to show
+     auto tEnd0 = std::chrono::steady_clock::now();
+-    xrEndFrame(app.session, &ei);
++    const XrResult endRes = xrEndFrame(app.session, &ei);
++    if (XR_FAILED(endRes)) {   // review 2026-10-21 (M3): a failed EndFrame is a vanished picture, so say so
++        static uint32_t endFails = 0; endFails++;
++        if (endFails <= 10 || endFails % 900 == 0) LOG_ERROR("xrEndFrame failed: %d (%u so far; layer %s)", (int)endRes, endFails, submitLayer ? "submitted" : "none");
++    }
+     if (submitLayer) {
+         double endMs = MsSince(tEnd0), threadMs = MsSince(tThread0);
+         g_rt.endFrame += endMs; if (endMs > g_rt.endFrameMax) g_rt.endFrameMax = endMs;
+@@ -2143,14 +2158,17 @@ int main(int argc, char** argv)
+ 
+     LOG_INFO("Entering frame loop (Ctrl-C to quit)");
+     bool exitAsked = false;
++    std::chrono::steady_clock::time_point exitAskedAt{};
+     while (!app.exitRequested) {
+         PollEvents(app);
+         // On Ctrl-C, ask the runtime to tear the session down cleanly (drives
+         // it through STOPPING -> EXITING) instead of killing it mid-frame.
+         if (!g_running && !exitAsked && app.session) {
+-            xrRequestExitSession(app.session);
+             exitAsked = true;
++            exitAskedAt = std::chrono::steady_clock::now();
++            if (XR_FAILED(xrRequestExitSession(app.session))) { LOG_INFO("session not running; leaving the loop"); break; }   // review M1
+         }
++        if (exitAsked && std::chrono::steady_clock::now() - exitAskedAt > std::chrono::seconds(3)) { LOG_INFO("no EXITING within 3 s; leaving the loop"); break; }
+         if (!app.sessionRunning) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+         RenderFrame(app);
+     }
+diff --git a/clients/steam-frame/src/stream_connection.cpp b/clients/steam-frame/src/stream_connection.cpp
+index e06921a..dec1d41 100644
+--- a/clients/steam-frame/src/stream_connection.cpp
++++ b/clients/steam-frame/src/stream_connection.cpp
+@@ -17,6 +17,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <mutex>
+ #include <thread>
+ 
+ #define LOG_INF(fmt, ...) fprintf(stderr, "[INFO] StreamConnection: " fmt "\n", ##__VA_ARGS__)
+@@ -57,24 +58,30 @@ bool StreamConnection::Connect(VideoDecoder* decoder, int timeoutMs)
+ {
+     if (connectRetry_.joinable()) { stopRetry_ = true; connectRetry_.join(); }
+     if (const char* s = getenv("FRAME_CLIENT_TEST_DROP_CONNECT")) testDropConnects_ = atoi(s);
+-    std::atomic<bool> found{false};
++    // Review 2026-10-21 (H7): the result is copied under a mutex and published after the copy, and StopDiscovery
++    // now joins the thread, so nothing writes into this frame once Connect has returned.
++    std::mutex foundMu;
++    bool found = false;
+     protocol::ServerAnnounce srv{};
+     char ip[64] = {};
++    auto isFound = [&]() { std::lock_guard<std::mutex> lk(foundMu); return found; };
+ 
+     if (!net_->StartDiscovery([&](const protocol::ServerAnnounce& s, const char* serverIp) {
+-            if (found.exchange(true)) return;
++            std::lock_guard<std::mutex> lk(foundMu);
++            if (found) return;
+             srv = s;
+             strncpy(ip, serverIp, sizeof(ip) - 1);
++            found = true;
+         })) {
+         LOG_ERR("StartDiscovery failed");
+         return false;
+     }
+ 
+     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+-    while (!found && std::chrono::steady_clock::now() < deadline)
++    while (!isFound() && std::chrono::steady_clock::now() < deadline)
+         std::this_thread::sleep_for(std::chrono::milliseconds(50));
+     net_->StopDiscovery();
+-    if (!found) { LOG_ERR("no server found in %d ms", timeoutMs); return false; }
++    if (!isFound()) { LOG_ERR("no server found in %d ms", timeoutMs); return false; }
+ 
+     serverIp_ = ip;
+     encodedW_ = srv.encodedWidth ? srv.encodedWidth : srv.renderWidth;
+diff --git a/clients/steam-frame/src/video_decoder.cpp b/clients/steam-frame/src/video_decoder.cpp
+index 75ea2ab..a0b411b 100644
+--- a/clients/steam-frame/src/video_decoder.cpp
++++ b/clients/steam-frame/src/video_decoder.cpp
+@@ -419,6 +419,16 @@ void VideoDecoder::submitNalImpl(const uint8_t* data, size_t size, int64_t ptsUs
+         if (sc == 0) { const uint8_t start[4] = {0, 0, 0, 1}; au_.insert(au_.end(), start, start + 4); }
+         if (size <= sc) return;
+         const int nalType = (data[sc] >> 1) & 0x3f;
++        // Review 2026-10-21 (H4): non-VCL NALs accumulate until a slice arrives, so a run of them (garbage, or an
++        // H.264 stream parsed with this HEVC formula) grew au_ without limit. 2 MB is ~3x the largest IDR at 50 Mbit/s.
++        if (au_.size() + size > kMaxAccessUnitBytes) {
++            auOverflows_++;
++            if (auOverflows_ <= 5 || auOverflows_ % 100 == 0) LOG_ERR("access unit over %zu bytes without a slice; dropped, keyframe requested (%u so far)", kMaxAccessUnitBytes, auOverflows_);
++            au_.clear();
++            std::lock_guard<std::mutex> lk(latestMutex_);
++            needKeyframe_ = true;
++            return;
++        }
+         au_.insert(au_.end(), data, data + size);
+         if (nalType >= 32) return;            // VPS/SPS/PPS/AUD/SEI: not a frame yet
+         au_.insert(au_.end(), AV_INPUT_BUFFER_PADDING_SIZE, 0);
+diff --git a/clients/steam-frame/src/video_decoder.h b/clients/steam-frame/src/video_decoder.h
+index 44b766b..aa14d07 100644
+--- a/clients/steam-frame/src/video_decoder.h
++++ b/clients/steam-frame/src/video_decoder.h
+@@ -144,6 +144,8 @@ class VideoDecoder {
+     uint64_t noPtsFrames_ = 0, labelledLatest_ = 0, labelledOther_ = 0;
+     uint64_t auInOwnCall_ = 0, auInLaterCall_ = 0, submitCalls_ = 0;
+     std::vector<uint8_t> au_;          // the access unit being assembled (parameter sets + the slice)
++    static constexpr size_t kMaxAccessUnitBytes = 2u << 20;   // review 2026-10-21 (H4)
++    uint32_t auOverflows_ = 0;
+     int parserHold_ = -1;              // -1 unread; 1 = old path through av_parser (FRAME_CLIENT_PARSER_HOLD)   // parser: did this call's AU go to the decoder in this call?
+     bool latestFresh_ = false;
+     FrameTiming latestTiming_;
+-- 
+2.44.0
+

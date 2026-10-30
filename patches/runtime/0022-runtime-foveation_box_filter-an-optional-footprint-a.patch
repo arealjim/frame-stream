@@ -1,0 +1,168 @@
+From 5b79c65b3bc281872f34a8a86bcd565c9294975b Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 12:43:54 +0000
+Subject: [PATCH 22/23] runtime: foveation_box_filter, an optional footprint
+ average in the foveation kernel (default off)
+
+The kernel takes one bilinear tap per output pixel whatever the footprint, so the
+periphery (edge ratio 4-8) and a supersampled source are undersampled. With the knob
+on, round(footprint) bilinear taps per axis (up to 4x4) are averaged, with the source
+size and the flag carried in the uniforms, and one log line names the state.
+Measured 2026-10-19 on a 512-texel card in the centre of the eye: bit-identical at
+native size; identical at an exact 2x render, where the single tap already lands on
+the 2x2 block centre; the ceil rule blurred a 1.5x render (4 px period 0.83 -> 0.55),
+hence round and the default off until a peripheral measurement exists.
+
+---
+ runtime/src/Config.cpp      |  4 +++
+ runtime/src/Config.h        |  8 ++++++
+ runtime/src/VideoEncoder.h  |  2 ++
+ runtime/src/VideoEncoder.mm | 55 +++++++++++++++++++++++++++++++++++--
+ 4 files changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index 956f093..c16b200 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -429,6 +429,10 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             {
+                 values.encoderLowLatency = ParseBool(value);
+             }
++            else if (key == "foveation_box_filter")
++            {
++                values.foveationBoxFilter = ParseBool(value);
++            }
+             else if (key == "encoder_min_qp")
+             {
+                 values.encoderMinQp = static_cast<uint32_t>(std::max(0, std::min(51, std::stoi(value))));
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index 0b30d44..89a212d 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -35,6 +35,14 @@ struct ConfigValues
+     // scenes. Measured 2026-10-18, M5 Pro, 2560x1120 HEVC, bench "smooth" scene at 50 Mbps:
+     // 38.2 -> 49.8 Mbps actual, callback p50 9.6 -> 10.1 ms.
+     uint32_t encoderMinQp = 0;
++    // foveation_box_filter: the foveation kernel averages each output pixel's source footprint with
++    // round(footprint) bilinear taps per axis (up to 4x4) instead of one centre tap. Measured 2026-10-19
++    // on the 512-texel test card (centre of the eye): bit-identical at native size (footprint 1); at a
++    // 2x supersampled render the single bilinear tap already IS the 2x2 box (the centre maps 1:2
++    // exactly), so no change; at 1.5x the ceil rule blurred (4 px period 0.83 -> 0.55), hence round.
++    // The periphery (edge ratio 4-8, where one tap undersamples by that factor) is where it should
++    // matter and is unmeasured, so it stays off until a peripheral card says otherwise.
++    bool foveationBoxFilter = false;
+     // send_pacing_ms: spread each encoded frame's UDP packets evenly over this many ms instead
+     // of handing them to the socket as one burst (an AP queue under contention drops a burst's
+     // tail, and the XOR FEC cannot repair consecutive losses). Capped at 0.8 of the frame period;
+diff --git a/runtime/src/VideoEncoder.h b/runtime/src/VideoEncoder.h
+index bc1f351..bf4a94e 100644
+--- a/runtime/src/VideoEncoder.h
++++ b/runtime/src/VideoEncoder.h
+@@ -225,6 +225,8 @@ class VideoEncoder
+     uint32_t bitrateMbps_ = 50;
+     oxr::protocol::VideoCodec codec_ = oxr::protocol::VideoCodec::H265;
+     FoveationSettings foveationSettings_ = {};
++    bool foveationBoxFilter_ = true;   // foveation_box_filter: average each output pixel's source footprint
++    bool foveationBoxLogged_ = false;
+     bool tenBit_ = false;
+     bool forceSoftwareForTesting_ = false;
+     bool inProcessSessionHardware_ = false;
+diff --git a/runtime/src/VideoEncoder.mm b/runtime/src/VideoEncoder.mm
+index f7806d6..18933a5 100644
+--- a/runtime/src/VideoEncoder.mm
++++ b/runtime/src/VideoEncoder.mm
+@@ -81,6 +81,8 @@ struct MetalFoveationUniforms
+     vector_float2 edgeRatio;
+     vector_float2 eyeSizeRatio;
+     vector_uint2 sourceSrgb;
++    vector_uint2 sourceSize;   // source eye texture size in texels (footprint of one output pixel)
++    vector_uint2 boxFilter;    // x: 1 = average the output pixel's footprint (foveation_box_filter), y: unused
+ };
+ 
+ struct MetalVideoCopyUniforms
+@@ -150,6 +152,8 @@ struct FoveationUniforms
+     float2 edgeRatio;
+     float2 eyeSizeRatio;
+     uint2 sourceSrgb;
++    uint2 sourceSize;
++    uint2 boxFilter;
+ };
+ 
+ static float3 linear_to_srgb(float3 value)
+@@ -209,11 +213,46 @@ kernel void foveation_kernel(texture2d<float, access::sample> leftTexture [[text
+     float2 compressedUv;
+     compressedUv.x = compress_axis(eyeUv.x, params.centerSize.x, params.centerShift.x, params.edgeRatio.x);
+     compressedUv.y = compress_axis(eyeUv.y, params.centerSize.y, params.centerShift.y, params.edgeRatio.y);
++    // Footprint of this output pixel in the source (2026-10-19): the compressed uv of the next output
++    // pixel along each axis. One bilinear tap at the centre is exact only when the footprint is one source
++    // texel; the periphery (edge ratio 4-8) and any supersampled render (render_target_size_multiplier,
++    // steam_frame_dense) are undersampled by it, which the wearer sees as moire and a shimmering ring on
++    // 2-3 px detail. With foveation_box_filter the footprint is averaged with up to 4x4 bilinear taps.
++    float2 eyeUvNext = (float2(localX, gid.y) + float2(1.5)) / float2(eyeWidth, outputHeight)
++                       / max(params.eyeSizeRatio, float2(0.0001));
++    float2 stepUv;
++    stepUv.x = abs(compress_axis(eyeUvNext.x, params.centerSize.x, params.centerShift.x, params.edgeRatio.x) - compressedUv.x);
++    stepUv.y = abs(compress_axis(eyeUvNext.y, params.centerSize.y, params.centerShift.y, params.edgeRatio.y) - compressedUv.y);
+     compressedUv = clamp(compressedUv, float2(0.0), float2(1.0));
++    float2 footprint = stepUv * float2(params.sourceSize);
++    uint2 taps = params.boxFilter.x != 0
++        ? clamp(uint2(footprint + float2(0.5)), uint2(1), uint2(4))   // nearest: 1.5 texels stays one tap (measured 2026-10-19: ceil blurred a 4 px period to 0.55)
++        : uint2(1);
+ 
+-    float4 color = rightEye
+-        ? rightTexture.sample(linearSampler, compressedUv)
+-        : leftTexture.sample(linearSampler, compressedUv);
++    float4 color;
++    if (taps.x == 1 && taps.y == 1)
++    {
++        color = rightEye
++            ? rightTexture.sample(linearSampler, compressedUv)
++            : leftTexture.sample(linearSampler, compressedUv);
++    }
++    else
++    {
++        float2 tapStep = stepUv / float2(taps);
++        float2 start = compressedUv - stepUv * 0.5 + tapStep * 0.5;
++        float4 sum = float4(0.0);
++        for (uint j = 0; j < taps.y; ++j)
++        {
++            for (uint i = 0; i < taps.x; ++i)
++            {
++                float2 tapUv = clamp(start + tapStep * float2(i, j), float2(0.0), float2(1.0));
++                sum += rightEye
++                    ? rightTexture.sample(linearSampler, tapUv)
++                    : leftTexture.sample(linearSampler, tapUv);
++            }
++        }
++        color = sum / float(taps.x * taps.y);
++    }
+     if (params.sourceSrgb[rightEye ? 1 : 0] != 0)
+     {
+         color.rgb = linear_to_srgb(color.rgb);
+@@ -980,6 +1019,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+     }
+ 
+     const ConfigValues initialConfig = Config::Get().GetValues();
++    foveationBoxFilter_ = initialConfig.foveationBoxFilter;
+ 
+     // Which process encodes this codec, and why. Decided from what VideoToolbox
+     // will actually grant this process — not from its architecture — so the
+@@ -2000,6 +2040,15 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
+             oxrsys::video::IsSrgbTextureFormat(static_cast<uint64_t>(leftTex.pixelFormat)) ? 1u : 0u,
+             oxrsys::video::IsSrgbTextureFormat(static_cast<uint64_t>(rightTex.pixelFormat)) ? 1u : 0u,
+         };
++        uniforms.sourceSize = {(uint32_t)leftTex.width, (uint32_t)leftTex.height};
++        uniforms.boxFilter = {foveationBoxFilter_ ? 1u : 0u, 0u};
++        if (!foveationBoxLogged_)
++        {
++            foveationBoxLogged_ = true;
++            spdlog::info("VideoEncoder: foveation box filter {} (foveation_box_filter), source {}x{} -> eye {}x{}",
++                         foveationBoxFilter_ ? "on" : "off", (int)leftTex.width, (int)leftTex.height,
++                         foveationSettings_.targetEyeWidth, foveationSettings_.targetEyeHeight);
++        }
+ 
+         id<MTLComputeCommandEncoder> computeEncoder = [cmdBuf computeCommandEncoder];
+         if (computeEncoder == nil)
+-- 
+2.43.0
+

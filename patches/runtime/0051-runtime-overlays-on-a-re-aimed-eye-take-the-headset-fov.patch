@@ -1,0 +1,38 @@
+From e116a036f0c7f771a69b0099140cf06bd389fe5d Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 17:01:18 +0000
+Subject: [PATCH 51/52] runtime: overlays on a re-aimed eye take the headset's
+ fov
+
+Quad and cylinder layers are drawn into an eye after the eye is placed, so
+on an eye re-aimed into the headset's frustum their clip transform must use
+the headset's fov. With the app's fov, CyberpunkVRPort's HUD icons landed
+shifted in the left eye and read as two icons side by side.
+---
+ runtime/src/Session.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index 4ad8f01..9e3727e 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -1548,7 +1548,18 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+         for (uint32_t eye = 0; eye < 2; ++eye)
+         {
+             const XrCompositionLayerProjectionView& view = projection.views[eye];
+-            const glm::mat4 clip = oxrsys::runtime::OverlayClipFromLayer(view.pose, view.fov, location.pose, layerPose);
++            // The overlays are drawn into the eye after it is placed: an eye re-aimed into the headset's
++            // frustum (ValidateProjectionLayer) takes its overlays at the headset's fov, not the app's.
++            XrFovf fov = view.fov;
++            const FrameImageSource& eyeImage = eye == 0 ? frameSource.left : frameSource.right;
++            if (eyeImage.placeInEye)
++            {
++                fov.angleLeft = std::atan(eyeImage.eyeTan[0]);
++                fov.angleRight = std::atan(eyeImage.eyeTan[1]);
++                fov.angleUp = std::atan(eyeImage.eyeTan[2]);
++                fov.angleDown = std::atan(eyeImage.eyeTan[3]);
++            }
++            const glm::mat4 clip = oxrsys::runtime::OverlayClipFromLayer(view.pose, fov, location.pose, layerPose);
+             std::memcpy(overlay.clipFromLayer[eye], &clip[0][0], sizeof(overlay.clipFromLayer[eye]));
+         }
+ 

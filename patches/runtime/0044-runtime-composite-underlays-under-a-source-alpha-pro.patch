@@ -1,0 +1,395 @@
+From 1ea5be73aca0eddcd256a142ff940ec38e79a4ab Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 18:44:04 +0000
+Subject: [PATCH] runtime: composite underlays under a source-alpha projection
+ layer
+
+A quad or cylinder submitted before the projection layer was never drawn.
+That is right under an opaque projection, which hides it, but under a
+projection layer with XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+it should show through wherever the projection's alpha is below 1.
+
+Draw those layers into the eye copy with a premultiplied "under" blend
+(source x (1 - destination alpha) + destination), nearest the projection
+first, before the layers after it are drawn over. No extra texture or
+pass: both go through the one render pass, each with its own pipeline.
+OXRSYS_OVERLAY_UNDERLAYS=0 keeps the old behaviour.
+---
+ runtime/src/GraphicsTypes.h      |  4 +-
+ runtime/src/OverlayCompositor.h  | 10 ++--
+ runtime/src/OverlayCompositor.mm | 86 +++++++++++++++++++++++++-------
+ runtime/src/Session.cpp          | 29 ++++++++---
+ runtime/src/Session.h            |  8 +--
+ tests/TestOverlayCompositor.mm   | 65 ++++++++++++++++++++++++
+ 6 files changed, 169 insertions(+), 33 deletions(-)
+
+diff --git a/runtime/src/GraphicsTypes.h b/runtime/src/GraphicsTypes.h
+index 7f16086..7a6bbac 100644
+--- a/runtime/src/GraphicsTypes.h
++++ b/runtime/src/GraphicsTypes.h
+@@ -150,6 +150,8 @@ struct FrameOverlayLayer
+     float centralAngle = 0.0f;        // cylinder, radians
+     bool sourceAlpha = false;         // XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+     bool unpremultipliedAlpha = false; // XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT
++    bool underlay = false;            // submitted before the projection layer: drawn under the eye image,
++                                      // showing through where the projection's alpha is below 1
+ };
+ 
+ struct FrameSource
+@@ -157,7 +159,7 @@ struct FrameSource
+     FrameImageSource left = {};
+     FrameImageSource right = {};
+     bool alphaBlend = false;
+-    std::vector<FrameOverlayLayer> overlays = {}; // back to front, all after the projection layer
++    std::vector<FrameOverlayLayer> overlays = {}; // back to front in submit order; underlays first
+ 
+     bool IsStereoValid() const
+     {
+diff --git a/runtime/src/OverlayCompositor.h b/runtime/src/OverlayCompositor.h
+index 29edb50..531ffdc 100644
+--- a/runtime/src/OverlayCompositor.h
++++ b/runtime/src/OverlayCompositor.h
+@@ -13,8 +13,10 @@ namespace oxrsys::video
+ {
+ 
+ // Draws quad and cylinder composition layers into one eye's projection image
+-// on the encoder's command buffer, back to front, alpha-blended per the layer
+-// flags. The geometry (clip <- layer matrices) is computed by the Session from
++// on the encoder's command buffer, alpha-blended per the layer flags: underlays
++// first, nearest the projection first, UNDER the image (they fill only what its
++// alpha leaves uncovered), then the layers after the projection, back to front,
++// over it. The geometry (clip <- layer matrices) is computed by the Session from
+ // the projection view's own pose and fov; see CompositionOverlay.h.
+ class OverlayCompositor
+ {
+@@ -43,13 +45,13 @@ class OverlayCompositor
+     }
+ 
+ private:
+-    void* PipelineFor(void* device, uint64_t pixelFormat);
++    void* PipelineFor(void* device, uint64_t pixelFormat, bool under);
+ 
+     std::mutex mutex_;
+     void* device_ = nullptr;   // id<MTLDevice>, not retained (owned by the encoder)
+     void* library_ = nullptr;  // id<MTLLibrary>
+     void* sampler_ = nullptr;  // id<MTLSamplerState>
+-    std::map<uint64_t, void*> pipelines_; // MTLPixelFormat -> id<MTLRenderPipelineState>
++    std::map<uint64_t, void*> pipelines_; // MTLPixelFormat * 2 + under -> id<MTLRenderPipelineState>
+     bool failed_ = false;
+ };
+ 
+diff --git a/runtime/src/OverlayCompositor.mm b/runtime/src/OverlayCompositor.mm
+index 628bd37..671a519 100644
+--- a/runtime/src/OverlayCompositor.mm
++++ b/runtime/src/OverlayCompositor.mm
+@@ -210,7 +210,7 @@ OverlayCompositor::~OverlayCompositor()
+     }
+ }
+ 
+-void* OverlayCompositor::PipelineFor(void* deviceHandle, uint64_t pixelFormat)
++void* OverlayCompositor::PipelineFor(void* deviceHandle, uint64_t pixelFormat, bool under)
+ {
+     id<MTLDevice> device = (id<MTLDevice>)deviceHandle;
+     if (device_ != nullptr && device_ != deviceHandle)
+@@ -239,7 +239,8 @@ void* OverlayCompositor::PipelineFor(void* deviceHandle, uint64_t pixelFormat)
+         return nullptr;
+     }
+ 
+-    auto existing = pipelines_.find(pixelFormat);
++    const uint64_t key = pixelFormat * 2 + (under ? 1 : 0);
++    auto existing = pipelines_.find(key);
+     if (existing != pipelines_.end())
+     {
+         return existing->second;
+@@ -285,10 +286,21 @@ void* OverlayCompositor::PipelineFor(void* deviceHandle, uint64_t pixelFormat)
+     color.blendingEnabled = YES;
+     color.rgbBlendOperation = MTLBlendOperationAdd;
+     color.alphaBlendOperation = MTLBlendOperationAdd;
+-    color.sourceRGBBlendFactor = MTLBlendFactorOne;
+-    color.sourceAlphaBlendFactor = MTLBlendFactorOne;
+-    color.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+-    color.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
++    if (under)
++    {
++        // Premultiplied "under": the layer fills only what the image's alpha leaves uncovered.
++        color.sourceRGBBlendFactor = MTLBlendFactorOneMinusDestinationAlpha;
++        color.sourceAlphaBlendFactor = MTLBlendFactorOneMinusDestinationAlpha;
++        color.destinationRGBBlendFactor = MTLBlendFactorOne;
++        color.destinationAlphaBlendFactor = MTLBlendFactorOne;
++    }
++    else
++    {
++        color.sourceRGBBlendFactor = MTLBlendFactorOne;
++        color.sourceAlphaBlendFactor = MTLBlendFactorOne;
++        color.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
++        color.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
++    }
+ 
+     NSError* error = nil;
+     id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+@@ -302,8 +314,8 @@ void* OverlayCompositor::PipelineFor(void* deviceHandle, uint64_t pixelFormat)
+         failed_ = true;
+         return nullptr;
+     }
+-    pipelines_[pixelFormat] = (void*)pipeline;
+-    spdlog::info("OverlayCompositor: overlay pipeline ready for format {}", pixelFormat);
++    pipelines_[key] = (void*)pipeline;
++    spdlog::info("OverlayCompositor: {} pipeline ready for format {}", under ? "underlay" : "overlay", pixelFormat);
+     return (void*)pipeline;
+ }
+ 
+@@ -322,9 +334,28 @@ int OverlayCompositor::Draw(void* commandBufferHandle, void* targetHandle, uint3
+     }
+ 
+     std::lock_guard<std::mutex> lock(mutex_);
+-    id<MTLRenderPipelineState> pipeline =
+-        (id<MTLRenderPipelineState>)PipelineFor((void*)commandBuffer.device, (uint64_t)target.pixelFormat);
+-    if (pipeline == nil)
++    bool anyUnder = false;
++    bool anyOver = false;
++    for (const auto& overlay : overlays)
++    {
++        if ((overlay.eyeMask & (1u << eyeIndex)) != 0)
++        {
++            (overlay.underlay ? anyUnder : anyOver) = true;
++        }
++    }
++    id<MTLRenderPipelineState> underPipeline = nil;
++    id<MTLRenderPipelineState> overPipeline = nil;
++    if (anyUnder)
++    {
++        underPipeline = (id<MTLRenderPipelineState>)PipelineFor((void*)commandBuffer.device,
++                                                                (uint64_t)target.pixelFormat, true);
++    }
++    if (anyOver)
++    {
++        overPipeline = (id<MTLRenderPipelineState>)PipelineFor((void*)commandBuffer.device,
++                                                               (uint64_t)target.pixelFormat, false);
++    }
++    if ((anyUnder && underPipeline == nil) || (anyOver && overPipeline == nil))
+     {
+         return -1;
+     }
+@@ -338,22 +369,16 @@ int OverlayCompositor::Draw(void* commandBufferHandle, void* targetHandle, uint3
+     {
+         return -1;
+     }
+-    [encoder setRenderPipelineState:pipeline];
+     [encoder setCullMode:MTLCullModeNone];
+     [encoder setFragmentSamplerState:(id<MTLSamplerState>)sampler_ atIndex:0];
+ 
+     const bool targetIsLinear = IsSrgbTextureFormat(static_cast<uint64_t>(target.pixelFormat));
+     int drawn = 0;
+-    for (const auto& overlay : overlays)
+-    {
+-        if ((overlay.eyeMask & (1u << eyeIndex)) == 0)
+-        {
+-            continue;
+-        }
++    auto drawLayer = [&](const FrameOverlayLayer& overlay) {
+         id<MTLTexture> image = (id<MTLTexture>)overlay.image.GetImage();
+         if (image == nil || image.width == 0 || image.height == 0)
+         {
+-            continue;
++            return;
+         }
+ 
+         OverlayUniforms u = {};
+@@ -397,6 +422,29 @@ int OverlayCompositor::Draw(void* commandBufferHandle, void* targetHandle, uint3
+         [encoder setFragmentTexture:image atIndex:0];
+         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:u.columns * 6];
+         ++drawn;
++    };
++    if (anyUnder)
++    {
++        // Under the image, the one nearest the projection first, so each fills only what is still uncovered.
++        [encoder setRenderPipelineState:underPipeline];
++        for (auto it = overlays.rbegin(); it != overlays.rend(); ++it)
++        {
++            if (it->underlay && (it->eyeMask & (1u << eyeIndex)) != 0)
++            {
++                drawLayer(*it);
++            }
++        }
++    }
++    if (anyOver)
++    {
++        [encoder setRenderPipelineState:overPipeline];
++        for (const auto& overlay : overlays)
++        {
++            if (!overlay.underlay && (overlay.eyeMask & (1u << eyeIndex)) != 0)
++            {
++                drawLayer(overlay);
++            }
++        }
+     }
+     [encoder endEncoding];
+     return drawn;
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index 7e217c4..b652742 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -15,6 +15,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <ctime>
+ #include <exception>
+@@ -1093,7 +1094,17 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+         return;
+     }
+ 
++    // Layers before the projection layer show only through its alpha, and only when it is
++    // composited by source alpha; under an opaque projection they are hidden, as the spec asks.
++    // OXRSYS_OVERLAY_UNDERLAYS=0 skips them always (the 0031 behaviour, and the A/B lever).
++    static const bool underlaysEnabled = []() {
++        const char* value = std::getenv("OXRSYS_OVERLAY_UNDERLAYS");
++        return value == nullptr || std::strcmp(value, "0") != 0;
++    }();
++    const bool projectionShowsUnderlays =
++        underlaysEnabled && (projection.layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
+     static std::atomic_bool loggedUnderlay{false};
++    static std::atomic_bool loggedFirstUnderlay{false};
+     static std::atomic_bool loggedInfiniteCylinder{false};
+     static std::atomic_bool loggedFirstOverlay{false};
+     static std::atomic_bool loggedViewSpaceOverlay{false};
+@@ -1107,19 +1118,20 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+         {
+             continue;
+         }
+-        if (i < projectionLayerIndex)
++        const bool underlay = i < projectionLayerIndex;
++        if (underlay && !projectionShowsUnderlays)
+         {
+-            // Behind the projection layer. With an opaque projection it is hidden,
+-            // which is what the spec asks; under a source-alpha projection it would
+-            // show through, and we do not composite underlays yet.
+             if (!loggedUnderlay.exchange(true))
+             {
+-                spdlog::info("OXRSys: a quad/cylinder layer submitted before the projection layer is not drawn (underlays are not composited)");
++                spdlog::info("OXRSys: a quad/cylinder layer submitted before the projection layer is not drawn ({})",
++                             underlaysEnabled ? "the projection layer is opaque, so it hides it"
++                                              : "OXRSYS_OVERLAY_UNDERLAYS=0");
+             }
+             continue;
+         }
+ 
+         FrameOverlayLayer overlay = {};
++        overlay.underlay = underlay;
+         XrSpace layerSpaceHandle = XR_NULL_HANDLE;
+         XrPosef layerPose = {};
+         XrEyeVisibility eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+@@ -1217,7 +1229,12 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+             spdlog::info("OXRSys: a {} layer is in VIEW space (head-locked); it is composited with the scene, so it trails head turns by the stream latency",
+                          isQuad ? "quad" : "cylinder");
+         }
+-        if (!loggedFirstOverlay.exchange(true))
++        if (underlay && !loggedFirstUnderlay.exchange(true))
++        {
++            spdlog::info("OXRSys: compositing a {} layer under the source-alpha projection layer (an underlay)",
++                         isQuad ? "quad" : "cylinder");
++        }
++        if (!underlay && !loggedFirstOverlay.exchange(true))
+         {
+             spdlog::info("OXRSys: compositing {} layer into the eye images ({}x{} m, image {}x{}, alpha={})",
+                          isQuad ? "quad" : "cylinder",
+diff --git a/runtime/src/Session.h b/runtime/src/Session.h
+index cc84455..551c8e7 100644
+--- a/runtime/src/Session.h
++++ b/runtime/src/Session.h
+@@ -122,9 +122,11 @@ class Session
+                                      FrameSource& frameSource) const;
+     XrResult ValidateQuadLayer(const XrCompositionLayerQuad& layer) const;
+     XrResult ValidateCylinderLayer(const XrCompositionLayerCylinderKHR& layer) const;
+-    // Turns the quad and cylinder layers submitted after the projection layer
+-    // into overlays drawn into each eye before encode. Never fails the frame:
+-    // an overlay that cannot be placed this frame is skipped.
++    // Turns the quad and cylinder layers into overlays drawn into each eye before
++    // encode: those after the projection layer over it, those before it under it
++    // (only when the projection layer blends by source alpha; otherwise they are
++    // hidden, as the spec asks). Never fails the frame: an overlay that cannot be
++    // placed this frame is skipped.
+     void AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t projectionLayerIndex,
+                              FrameSource& frameSource) const;
+ 
+diff --git a/tests/TestOverlayCompositor.mm b/tests/TestOverlayCompositor.mm
+index a71e2bb..499d7a0 100644
+--- a/tests/TestOverlayCompositor.mm
++++ b/tests/TestOverlayCompositor.mm
+@@ -175,6 +175,71 @@ TEST_CASE("Source alpha blends, its absence is opaque", "[overlay][metal]")
+     }
+ }
+ 
++TEST_CASE("Underlays show only through the projection's alpha, the nearest on top", "[overlay][metal]")
++{
++    @autoreleasepool
++    {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        OverlayCompositor compositor;
++        const XrFovf fov = {-kPi / 4, kPi / 4, kPi / 4, -kPi / 4};
++
++        // A source-alpha projection image, premultiplied: left half opaque blue, right half clear
++        // below the middle and half-alpha blue above it.
++        std::vector<Bgra> scene(kEye * kEye);
++        for (uint32_t y = 0; y < kEye; ++y)
++        {
++            for (uint32_t x = 0; x < kEye; ++x)
++            {
++                scene[y * kEye + x] = x < kEye / 2 ? Bgra{255, 0, 0, 255}
++                                    : (y < kEye / 2 ? Bgra{128, 0, 0, 128} : Bgra{0, 0, 0, 0});
++            }
++        }
++        id<MTLTexture> eye = MakeTexture(device, MTLPixelFormatBGRA8Unorm, kEye, kEye, scene);
++        id<MTLTexture> red = MakeTexture(device, MTLPixelFormatBGRA8Unorm, 1, 1, {Bgra{0, 0, 255, 255}});
++        id<MTLTexture> green = MakeTexture(device, MTLPixelFormatBGRA8Unorm, 1, 1, {Bgra{0, 255, 0, 255}});
++        id<MTLTexture> white = MakeTexture(device, MTLPixelFormatBGRA8Unorm, 1, 1, {Bgra{255, 255, 255, 255}});
++
++        // Submit order: far underlay (red, fills the view), near underlay (green, pixels 75-125),
++        // projection, then an overlay (white, pixels 95-105).
++        FrameOverlayLayer far = Overlay(red, fov, At(0, 0, -2));
++        far.width = far.height = 4.0f;
++        far.underlay = true;
++        FrameOverlayLayer near = Overlay(green, fov, At(0, 0, -2));
++        near.width = near.height = 1.0f;
++        near.underlay = true;
++        FrameOverlayLayer over = Overlay(white, fov, At(0, 0, -2));
++        over.width = over.height = 0.2f;
++        Draw(queue, compositor, eye, {far, near, over}, 3);
++
++        Bgra p = ReadPixel(eye, 40, 160); // opaque scene: both underlays hidden
++        CHECK(p.b == 255);
++        CHECK(p.r == 0);
++        CHECK(p.g == 0);
++        p = ReadPixel(eye, 112, 112);     // clear scene over the near underlay: green, now opaque
++        CHECK(p.g >= 253);
++        CHECK(p.r <= 2);
++        CHECK(p.a >= 253);
++        p = ReadPixel(eye, 160, 160);     // clear scene, outside the near one: the far underlay
++        CHECK(p.r >= 253);
++        CHECK(p.g <= 2);
++        p = ReadPixel(eye, 160, 40);      // half-alpha blue over red: half of each
++        CHECK(std::abs(int(p.b) - 128) <= 2);
++        CHECK(std::abs(int(p.r) - 127) <= 2);
++        CHECK(p.a >= 253);
++        p = ReadPixel(eye, 100, 100);     // the overlay is on top of everything
++        CHECK(p.r >= 253);
++        CHECK(p.g >= 253);
++        CHECK(p.b >= 253);
++
++        [eye release];
++        [red release];
++        [green release];
++        [white release];
++        [queue release];
++    }
++}
++
+ TEST_CASE("Display-encoded bytes keep their value across sRGB and UNORM formats", "[overlay][metal]")
+ {
+     @autoreleasepool
+-- 
+2.43.0
+

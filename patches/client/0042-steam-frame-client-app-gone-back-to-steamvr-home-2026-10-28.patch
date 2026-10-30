@@ -1,0 +1,195 @@
+From d3f1fcb404ae36b4fb8cc8d1ec35b00b057586fd Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 10:36:37 +0000
+Subject: [PATCH] steam-frame client: go back to SteamVR home when the app on
+ the Mac is gone
+
+The headset kept showing the app's last frame after the app quit or crashed, which reads as a freeze.
+
+- On the server's stream-end marker (VIDEO_FLAG_STREAM_END) the client disconnects and looks for the server for
+  5 s, since xrEndSession sends it too and an app may begin a new session; if none comes back it ends its
+  session (the Ctrl-C path: xrRequestExitSession, exit 0), SteamVR shows its home, and the launcher's unit does
+  not restart it (it restarts on status 4 only).
+- A crashed app sends no marker: FRAME_CLIENT_APP_GONE_S seconds (default 20, 0 = marker only) with no video,
+  after video had started on the connection, end the session the same way.
+
+Tested 10-28 on the stand: Unreal SIGTERM (RequestExit) -> marker, home 6 s after the quit; Godot SIGTERM (no
+teardown) -> home on the 20 s rule. 742 unit checks green.
+
+---
+ clients/steam-frame/src/NetworkReceiver.cpp   |  9 +++++
+ clients/steam-frame/src/NetworkReceiver.h     |  3 ++
+ clients/steam-frame/src/main.cpp              | 35 +++++++++++++++++++
+ clients/steam-frame/src/stream_connection.cpp | 15 ++++++++
+ clients/steam-frame/src/stream_connection.h   |  6 ++++
+ .../include/oxrsys/protocol/Protocol.h        |  1 +
+ 6 files changed, 69 insertions(+)
+
+diff --git a/clients/steam-frame/src/NetworkReceiver.cpp b/clients/steam-frame/src/NetworkReceiver.cpp
+index ae834e1..77c3740 100644
+--- a/clients/steam-frame/src/NetworkReceiver.cpp
++++ b/clients/steam-frame/src/NetworkReceiver.cpp
+@@ -243,6 +243,7 @@ bool NetworkReceiver::StartReceiving(const char* serverIp, uint16_t videoPort,
+                                      OnNalUnitCallback callback,
+                                      OnConnectionLostCallback connectionLostCallback)
+ {
++    streamEnded_.store(false);
+     videoServer_ = {};
+     videoServer_.sin_family = AF_INET;
+     videoServer_.sin_port = htons(videoPort);
+@@ -364,6 +365,7 @@ void NetworkReceiver::WireAssemblerCallbacks()
+ bool NetworkReceiver::StartReceivingTcp(uint16_t videoPort, OnNalUnitCallback callback,
+                                         OnConnectionLostCallback connectionLostCallback)
+ {
++    streamEnded_.store(false);
+     videoSocket_ = socket(AF_INET, SOCK_STREAM, 0);
+     if (videoSocket_ < 0)
+     {
+@@ -459,6 +461,13 @@ void NetworkReceiver::ReceiveThread(OnNalUnitCallback callback)
+             continue;
+         }
+ 
++        // The server's session ended (the app quit): a bare header, no payload. Latched for the frame loop.
++        if (header->flags & protocol::VIDEO_FLAG_STREAM_END)
++        {
++            if (!streamEnded_.exchange(true)) LOGI("The server says the stream ended (the app quit)");
++            continue;
++        }
++
+         // Review 2026-10-21 (H3/H4): bound the header before the assembler sizes anything from it. Parity packets
+         // carry their group index in packetIndex, so only data packets get the index check.
+         if (header->totalPackets == 0 || header->totalPackets > kMaxPacketsPerFrame ||
+diff --git a/clients/steam-frame/src/NetworkReceiver.h b/clients/steam-frame/src/NetworkReceiver.h
+index ae7340f..e89faff 100644
+--- a/clients/steam-frame/src/NetworkReceiver.h
++++ b/clients/steam-frame/src/NetworkReceiver.h
+@@ -80,6 +80,8 @@ class NetworkReceiver
+     // nothing new reaches the screen. A keyframe lost whole raises no second abandon, so the
+     // caller re-asks while this holds (2026-10-24: 1-2 s freezes waiting for the periodic IDR).
+     bool AwaitingKeyframe() const { return awaitingKeyframe_.load(); }
++    // The server said its session ended (VIDEO_FLAG_STREAM_END): the app quit.
++    bool StreamEnded() const { return streamEnded_.load(); }
+     uint32_t GetFecRecoveries() const { return fecRecoveries_.load(); }
+ 
+     // Render pose from the server (set when VIDEO_FLAG_RENDER_POSE packets arrive)
+@@ -158,6 +160,7 @@ class NetworkReceiver
+     std::atomic<uint32_t> framesDropped_{0};
+     std::atomic<bool> needKeyframe_{false};
+     std::atomic<bool> awaitingKeyframe_{false};
++    std::atomic<bool> streamEnded_{false};
+     std::atomic<uint32_t> fecRecoveries_{0};
+     std::atomic<uint32_t> nacksSent_{0};
+     std::atomic<int64_t> lastCompletedFrameReceiveTimeNs_{0};
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 0836373..53982b4 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -2321,8 +2321,16 @@ int main(int argc, char** argv)
+     };
+     if (g_streamMode) LOG_INFO("video watchdog: %s", kStallS > 0 ? "on - reconnect after FRAME_CLIENT_VIDEO_STALL_S with no video and data unread, exit 4 if stuck" : "off (FRAME_CLIENT_VIDEO_STALL_S=0)");
+     if (g_streamMode) LOG_INFO("reconnect: %s", kReconnectS > 0 ? "on - when the server announces again, the link closes, or no first video arrives (FRAME_CLIENT_RECONNECT_S)" : "off (FRAME_CLIENT_RECONNECT_S=0)");
++    // App gone (2026-10-28): when the app on the Mac quits, the headset kept showing its last frame, which reads as
++    // a freeze. The server now sends a stream-end marker as its session stops; the client then ends its own
++    // session and exits 0, so SteamVR goes back to its home and the unit does not restart it. A crashed app sends
++    // no marker: FRAME_CLIENT_APP_GONE_S seconds (default 20; 0 = marker only) with no video after video had
++    // started do the same. Long enough for a loading screen that stops submitting.
++    const double kAppGoneS = getenv("FRAME_CLIENT_APP_GONE_S") ? atof(getenv("FRAME_CLIENT_APP_GONE_S")) : 20.0;
++    if (g_streamMode) LOG_INFO("app gone: exit to SteamVR home on the server's stream-end marker%s", kAppGoneS > 0 ? " or after FRAME_CLIENT_APP_GONE_S with no video" : "");
+     std::chrono::steady_clock::time_point searchingSince{};
+     uint32_t reconnects = 0;
++    std::chrono::steady_clock::time_point endedAt{};   // set while waiting out a stream end
+     bool exitAsked = false;
+     std::chrono::steady_clock::time_point exitAskedAt{};
+     while (!app.exitRequested) {
+@@ -2335,6 +2343,33 @@ int main(int argc, char** argv)
+             if (XR_FAILED(xrRequestExitSession(app.session))) { LOG_INFO("session not running; leaving the loop"); break; }   // review M1
+         }
+         if (exitAsked && std::chrono::steady_clock::now() - exitAskedAt > std::chrono::seconds(3)) { LOG_INFO("no EXITING within 3 s; leaving the loop"); break; }
++        if (g_streamMode && g_running && !exitAsked) {
++            // The marker also comes from xrEndSession, and an app may end one session and begin another: look for
++            // the server for kEndGraceS first, and leave only if it does not come back.
++            constexpr double kEndGraceS = 5.0;
++            const char* gone = nullptr;
++            if (endedAt.time_since_epoch().count() != 0) {
++                if (g_stream.Connected() && !g_stream.Reconnecting()) { LOG_INFO("app gone: the server came back; streaming on"); endedAt = {}; }
++                else if (MsSince(endedAt) > kEndGraceS * 1000.0) {
++                    LOG_INFO("app gone: no server within %.0f s of the stream end; ending the session, back to SteamVR home", kEndGraceS);
++                    g_running = 0;   // the Ctrl-C path above: xrRequestExitSession, then exit 0
++                    continue;
++                }
++            } else if (!g_stream.Reconnecting() && g_stream.AppGone(kAppGoneS, &gone)) {
++                if (g_stream.Ended()) {
++                    LOG_INFO("app gone: %s; looking for the server for %.0f s before leaving", gone ? gone : "?", kEndGraceS);
++                    g_stream.Disconnect();
++                    g_poseEpoch++;
++                    endedAt = std::chrono::steady_clock::now();
++                    searchingSince = endedAt;
++                    if (!g_stream.StartReconnect(&g_decoder)) LOG_ERROR("could not restart discovery");
++                } else {
++                    LOG_INFO("app gone: %s; ending the session, back to SteamVR home", gone ? gone : "?");
++                    g_running = 0;
++                    continue;
++                }
++            }
++        }
+         if (g_streamMode && kReconnectS > 0 && !exitAsked) {
+             const char* why = nullptr;
+             std::string stall;
+diff --git a/clients/steam-frame/src/stream_connection.cpp b/clients/steam-frame/src/stream_connection.cpp
+index 4fd6954..7996461 100644
+--- a/clients/steam-frame/src/stream_connection.cpp
++++ b/clients/steam-frame/src/stream_connection.cpp
+@@ -148,6 +148,21 @@ bool StreamConnection::Lost(double firstVideoS, const char** reason) const
+     return false;
+ }
+ 
++bool StreamConnection::AppGone(double idleS, const char** reason) const
++{
++    if (!connected_.load() || !net_) return false;
++    if (net_->StreamEnded()) { if (reason) *reason = "the server says the app quit"; return true; }
++    if (idleS <= 0.0) return false;
++    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++    const int64_t lastFrame = net_->GetLastCompletedFrameReceiveTimeNs();
++    if (lastFrame <= connectedAtNs_.load() || now - lastFrame < (int64_t)(idleS * 1e9)) return false;
++    if (reason) *reason = "no video since the app's last frame for FRAME_CLIENT_APP_GONE_S (the app stopped or crashed)";
++    return true;
++}
++
++bool StreamConnection::Ended() const { return connected_.load() && net_ && net_->StreamEnded(); }
++
+ bool StreamConnection::VideoStalled(double stallS, std::string* detail) const
+ {
+     if (stallS <= 0.0 || !connected_.load() || !net_) return false;
+diff --git a/clients/steam-frame/src/stream_connection.h b/clients/steam-frame/src/stream_connection.h
+index 9ccc83d..d02964c 100644
+--- a/clients/steam-frame/src/stream_connection.h
++++ b/clients/steam-frame/src/stream_connection.h
+@@ -51,6 +51,12 @@ class StreamConnection {
+     // reading (the start-up freeze: first frame, then nothing, while the server sends at full rate). An idle app
+     // leaves the socket empty, so it never trips this. detail (optional) gets the numbers for the log.
+     bool VideoStalled(double stallS, std::string* detail) const;
++    // The app on the Mac is gone: the server sent its stream-end marker (a clean quit), or video had started on
++    // this connection and none has arrived for idleS seconds (a crashed app sends no marker; <= 0: marker only).
++    // reason names which.
++    bool AppGone(double idleS, const char** reason) const;
++    // True when the server's stream-end marker arrived on this connection.
++    bool Ended() const;
+ 
+     // Send a fully-built tracking packet upstream (V4: head + controllers + hands).
+     void SendTrackingPacket(const oxr::protocol::TrackingPacket& pkt);
+diff --git a/common/protocol/include/oxrsys/protocol/Protocol.h b/common/protocol/include/oxrsys/protocol/Protocol.h
+index 76de12e..c0b250e 100644
+--- a/common/protocol/include/oxrsys/protocol/Protocol.h
++++ b/common/protocol/include/oxrsys/protocol/Protocol.h
+@@ -288,6 +288,7 @@ enum VideoFlags : uint8_t
+     VIDEO_FLAG_FEC = 0x10,     // Forward Error Correction parity packet
+     VIDEO_FLAG_RENDER_POSE = 0x20, // Payload contains the server's render pose for this frame
+     VIDEO_FLAG_ALPHA_BLEND = 0x40, // App submitted alpha-blend environment or source-alpha projection layer
++    VIDEO_FLAG_STREAM_END = 0x80,  // The server's session ended: a bare header, totalPackets 0, no payload
+     VIDEO_FLAG_FOVEATION_CENTER = 0x80, // foveationCenterX/Y carry this frame's gaze-driven centre
+ };
+ 
+-- 
+2.44.0
+

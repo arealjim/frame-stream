@@ -1,0 +1,255 @@
+From a1b0c038f4deee874a0259c21a917e0941a75fcc Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 13:59:18 +0000
+Subject: [PATCH 13/23] runtime: encoder_min_qp lets the low-latency encoder
+ spend its bitrate
+
+The low-latency (rtvc) VideoToolbox session floors frame QP at 16 and stops
+there, so past a scene-dependent size it leaves the bitrate unspent: on the
+bench smooth scene at 2560x1120 it sends 38.2 Mbps whether asked for 50 or 150
+(measured 2026-10-18, M5 Pro, sparse 15 Hz submits). Live, a simpler scene sent
+7 Mbps at 150. MinAllowedFrameQP is the only property that moves it: 12 gives
+49.8 Mbps at 50 (callback p50 10.2 vs 10.2 ms in back-to-back runs, 9.6 to 10.1
+in the sweep), 14 gives 45.2, 18 and 20 cut bits. ConstantBitRate, Quality,
+PrioritizeEncodingSpeedOverQuality and SpatialAdaptiveQPLevel are refused by the
+rtvc session (-12900); MaxAllowedFrameQP, DataRateLimits removed or tight and
+BaseLayerBitRateFraction change nothing; ExpectedFrameRate 0 stops all output.
+
+New config encoder_min_qp, default 0 = the encoder floor (current behaviour),
+clamped to 0..51, applied to the in-process session with a log line, refused
+loudly. Config test covers default, value and clamp. The encoder bench gains
+--pattern texture|scene|smooth so bytes per frame mean something.
+
+---
+ CHANGES.md                  |  5 +++++
+ runtime/oxrsys-runtime.toml |  6 ++++++
+ runtime/src/Config.cpp      |  4 ++++
+ runtime/src/Config.h        |  6 ++++++
+ runtime/src/VideoEncoder.mm | 19 ++++++++++++++++
+ tests/TestConfig.cpp        | 20 +++++++++++++++++
+ tools/EncoderBench.mm       | 43 ++++++++++++++++++++++++++++++++++---
+ 7 files changed, 100 insertions(+), 3 deletions(-)
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 37a20d3..7faaaa2 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -6,6 +6,11 @@ ## 1.3.0 - TBD
+ 
+ ### Added
+ 
++- Added config encoder_min_qp (default 0 = VideoToolbox's own floor): the minimum frame QP of the
++  in-process encoder session. The low-latency (rtvc) session floors QP at 16 and stops spending
++  bits there whatever the bitrate; 12 lets it reach the target (bench, 2560x1120 at 50 Mbps:
++  38.2 -> 49.8 Mbps actual, callback p50 +0.5 ms). The encoder bench gains --pattern
++  texture|scene|smooth.
+ - The streaming "encode queue" log line ends with frameBytes(min/med/max)=a/b/c small=k/n: encoded
+   bytes per frame over the window and how many of its n frames were under 20 % of the median (a
+   duplicate frame reaching the encoder shows up there).
+diff --git a/runtime/oxrsys-runtime.toml b/runtime/oxrsys-runtime.toml
+index f7cc713..50db0ee 100644
+--- a/runtime/oxrsys-runtime.toml
++++ b/runtime/oxrsys-runtime.toml
+@@ -61,6 +61,12 @@ pacing_thread = "default"
+ # to ~8.0 ms at 2272x1264 H.265 (M5 Pro, 2026-10-17). Set false to compare.
+ encoder_low_latency = true
+ 
++# Lowest QP the in-process encoder may use (MinAllowedFrameQP); 0 keeps VideoToolbox's floor.
++# The low-latency session floors at QP 16 and then leaves bitrate unspent on simple scenes;
++# 12 lets it spend up to the target (2560x1120 at 50 Mbps: 38 -> 50 Mbps actual, +0.5 ms
++# callback; M5 Pro, 2026-10-18). More bits per frame: check the link can carry them.
++encoder_min_qp = 0
++
+ # Skip the per-frame BT.709 video-range conversion in front of the low-latency (or software)
+ # encoder session (about 1 ms of submit per frame): the stream is then FULL range and its VUI
+ # says so. Only for clients that honour the signalled range (Steam Frame client, 2026-10-17);
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index e51c7f8..cec86c7 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -416,6 +416,10 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             {
+                 values.encoderLowLatency = ParseBool(value);
+             }
++            else if (key == "encoder_min_qp")
++            {
++                values.encoderMinQp = static_cast<uint32_t>(std::max(0, std::min(51, std::stoi(value))));
++            }
+             else if (key == "encoder_full_range")
+             {
+                 values.encoderFullRange = ParseBool(value);
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index f2985e5..b21c99e 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -29,6 +29,12 @@ struct ConfigValues
+     // no periodic IDR (keyframes come from ForceKeyFrame, i.e. client requests).
+     // Measured 2026-10-17, M5 Pro, 2272x1264 HEVC @72: encode callback 12.6 -> 8.0 ms.
+     bool encoderLowLatency = true;
++    // encoder_min_qp: kVTCompressionPropertyKey_MinAllowedFrameQP on the in-process session,
++    // 0 = leave VideoToolbox's own floor. The low-latency (rtvc) session floors QP at 16 and
++    // then stops spending bits whatever the bitrate; 12 lets it reach the target on detailed
++    // scenes. Measured 2026-10-18, M5 Pro, 2560x1120 HEVC, bench "smooth" scene at 50 Mbps:
++    // 38.2 -> 49.8 Mbps actual, callback p50 9.6 -> 10.1 ms.
++    uint32_t encoderMinQp = 0;
+     // pacing_spin_ms: WaitFrame sleeps until (deadline - this) and spins the rest. 0 = sleep to the deadline.
+     float pacingSpinMs = 0.0f;
+     // pacing_thread: "default" | "qos" (USER_INTERACTIVE QoS on the app thread that calls WaitFrame)
+diff --git a/runtime/src/VideoEncoder.mm b/runtime/src/VideoEncoder.mm
+index ce6aa3f..726edd7 100644
+--- a/runtime/src/VideoEncoder.mm
++++ b/runtime/src/VideoEncoder.mm
+@@ -1136,6 +1136,25 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+         kVTCompressionPropertyKey_MaxFrameDelayCount, delayRef);
+     CFRelease(delayRef);
+ 
++    // A QP floor below VideoToolbox's own lets the low-latency session spend the
++    // bitrate it is given (Config.h encoder_min_qp); 0 leaves the encoder's floor.
++    if (config.encoderMinQp > 0)
++    {
++        int minQp = (int)config.encoderMinQp;
++        CFNumberRef minQpRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &minQp);
++        const OSStatus minQpStatus = VTSessionSetProperty(compressionSession,
++            kVTCompressionPropertyKey_MinAllowedFrameQP, minQpRef);
++        CFRelease(minQpRef);
++        if (minQpStatus == noErr)
++        {
++            spdlog::info("VideoEncoder: minimum frame QP {} (encoder_min_qp)", minQp);
++        }
++        else
++        {
++            spdlog::warn("VideoEncoder: encoder_min_qp {} refused by this session ({})", minQp, minQpStatus);
++        }
++    }
++
+     VTCompressionSessionPrepareToEncodeFrames(compressionSession);
+     {
+         std::lock_guard<std::mutex> sessionLock(videoToolboxSessionMutex_);
+diff --git a/tests/TestConfig.cpp b/tests/TestConfig.cpp
+index 9a115a1..e58e482 100644
+--- a/tests/TestConfig.cpp
++++ b/tests/TestConfig.cpp
+@@ -181,6 +181,26 @@ encoder_low_latency = false
+     CHECK(ParseConfigToml(off).encoderLowLatency == false);
+ }
+ 
++TEST_CASE("Config parser reads encoder_min_qp, 0 by default, clamped to the HEVC range", "[config]")
++{
++    CHECK(ConfigValues{}.encoderMinQp == 0);
++    std::istringstream twelve(R"TOML(
++[streaming]
++encoder_min_qp = 12
++)TOML");
++    CHECK(ParseConfigToml(twelve).encoderMinQp == 12);
++    std::istringstream high(R"TOML(
++[streaming]
++encoder_min_qp = 80
++)TOML");
++    CHECK(ParseConfigToml(high).encoderMinQp == 51);
++    std::istringstream negative(R"TOML(
++[streaming]
++encoder_min_qp = -3
++)TOML");
++    CHECK(ParseConfigToml(negative).encoderMinQp == 0);
++}
++
+ TEST_CASE("Config parser keeps encoder_helper tri-state with an automatic default", "[config]")
+ {
+     // Default: the runtime decides from the measured hardware-encoder
+diff --git a/tools/EncoderBench.mm b/tools/EncoderBench.mm
+index 98bccbb..75a929c 100644
+--- a/tools/EncoderBench.mm
++++ b/tools/EncoderBench.mm
+@@ -6,7 +6,7 @@
+ //
+ //   oxrsys_encoder_bench [--preset medium|light|high|off] [--eye 2160] [--fps 90]
+ //                        [--mbps 50] [--frames 900] [--submit-hz N]
+-//                        [--codec h265|h264] [--ten-bit]
++//                        [--codec h265|h264] [--ten-bit] [--pattern texture|scene|smooth]
+ //
+ // It reads the runtime config from $HOME/Library/Application Support/OXRSys,
+ // like the runtime, so run it with HOME pointing at a scratch directory whose
+@@ -45,9 +45,43 @@ const char* kPatternSource = R"(
+ using namespace metal;
+ kernel void pattern(texture2d<float, access::write> out [[texture(0)]],
+                     constant float& t [[buffer(0)]],
++                    constant int& mode [[buffer(1)]],
+                     uint2 gid [[thread_position_in_grid]])
+ {
+     if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
++    if (mode == 2 || mode == 3)
++    {
++        // A simple rendered scene: smooth shading, a few hard-edged shapes,
++        // mild texture, panned - what a game scene gives the encoder.
++        float2 s = float2(gid) + float2(t * 140.0, t * 55.0);
++        float3 c = 0.45 + 0.3 * float3(sin(s.x * 0.0021), sin(s.y * 0.0033 + 1.0), sin((s.x - s.y) * 0.0017 + 2.0));
++        float2 cell = fmod(s, 360.0);
++        if (length(cell - 180.0) < 90.0) c = float3(0.85, 0.4, 0.2) * (0.7 + 0.3 * (cell.y / 360.0));
++        if (fmod(floor(s.x / 48.0) + floor(s.y / 48.0), 2.0) < 1.0 && cell.y > 300.0) c *= 0.6;
++        uint h = uint(int(s.x)) * 1973u + uint(int(s.y)) * 9277u;
++        h = (h ^ (h >> 13)) * 1274126177u; h ^= h >> 16;
++        c += (float(h & 255u) / 255.0 - 0.5) * (mode == 2 ? 0.03 : 0.004);
++        out.write(float4(c, 1.0), gid);
++        return;
++    }
++    if (mode == 1)
++    {
++        // Fine static texture in scene space, panned: per-pixel noise, 1-px
++        // text-like strokes on a 6x9 cell grid, a soft colour field. Motion
++        // compensation finds it, but every frame carries real detail.
++        int2 s = int2(gid) + int2(int(t * 140.0), int(t * 55.0));
++        uint h = uint(s.x) * 1973u + uint(s.y) * 9277u;
++        h = (h ^ (h >> 13)) * 1274126177u; h ^= h >> 16;
++        float n = float(h & 255u) / 255.0;
++        int cx = ((s.x % 6) + 6) % 6, cy = ((s.y % 9) + 9) % 9;
++        uint g = uint(s.x / 6) * 2654435761u ^ uint(s.y / 9) * 40503u;
++        bool stroke = (cy < 7) && (((g >> (cx + cy * 3)) & 1u) != 0u) && (cx < 5);
++        float3 field = 0.5 + 0.35 * float3(sin(s.x * 0.004), sin(s.y * 0.006 + 1.0), sin((s.x + s.y) * 0.003 + 2.0));
++        float3 c = field * (0.75 + 0.25 * n);
++        if (stroke) c *= 0.25;
++        out.write(float4(c, 1.0), gid);
++        return;
++    }
+     float2 p = float2(gid) / float2(out.get_width(), out.get_height());
+     float2 q = p + float2(t * 0.11, t * 0.07);
+     float bars = 0.5 + 0.5 * sin((q.x * 40.0) + t * 3.0);
+@@ -81,6 +115,7 @@ int main(int argc, char** argv)
+     {
+         std::string preset = "medium";
+         uint32_t eye = 2160, fps = 90, mbps = 50, frames = 900, submitHz = 0;
++        int patternMode = 0;
+         std::string codecName = "h265";
+         bool tenBit = false;
+         for (int i = 1; i < argc; ++i)
+@@ -94,6 +129,7 @@ int main(int argc, char** argv)
+             else if (a == "--frames") frames = std::stoul(next());
+             else if (a == "--codec") codecName = next();
+             else if (a == "--ten-bit") tenBit = true;
++            else if (a == "--pattern") { std::string v = next(); patternMode = v == "texture" ? 1 : v == "scene" ? 2 : v == "smooth" ? 3 : 0; }
+             else if (a == "--submit-hz") submitHz = std::stoul(next());
+         }
+         oxr::protocol::FoveationPreset fp = oxr::protocol::FoveationPreset::Off;
+@@ -171,6 +207,7 @@ int main(int argc, char** argv)
+                 float te = t + e * 0.01f;
+                 [ce setTexture:(e ? r : l) atIndex:0];
+                 [ce setBytes:&te length:sizeof(te) atIndex:0];
++                [ce setBytes:&patternMode length:sizeof(patternMode) atIndex:1];
+                 [ce dispatchThreads:MTLSizeMake(eye, eye, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+             }
+             [ce endEncoding];
+@@ -211,10 +248,10 @@ int main(int argc, char** argv)
+         std::lock_guard<std::mutex> lock(m);
+         std::vector<double> kb;
+         for (size_t b : frameBytes) kb.push_back(b / 1024.0);
+-        std::printf("RESULT %ux%u %s fps=%u hz=%u mbps=%u n=%zu cb min=%.2f p10=%.2f p50=%.2f p95=%.2f max=%.2f | total p50=%.2f p95=%.2f | submit p50=%.2f | gpu p50=%.2f | fps_out=%.1f drops=%u inflight_end=%u | KB/frame p50=%.0f\n",
++        std::printf("RESULT %ux%u %s fps=%u hz=%u mbps=%u n=%zu cb min=%.2f p10=%.2f p50=%.2f p95=%.2f max=%.2f | total p50=%.2f p95=%.2f | submit p50=%.2f | gpu p50=%.2f | fps_out=%.1f drops=%u inflight_end=%u | KB/frame p50=%.1f (%.1f Mbps)\n",
+                     encW, encH, codecName.c_str(), fps, submitHz ? submitHz : fps, mbps, cb.size(), Pct(cb, 0.0), Pct(cb, 0.1), Pct(cb, 0.5), Pct(cb, 0.95), Pct(cb, 1.0),
+                     Pct(total, 0.5), Pct(total, 0.95), Pct(submit, 0.5), Pct(gpu, 0.5), done / wall, dropped,
+-                    encoder.GetInFlightFrameCount(), Pct(kb, 0.5));
++                    encoder.GetInFlightFrameCount(), Pct(kb, 0.5), Pct(kb, 0.5) * 1024 * 8 * fps / 1e6);
+         encoder.Shutdown();
+     }
+     return 0;
+-- 
+2.43.0
+

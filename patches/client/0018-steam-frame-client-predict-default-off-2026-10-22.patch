@@ -1,0 +1,29 @@
+From 76e39e3ac58d93f2b61dc8ed28def6f44eabe8c7 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:46:16 +0000
+Subject: [PATCH] steam-frame client: FRAME_CLIENT_PREDICT_MS defaults to 0 -
+ head-locked content jittered at 40 (worn A/B 2026-10-22)
+
+---
+ clients/steam-frame/src/main.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 126cbc6..c6654ae 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -1285,8 +1285,9 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+     // headset's runtime for the head pose that far in the FUTURE (its own tracker's predictor, the one
+     // the compositor's panels get) and send zero velocity, so the server renders exactly that pose and
+     // extrapolates nothing. The layer is still stamped with the pose the server rendered from.
+-    // Default 40 ms since 2026-10-21 (review H2): the wears' setting, previously only in the launcher.
+-    static float kPredictMs = getenv("FRAME_CLIENT_PREDICT_MS") ? std::min(200.0f, std::max(0.0f, (float)atof(getenv("FRAME_CLIENT_PREDICT_MS")))) : 40.0f;   // clamped like the live file (review L8)
++    // Default 0 (off) since 2026-10-22: 40 ms made head-locked content jitter at rest (worn A/B); with the rate lock
++    // holding the cadence, prediction off is still and fast turns stay clean. 40 was the default 2026-10-21 (review H2).
++    static float kPredictMs = getenv("FRAME_CLIENT_PREDICT_MS") ? std::min(200.0f, std::max(0.0f, (float)atof(getenv("FRAME_CLIENT_PREDICT_MS")))) : 0.0f;   // clamped like the live file (review L8)
+     static bool predictLogged = false;
+     if (kPredictMs > 0 && !predictLogged) { predictLogged = true; LOG_INFO("head pose sampled %.1f ms ahead by the runtime (FRAME_CLIENT_PREDICT_MS); velocity sent as zero", kPredictMs); }
+     // Live override (2026-10-19): the file frame-predict-ms in the per-user runtime dir (review M11; /dev/shm as the
+-- 
+2.44.0
+

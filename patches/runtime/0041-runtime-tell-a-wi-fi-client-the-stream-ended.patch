@@ -1,0 +1,101 @@
+From dde661e0fd3de9e55a881930686c70ebf301b481 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 10:36:35 +0000
+Subject: [PATCH] runtime: tell a Wi-Fi client the stream ended when the
+ session stops
+
+When the app quit, StreamingServer::Stop() sent a Disconnect only on the USB control socket, so a headset on
+Wi-Fi kept showing the last frame, which reads as a freeze (Unreal VR Template "Real Life" = Quit, 10-28).
+
+Stop() now sends a bare video header with the new VIDEO_FLAG_STREAM_END (0x80) and totalPackets 0 to the
+client's video port, three times (UDP), before the client's address is cleared. A client that does not know
+the flag drops it as malformed, so older clients are unaffected.
+
+---
+ .../include/oxrsys/protocol/Protocol.h        |  1 +
+ runtime/src/StreamingServer.cpp               | 37 +++++++++++++++++++
+ runtime/src/StreamingServer.h                 |  1 +
+ 3 files changed, 39 insertions(+)
+
+diff --git a/common/protocol/include/oxrsys/protocol/Protocol.h b/common/protocol/include/oxrsys/protocol/Protocol.h
+index f77ca7b..281ec5e 100644
+--- a/common/protocol/include/oxrsys/protocol/Protocol.h
++++ b/common/protocol/include/oxrsys/protocol/Protocol.h
+@@ -260,6 +260,7 @@ enum VideoFlags : uint8_t
+     VIDEO_FLAG_FEC = 0x10,     // Forward Error Correction parity packet
+     VIDEO_FLAG_RENDER_POSE = 0x20, // Payload contains the server's render pose for this frame
+     VIDEO_FLAG_ALPHA_BLEND = 0x40, // App submitted alpha-blend environment or source-alpha projection layer
++    VIDEO_FLAG_STREAM_END = 0x80,  // The server's session ended: a bare header, totalPackets 0, no payload
+ };
+ 
+ struct AudioPacketHeader
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index a4179f1..e25b24e 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -855,6 +855,7 @@ bool StreamingServer::Stop(std::chrono::nanoseconds timeout)
+     }
+     videoSendCv_.notify_all();
+     RuntimeStatus::SetIdle();
++    SendStreamEndBestEffort();
+     SendUsbDisconnectBestEffort();
+     StopUsbTcpSockets();
+ 
+@@ -1154,6 +1155,42 @@ void StreamingServer::SendUsbDisconnectBestEffort()
+     }
+ }
+ 
++// Tell a Wi-Fi client that the stream has ended, so it stops showing the last frame (a headset kept showing it
++// when the app quit, which reads as a freeze). A bare video header with VIDEO_FLAG_STREAM_END and totalPackets 0
++// on the video path, the one socket a client always reads; a client that does not know the flag drops it as
++// malformed. UDP, so it goes three times; the client acts on the first.
++void StreamingServer::SendStreamEndBestEffort()
++{
++    std::lock_guard<std::mutex> lock(packetDispatchState_->mutex);
++    if (packetDispatchState_->videoUsesTcp || packetDispatchState_->clientIp.empty() ||
++        !oxrsys::runtime_socket::IsValid(packetDispatchState_->videoSocket))
++    {
++        return;
++    }
++    oxr::protocol::VideoPacketHeader header = {};
++    header.flags = oxr::protocol::VIDEO_FLAG_STREAM_END;
++    header.presentationTimeNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++    sockaddr_in destAddr = {};
++    destAddr.sin_family = AF_INET;
++    destAddr.sin_port = htons(oxr::protocol::VIDEO_PORT);
++    inet_pton(AF_INET, packetDispatchState_->clientIp.c_str(), &destAddr.sin_addr);
++    int sent = 0;
++    for (int i = 0; i < 3; ++i)
++    {
++        if (oxrsys::runtime_socket::SendTo(packetDispatchState_->videoSocket,
++                                           &header,
++                                           sizeof(header),
++                                           kBestEffortSendFlags,
++                                           (sockaddr*)&destAddr,
++                                           sizeof(destAddr)) >= 0)
++        {
++            ++sent;
++        }
++    }
++    spdlog::info("StreamingServer: told {} the stream ended ({} of 3 sent)", packetDispatchState_->clientIp, sent);
++}
++
+ void StreamingServer::StopUsbTcpSockets()
+ {
+     std::lock_guard<std::mutex> lock(tcpSocketMutex_);
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index ce7c61a..f9f0fe7 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -228,6 +228,7 @@ class StreamingServer
+     void SendRenderPosePacket(const EncodedVideoFrame& frame);
+     bool StartUsbTcpListeners();
+     void SendUsbDisconnectBestEffort();
++    void SendStreamEndBestEffort();
+     void StopUsbTcpSockets();
+ 
+     std::atomic<State> state_{State::Stopped};
+-- 
+2.50.1 (Apple Git-155)
+

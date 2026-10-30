@@ -1,0 +1,41 @@
+From cfe55194b82928cc49c263ebb8f129d32b023a3d Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 21:55:39 +0000
+Subject: [PATCH] steam-frame client: FRAME_CLIENT_PREDICT_POS=0 predicts the
+ orientation only and samples the position at now - the compositor warps
+ rotation, not position, so predicted position carries velocity noise to the
+ eye at rest and a ramped horizon smeared
+
+---
+ clients/steam-frame/src/main.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 4c71c5d..d0ad2fe 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -1276,6 +1276,21 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+         (hl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+         (hl.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+         head = hl.pose;
++        // FRAME_CLIENT_PREDICT_POS=0 (2026-10-20, patch 0013): predict the ORIENTATION only. The compositor's warp
++        // corrects rotation between the stamped and the displayed pose, so orientation noise from the predictor is
++        // harmless; position is not warped, so 40 ms of predicted position carries the tracker's velocity noise
++        // straight to the eye (the at-rest vibration, better at 0 ms when worn) and a ramped horizon smeared
++        // (patch 0012). Position is sampled at NOW instead; translation then lags the pipeline, as it does at 0 ms.
++        static int kPredictPos = getenv("FRAME_CLIENT_PREDICT_POS") ? atoi(getenv("FRAME_CLIENT_PREDICT_POS")) : 1;
++        static bool predictPosLogged = false;
++        if (!predictPosLogged) { predictPosLogged = true; LOG_INFO("prediction applies to: %s (FRAME_CLIENT_PREDICT_POS)", kPredictPos ? "orientation and position" : "orientation only, position sampled now"); }
++        if (!kPredictPos && tLocate != t) {
++            XrSpaceLocation hlNow = {XR_TYPE_SPACE_LOCATION};
++            if (XR_SUCCEEDED(xrLocateSpace(app.viewSpace, app.stageSpace, t, &hlNow)) &&
++                (hlNow.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
++                head.position = hlNow.pose.position;
++            }
++        }
+         if (kPredictMs > 0) { hv.velocityFlags = 0; }   // the runtime predicted; nothing left for the server to add
+         if (hv.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) {
+             pkt.headLinearVelocity[0] = hv.linearVelocity.x;
+-- 
+2.44.0
+

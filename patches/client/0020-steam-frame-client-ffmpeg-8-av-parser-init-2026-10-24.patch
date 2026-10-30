@@ -1,0 +1,30 @@
+From b52c150d123f5aa96948e3191ff41bef3be7ef44 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 05:16:06 +0000
+Subject: [PATCH] steam-frame client: build against FFmpeg 8 (av_parser_init
+ takes enum AVCodecID)
+
+FFmpeg 8 changed av_parser_init's parameter from int to enum AVCodecID, and C++ refuses the
+implicit conversion, so the client stopped compiling on current Arch. The cast is a no-op on the
+FFmpeg SteamOS ships today.
+
+---
+ clients/steam-frame/src/video_decoder.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/clients/steam-frame/src/video_decoder.cpp b/clients/steam-frame/src/video_decoder.cpp
+index 04b26d6..f2e4f1e 100644
+--- a/clients/steam-frame/src/video_decoder.cpp
++++ b/clients/steam-frame/src/video_decoder.cpp
+@@ -150,7 +150,7 @@ bool VideoDecoder::openCodecOnly(int avCodecId)
+     if (const char* threads = getenv("FRAME_CLIENT_THREADS")) codec_->thread_count = atoi(threads);
+     if (avcodec_open2(codec_, dec, nullptr) < 0) { LOG_ERR("avcodec_open2 (stream)"); return false; }
+     LOG_INF("decoder %s (threads=%d)", dec->name, codec_->thread_count);
+-    parser_ = av_parser_init(avCodecId);
++    parser_ = av_parser_init(static_cast<AVCodecID>(avCodecId));   // FFmpeg 8 takes the enum; older FFmpeg converts it back
+     if (!parser_) { LOG_ERR("parser init"); return false; }
+     frame_ = av_frame_alloc();
+     packet_ = av_packet_alloc();
+-- 
+2.43.0
+

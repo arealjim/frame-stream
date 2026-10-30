@@ -1,0 +1,686 @@
+From e873dc0a38a736fff004c9a4201f1883eee09d5b Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:29:52 +0000
+Subject: [PATCH 49/49] runtime: stream a frame that has only a quad layer
+
+A frame whose layers are a single quad and no projection layer (a game's
+loading screen, or a menu drawn on one quad) streamed nothing: the encoder
+only ran when a projection layer was present, so the headset kept its last
+picture, or none, for the whole loading screen. Such a frame now streams
+the first quad, placed per eye where it sits in space: each display pixel
+is ray-cast onto the quad's plane and lands on black outside it.
+---
+ runtime/src/GraphicsTypes.h |  21 +++
+ runtime/src/Session.cpp     | 244 +++++++++++++++++++++++++++++++++
+ runtime/src/Session.h       |   1 +
+ runtime/src/VideoEncoder.h  |   2 +
+ runtime/src/VideoEncoder.mm | 259 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 527 insertions(+)
+
+diff --git a/runtime/src/GraphicsTypes.h b/runtime/src/GraphicsTypes.h
+index 50555ca..36eefc1 100644
+--- a/runtime/src/GraphicsTypes.h
++++ b/runtime/src/GraphicsTypes.h
+@@ -101,6 +101,23 @@ struct FrameImageSource
+     uint64_t sourceFormat = 0;
+     uint32_t imageWidth = 0;
+     uint32_t imageHeight = 0;
++    // Quad layer streamed as an eye: the cropped source is drawn into a black eyeWidth x eyeHeight
++    // texture at the normalized rectangle place{X,Y,W,H} (0..1 of the eye, top-left origin), which
++    // is where the quad's corners project in that eye's field of view. placeW == 0 means the quad
++    // is out of view and the eye is black.
++    bool placeInEye = false;
++    uint32_t eyeWidth = 0;
++    uint32_t eyeHeight = 0;
++    float placeX = 0.0f;
++    float placeY = 0.0f;
++    float placeW = 0.0f;
++    float placeH = 0.0f;
++    // the quad in eye space for a per-pixel ray cast: its top-left corner, its full-width and
++    // full-height edges, and the eye's FOV as tangents (left, right, up, down)
++    float quadCorner[3] = {0.0f, 0.0f, 0.0f};
++    float quadEdgeX[3] = {0.0f, 0.0f, 0.0f};
++    float quadEdgeY[3] = {0.0f, 0.0f, 0.0f};
++    float eyeTan[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+ 
+     void* GetImage() const
+     {
+@@ -129,6 +146,10 @@ struct FrameImageSource
+         sourceFormat = 0;
+         imageWidth = 0;
+         imageHeight = 0;
++        placeInEye = false;
++        eyeWidth = 0;
++        eyeHeight = 0;
++        placeX = placeY = placeW = placeH = 0.0f;
+     }
+ };
+ 
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index 66439cc..670b7aa 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -14,6 +14,7 @@
+ #include <spdlog/spdlog.h>
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+@@ -22,6 +23,7 @@
+ #include <mutex>
+ #include <numeric>
+ #include <thread>
++#include <string>
+ #include <pthread.h>
+ #include <mach/mach.h>
+ #include <mach/mach_time.h>
+@@ -784,6 +786,7 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
+ 
+     FrameSource frameSource = {};
+     uint32_t projectionLayerIndex = UINT32_MAX;
++    const XrCompositionLayerQuad* firstQuad = nullptr;
+ 
+     for (uint32_t i = 0; i < frameEndInfo->layerCount; i++)
+     {
+@@ -823,6 +826,10 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
+                 {
+                     return result;
+                 }
++                if (firstQuad == nullptr)
++                {
++                    firstQuad = reinterpret_cast<const XrCompositionLayerQuad*>(layer);
++                }
+                 break;
+             }
+             case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR:
+@@ -859,6 +866,29 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
+         AppendOverlayLayers(*frameEndInfo, projectionLayerIndex, frameSource);
+     }
+ 
++    if (!frameSource.IsStereoValid() && firstQuad != nullptr)
++    {
++        BuildQuadFrameSource(*firstQuad, frameEndInfo->displayTime, frameSource);
++    }
++
++    {
++        static std::atomic<int64_t> lastLayerLogNs{0};
++        const int64_t nowNs = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()).count());
++        if (nowNs - lastLayerLogNs.load() > 5000000000LL)
++        {
++            lastLayerLogNs.store(nowNs);
++            std::string types;
++            for (uint32_t i = 0; i < frameEndInfo->layerCount; i++)
++            {
++                types += std::to_string(static_cast<int>(frameEndInfo->layers[i]->type)) + " ";
++            }
++            spdlog::info("OXRSys: EndFrame layers={} types=[{}] stereoValid={} clientConnected={}",
++                         frameEndInfo->layerCount, types, frameSource.IsStereoValid(),
++                         streamingServer_ && streamingServer_->IsClientConnected());
++        }
++    }
++
+     frameSource.alphaBlend = oxrsys::runtime::IsAlphaFrameForStreaming(
+         frameEndInfo->environmentBlendMode, sourceAlphaProjectionLayer);
+ 
+@@ -1023,6 +1053,49 @@ XrResult Session::ValidateProjectionLayer(const XrCompositionLayerProjection& la
+         auto* swapchain = Runtime::Get().FromHandle<Swapchain>(reinterpret_cast<uint64_t>(view.subImage.swapchain));
+         FrameImageSource imageSource =
+             swapchain->GetLastReleasedFrameImageSource(view.subImage.imageArrayIndex);
++        if (!imageSource.IsValid())
++        {
++            static std::atomic<int64_t> lastEmptyViewLogNs{0};
++            const int64_t nowNs = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count());
++            if (nowNs - lastEmptyViewLogNs.load() > 5000000000LL)
++            {
++                lastEmptyViewLogNs.store(nowNs);
++                spdlog::warn("OXRSys: projection view {} has no source image (swapchain {} arrayIndex={} released={} rect={}x{}+{}+{})",
++                             viewIndex, static_cast<const void*>(swapchain), view.subImage.imageArrayIndex,
++                             swapchain->HasReleasedImage(), view.subImage.imageRect.extent.width,
++                             view.subImage.imageRect.extent.height, view.subImage.imageRect.offset.x,
++                             view.subImage.imageRect.offset.y);
++            }
++        }
++        // How many submitted views carry a newly released image: an app that re-submits its last
++        // image (a render thread slower than its submit thread) shows here, not in WaitFrame pacing.
++        {
++            static const void* lastImage[2] = {nullptr, nullptr};
++            static std::atomic<int64_t> windowStartNs{0};
++            static std::atomic<int> fresh[2] = {0, 0}, total[2] = {0, 0}, newPose[2] = {0, 0};
++            // a swapchain cycles its images even when the content is a copy of the last render, so
++            // count the render pose too: a re-submitted frame repeats the pose it was drawn with
++            static XrPosef lastPose[2] = {};
++            const void* img = imageSource.image.get();
++            total[viewIndex]++;
++            if (img != lastImage[viewIndex]) fresh[viewIndex]++;
++            lastImage[viewIndex] = img;
++            if (std::memcmp(&view.pose, &lastPose[viewIndex], sizeof(XrPosef)) != 0) newPose[viewIndex]++;
++            lastPose[viewIndex] = view.pose;
++            const int64_t nowNs = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count());
++            if (windowStartNs.load() == 0) windowStartNs.store(nowNs);
++            if (viewIndex == 1 && nowNs - windowStartNs.load() > 5000000000LL)
++            {
++                const double secs = (nowNs - windowStartNs.load()) / 1e9;
++                spdlog::info("OXRSys: fresh projection images: L {:.1f}/s R {:.1f}/s, new render poses L {:.1f}/s R {:.1f}/s, of {:.1f} submits/s",
++                             fresh[0].load() / secs, fresh[1].load() / secs, newPose[0].load() / secs,
++                             newPose[1].load() / secs, total[1].load() / secs);
++                fresh[0] = fresh[1] = total[0] = total[1] = newPose[0] = newPose[1] = 0;
++                windowStartNs.store(nowNs);
++            }
++        }
+         // Honor the per-view sub-rectangle: UE packs both eyes into one swapchain side-by-side.
+         imageSource.sourceX = static_cast<uint32_t>(view.subImage.imageRect.offset.x);
+         imageSource.sourceY = static_cast<uint32_t>(view.subImage.imageRect.offset.y);
+@@ -1083,6 +1156,177 @@ void Session::CollectProjectionDepth(const XrCompositionLayerProjectionView& vie
+     }
+ }
+ 
++// A frame with no projection layer (a loading screen or a menu drawn on one quad)
++// would otherwise stream nothing. Project the quad's corners into each eye's field of view and
++// hand the encoder the quad's image plus where it lands, so each eye draws it at its own place:
++// a flat panel at the quad's true distance, not a head-locked full-view picture. The bounding box
++// of the projected corners is used, so a quad seen at a steep angle keeps no keystone.
++void Session::BuildQuadFrameSource(const XrCompositionLayerQuad& quad, XrTime displayTime,
++                                   FrameSource& frameSource)
++{
++    auto* swapchain = Runtime::Get().FromHandle<Swapchain>(reinterpret_cast<uint64_t>(quad.subImage.swapchain));
++    if (swapchain == nullptr)
++    {
++        return;
++    }
++    FrameImageSource image = swapchain->GetLastReleasedFrameImageSource(quad.subImage.imageArrayIndex);
++    if (!image.IsValid())
++    {
++        return;
++    }
++    image.sourceX = static_cast<uint32_t>(quad.subImage.imageRect.offset.x);
++    image.sourceY = static_cast<uint32_t>(quad.subImage.imageRect.offset.y);
++    image.sourceWidth = static_cast<uint32_t>(quad.subImage.imageRect.extent.width);
++    image.sourceHeight = static_cast<uint32_t>(quad.subImage.imageRect.extent.height);
++
++    // Place the quad with the head pose this frame will be stamped with (the one the app located for
++    // displayTime), not a fresh locate: calling LocateViews here would read a pose ~10 ms newer and also
++    // write it into locatedPoses_, so the placement and the stamp would disagree and the panel would swim.
++    if (!lastRenderHasPose_)
++    {
++        return;
++    }
++    XrPosef headPose = lastRenderHeadPose_;
++    {
++        std::lock_guard<std::mutex> lock(locatedPoseMutex_);
++        for (const auto& lp : locatedPoses_)
++        {
++            if (lp.displayTime == displayTime)
++            {
++                headPose = lp.pose;
++            }
++        }
++    }
++    // The eyes' offsets from the head (IPD, canting) and their FOVs, from the current views; then the
++    // eyes re-seated on the stamped head and expressed in the quad's space.
++    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
++    inputManager_->GetEyeViews(views, 2);
++    const XrPosef currentHead = inputManager_->GetHeadPose();
++    const glm::quat curRotInv = glm::inverse(ToGlmQuat(currentHead.orientation));
++    const glm::vec3 curPos = ToGlmVec(currentHead.position);
++    const glm::quat headRot = ToGlmQuat(headPose.orientation);
++    const glm::vec3 headPos = ToGlmVec(headPose.position);
++    auto* quadSpace = Runtime::Get().FromHandle<Space>(reinterpret_cast<uint64_t>(quad.space));
++    if (quadSpace == nullptr)
++    {
++        return;
++    }
++    const XrPosef basePose = ReferenceSpaceWorldPose(quadSpace, *inputManager_);
++    {
++        static auto lastQuadLog = std::chrono::steady_clock::time_point{};
++        const auto now = std::chrono::steady_clock::now();
++        if (now - lastQuadLog >= std::chrono::seconds(2))
++        {
++            lastQuadLog = now;
++            spdlog::info("OXRSys: quad pose space type={} ref={} pos=({:.2f},{:.2f},{:.2f}) rot=({:.3f},{:.3f},{:.3f},{:.3f}) "
++                         "head rot=({:.3f},{:.3f},{:.3f},{:.3f})",
++                         (int)quadSpace->GetType(), (int)quadSpace->GetReferenceSpaceType(),
++                         quad.pose.position.x, quad.pose.position.y, quad.pose.position.z,
++                         quad.pose.orientation.x, quad.pose.orientation.y, quad.pose.orientation.z,
++                         quad.pose.orientation.w, headPose.orientation.x, headPose.orientation.y,
++                         headPose.orientation.z, headPose.orientation.w);
++        }
++    }
++    const glm::quat baseRotInv = glm::inverse(ToGlmQuat(basePose.orientation));
++    const glm::vec3 basePos = ToGlmVec(basePose.position);
++    for (XrView& view : views)
++    {
++        const glm::quat eyeRotInHead = curRotInv * ToGlmQuat(view.pose.orientation);
++        const glm::vec3 eyePosInHead = curRotInv * (ToGlmVec(view.pose.position) - curPos);
++        const glm::quat eyeRot = headRot * eyeRotInHead;
++        const glm::vec3 eyePos = headPos + headRot * eyePosInHead;
++        view.pose.orientation = ToXrQuat(baseRotInv * eyeRot);
++        view.pose.position = ToXrVec(baseRotInv * (eyePos - basePos));
++    }
++
++    // The eye texture: the recommended eye size, the size an app renders each eye at.
++    const uint32_t eyeW = image.imageWidth != 0 ? image.imageWidth : image.sourceWidth;
++    const uint32_t eyeH = image.imageHeight != 0 ? image.imageHeight : image.sourceHeight;
++
++    const glm::quat quadRot = ToGlmQuat(quad.pose.orientation);
++    const glm::vec3 quadPos = ToGlmVec(quad.pose.position);
++    const float hw = quad.size.width * 0.5f;
++    const float hh = quad.size.height * 0.5f;
++    const glm::vec3 corners[4] = {{-hw, -hh, 0.0f}, {hw, -hh, 0.0f}, {hw, hh, 0.0f}, {-hw, hh, 0.0f}};
++
++    for (int eye = 0; eye < 2; ++eye)
++    {
++        FrameImageSource placed = image;
++        placed.placeInEye = true;
++        placed.eyeWidth = eyeW;
++        placed.eyeHeight = eyeH;
++        const glm::quat eyeRotInv = glm::inverse(ToGlmQuat(views[eye].pose.orientation));
++        const glm::vec3 eyePos = ToGlmVec(views[eye].pose.position);
++        const float tl = std::tan(views[eye].fov.angleLeft);
++        const float tr = std::tan(views[eye].fov.angleRight);
++        const float td = std::tan(views[eye].fov.angleDown);
++        const float tu = std::tan(views[eye].fov.angleUp);
++        {
++            // image top-left is the quad's (-w/2, +h/2); x runs right, y runs down the image
++            const glm::vec3 c0 = eyeRotInv * (quadPos + quadRot * glm::vec3(-hw, hh, 0.0f) - eyePos);
++            const glm::vec3 ex = eyeRotInv * (quadRot * glm::vec3(2.0f * hw, 0.0f, 0.0f));
++            const glm::vec3 ey = eyeRotInv * (quadRot * glm::vec3(0.0f, -2.0f * hh, 0.0f));
++            for (int k = 0; k < 3; ++k)
++            {
++                placed.quadCorner[k] = c0[k];
++                placed.quadEdgeX[k] = ex[k];
++                placed.quadEdgeY[k] = ey[k];
++            }
++            placed.eyeTan[0] = tl; placed.eyeTan[1] = tr; placed.eyeTan[2] = tu; placed.eyeTan[3] = td;
++        }
++        float u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
++        bool inFront = true;
++        for (const glm::vec3& c : corners)
++        {
++            const glm::vec3 inEye = eyeRotInv * (quadPos + quadRot * c - eyePos);
++            if (inEye.z > -0.01f)
++            {
++                inFront = false;
++                break;
++            }
++            const float u = (inEye.x / -inEye.z - tl) / (tr - tl);
++            const float v = (tu - inEye.y / -inEye.z) / (tu - td);
++            u0 = std::min(u0, u); u1 = std::max(u1, u);
++            v0 = std::min(v0, v); v1 = std::max(v1, v);
++        }
++        if (inFront && u1 > u0 && v1 > v0)
++        {
++            placed.placeX = u0;
++            placed.placeY = v0;
++            placed.placeW = u1 - u0;
++            placed.placeH = v1 - v0;
++        }
++        else
++        {
++            // a corner behind the eye: no bounding box, but the ray cast still draws what is in front
++            placed.placeX = 0.0f;
++            placed.placeY = 0.0f;
++            placed.placeW = 1.0f;
++            placed.placeH = 1.0f;
++        }
++        if (eye == 0)
++        {
++            frameSource.left = std::move(placed);
++        }
++        else
++        {
++            frameSource.right = std::move(placed);
++        }
++    }
++
++    static std::atomic<bool> logged{false};
++    if (!logged.exchange(true))
++    {
++        spdlog::info("OXRSys: streaming a quad-only frame: quad {:.2f}x{:.2f} m at ({:.2f},{:.2f},{:.2f}), "
++                     "source {}x{}, eye {}x{}, left eye rect {:.3f},{:.3f} {:.3f}x{:.3f}, right {:.3f},{:.3f} {:.3f}x{:.3f}",
++                     quad.size.width, quad.size.height, quad.pose.position.x, quad.pose.position.y,
++                     quad.pose.position.z, image.sourceWidth, image.sourceHeight, eyeW, eyeH,
++                     frameSource.left.placeX, frameSource.left.placeY, frameSource.left.placeW,
++                     frameSource.left.placeH, frameSource.right.placeX, frameSource.right.placeY,
++                     frameSource.right.placeW, frameSource.right.placeH);
++    }
++}
++
+ XrResult Session::ValidateQuadLayer(const XrCompositionLayerQuad& layer) const
+ {
+     auto* space = Runtime::Get().FromHandle<Space>(reinterpret_cast<uint64_t>(layer.space));
+diff --git a/runtime/src/Session.h b/runtime/src/Session.h
+index 3bcb647..279ad70 100644
+--- a/runtime/src/Session.h
++++ b/runtime/src/Session.h
+@@ -131,6 +131,7 @@ class Session
+     // placed this frame is skipped.
+     void AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t projectionLayerIndex,
+                              FrameSource& frameSource) const;
++    void BuildQuadFrameSource(const XrCompositionLayerQuad& quad, XrTime displayTime, FrameSource& frameSource);
+ 
+     uint64_t handle_ = 0;
+     Instance* instance_;
+diff --git a/runtime/src/VideoEncoder.h b/runtime/src/VideoEncoder.h
+index 0791b16..1d66f87 100644
+--- a/runtime/src/VideoEncoder.h
++++ b/runtime/src/VideoEncoder.h
+@@ -166,6 +166,8 @@ class VideoEncoder
+         void* foveatedScratchTexture = nullptr; // id<MTLTexture>
+         void* leftCropTexture = nullptr;   // id<MTLTexture>, lazily (re)sized to sourceWidth/sourceHeight
+         void* rightCropTexture = nullptr;  // id<MTLTexture>, lazily (re)sized to sourceWidth/sourceHeight
++        void* leftPlacedTexture = nullptr;  // id<MTLTexture>, a quad drawn into an eye (eyeWidth/eyeHeight)
++        void* rightPlacedTexture = nullptr; // id<MTLTexture>
+         bool inUse = false;
+     };
+ 
+diff --git a/runtime/src/VideoEncoder.mm b/runtime/src/VideoEncoder.mm
+index 2159af3..ceec5a0 100644
+--- a/runtime/src/VideoEncoder.mm
++++ b/runtime/src/VideoEncoder.mm
+@@ -21,11 +21,15 @@
+ #include "EncoderSessionKind.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cmath>
++#include <cstdio>
+ #include <cstdlib>
+ #include <exception>
+ #include <utility>
++#include <mutex>
++#include <string>
+ #include <vector>
+ 
+ namespace
+@@ -619,6 +623,130 @@ bool TextureAllowsUsage(id<MTLTexture> texture, MTLTextureUsage requiredUsage)
+            (declaredUsage & requiredUsage) == requiredUsage;
+ }
+ 
++// A quad layer drawn into a black eye texture at the rectangle its corners project to (see
++// Session::BuildQuadFrameSource). A box of taps x taps samples per pixel keeps text readable when
++// the panel is drawn smaller than its source.
++constexpr const char* kQuadPlaceMetalSource = R"METAL(
++#include <metal_stdlib>
++using namespace metal;
++
++struct QuadPlaceUniforms
++{
++    float2 eyeSize;
++    float2 srcSize;
++    float4 place;
++    uint taps;
++    uint debugTint;
++    uint pad0;
++    uint pad1;
++    float4 corner;
++    float4 edgeX;
++    float4 edgeY;
++    float4 eyeTan;
++};
++
++vertex float4 quad_place_vs(uint vid [[vertex_id]])
++{
++    float2 p = float2((vid << 1) & 2, vid & 2);
++    return float4(p * 2.0 - 1.0, 0.0, 1.0);
++}
++
++fragment float4 quad_place_fs(float4 pos [[position]],
++                              texture2d<float> src [[texture(0)]],
++                              constant QuadPlaceUniforms& u [[buffer(0)]])
++{
++    constexpr sampler s(filter::linear, address::clamp_to_edge);
++    // cast this pixel's ray from the eye onto the quad's plane (eye space, -Z forward)
++    float2 e = pos.xy / u.eyeSize;
++    float3 d = float3(mix(u.eyeTan.x, u.eyeTan.y, e.x), mix(u.eyeTan.z, u.eyeTan.w, e.y), -1.0);
++    float3 n = cross(u.edgeX.xyz, u.edgeY.xyz);
++    float denom = dot(d, n);
++    float lambda = abs(denom) > 1e-8 ? dot(u.corner.xyz, n) / denom : -1.0;
++    float3 r = lambda * d - u.corner.xyz;
++    float2 q = float2(dot(r, u.edgeX.xyz) / dot(u.edgeX.xyz, u.edgeX.xyz),
++                      dot(r, u.edgeY.xyz) / dot(u.edgeY.xyz, u.edgeY.xyz));
++    float2 step = abs(dfdx(q)) + abs(dfdy(q));
++    if (lambda <= 0.0 || any(q < 0.0) || any(q > 1.0))
++    {
++        return float4(0.0, 0.0, 0.0, 1.0);
++    }
++    float4 acc = float4(0.0);
++    for (uint j = 0; j < u.taps; ++j)
++    {
++        for (uint i = 0; i < u.taps; ++i)
++        {
++            float2 o = (float2(i, j) + 0.5) / float(u.taps) - 0.5;
++            acc += src.sample(s, q + o * step);
++        }
++    }
++    float3 c = acc.rgb / float(u.taps * u.taps);
++    if (u.debugTint != 0)
++    {
++        c = c * 0.5 + float3(0.5, 0.0, 0.0);
++    }
++    return float4(c, 1.0);
++}
++)METAL";
++
++struct QuadPlaceUniforms
++{
++    simd_float2 eyeSize;
++    simd_float2 srcSize;
++    simd_float4 place;
++    uint32_t taps;
++    uint32_t debugTint;
++    uint32_t pad[2];
++    simd_float4 corner;
++    simd_float4 edgeX;
++    simd_float4 edgeY;
++    simd_float4 eyeTan;
++};
++
++id<MTLRenderPipelineState> QuadPlacePipeline(id<MTLDevice> device, MTLPixelFormat format)
++{
++    static std::mutex mutex;
++    static std::vector<std::pair<MTLPixelFormat, id<MTLRenderPipelineState>>> cache;
++    std::lock_guard<std::mutex> lock(mutex);
++    for (const auto& entry : cache)
++    {
++        if (entry.first == format)
++        {
++            return entry.second;
++        }
++    }
++    NSError* error = nil;
++    id<MTLLibrary> library =
++        [device newLibraryWithSource:[NSString stringWithUTF8String:kQuadPlaceMetalSource] options:nil error:&error];
++    if (library == nil)
++    {
++        spdlog::error("VideoEncoder: failed to compile the quad placement shader: {}",
++                      error != nil ? error.localizedDescription.UTF8String : "unknown error");
++        return nil;
++    }
++    id<MTLFunction> vs = [library newFunctionWithName:@"quad_place_vs"];
++    id<MTLFunction> fs = [library newFunctionWithName:@"quad_place_fs"];
++    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
++    desc.vertexFunction = vs;
++    desc.fragmentFunction = fs;
++    desc.colorAttachments[0].pixelFormat = format;
++    error = nil;
++    id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:desc error:&error];
++    if (pipeline == nil)
++    {
++        spdlog::error("VideoEncoder: failed to create the quad placement pipeline: {}",
++                      error != nil ? error.localizedDescription.UTF8String : "unknown error");
++    }
++    [desc release];
++    [vs release];
++    [fs release];
++    [library release];
++    if (pipeline != nil)
++    {
++        cache.emplace_back(format, pipeline);
++    }
++    return pipeline;
++}
++
+ id<MTLComputePipelineState> CreateVideoCopyPipeline(id<MTLDevice> device)
+ {
+     NSError* error = nil;
+@@ -2106,6 +2234,93 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
+                 return dropAcquiredSlot("failed to crop right eye texture");
+             }
+         }
++
++        auto placeEye = [&](id<MTLTexture> tex, const FrameImageSource& src, void** cachedTexture) -> id<MTLTexture> {
++            if (!src.placeInEye) return tex;
++            if (src.eyeWidth == 0 || src.eyeHeight == 0 || !TextureAllowsUsage(tex, MTLTextureUsageShaderRead))
++            {
++                return nil;
++            }
++            id<MTLRenderPipelineState> pipeline = QuadPlacePipeline(cropDev, tex.pixelFormat);
++            if (pipeline == nil)
++            {
++                return nil;
++            }
++            id<MTLTexture> placed = (__bridge id<MTLTexture>)*cachedTexture;
++            if (placed == nil || placed.pixelFormat != tex.pixelFormat ||
++                placed.width != (NSUInteger)src.eyeWidth || placed.height != (NSUInteger)src.eyeHeight)
++            {
++                MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:tex.pixelFormat
++                                                                                              width:src.eyeWidth
++                                                                                             height:src.eyeHeight
++                                                                                          mipmapped:NO];
++                d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
++                d.storageMode = MTLStorageModePrivate;
++                id<MTLTexture> newPlaced = [cropDev newTextureWithDescriptor:d];
++                if (newPlaced == nil)
++                {
++                    return nil;
++                }
++                if (placed != nil)
++                {
++                    [placed release];
++                }
++                placed = newPlaced;
++                *cachedTexture = (void*)placed;
++            }
++            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
++            rp.colorAttachments[0].texture = placed;
++            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
++            rp.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
++            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
++            id<MTLRenderCommandEncoder> re = [cmdBuf renderCommandEncoderWithDescriptor:rp];
++            if (re == nil)
++            {
++                return nil;
++            }
++            if (src.placeW > 0.0f && src.placeH > 0.0f)
++            {
++                QuadPlaceUniforms u = {};
++                u.eyeSize = simd_make_float2((float)src.eyeWidth, (float)src.eyeHeight);
++                u.srcSize = simd_make_float2((float)tex.width, (float)tex.height);
++                u.place = simd_make_float4(src.placeX, src.placeY, src.placeW, src.placeH);
++                u.corner = simd_make_float4(src.quadCorner[0], src.quadCorner[1], src.quadCorner[2], 0.0f);
++                u.edgeX = simd_make_float4(src.quadEdgeX[0], src.quadEdgeX[1], src.quadEdgeX[2], 0.0f);
++                u.edgeY = simd_make_float4(src.quadEdgeY[0], src.quadEdgeY[1], src.quadEdgeY[2], 0.0f);
++                u.eyeTan = simd_make_float4(src.eyeTan[0], src.eyeTan[1], src.eyeTan[2], src.eyeTan[3]);
++                const float shrink = (float)tex.width / std::max(1.0f, src.placeW * (float)src.eyeWidth);
++                u.taps = (uint32_t)std::clamp((int)std::ceil(shrink), 1, 4);
++                static const bool debugTint = std::getenv("OXRSYS_QUAD_DEBUG") != nullptr;
++                u.debugTint = debugTint ? 1u : 0u;
++                static std::atomic<bool> loggedPlace{false};
++                if (!loggedPlace.exchange(true))
++                {
++                    spdlog::info("VideoEncoder: placing a quad: source {}x{} fmt={} usage=0x{:x} storage={} -> eye {}x{} fmt={} taps={} tint={}",
++                                 (int)tex.width, (int)tex.height, (int)tex.pixelFormat, (unsigned)tex.usage,
++                                 (int)tex.storageMode, src.eyeWidth, src.eyeHeight, (int)placed.pixelFormat,
++                                 u.taps, u.debugTint);
++                }
++                [re setRenderPipelineState:pipeline];
++                [re setFragmentTexture:tex atIndex:0];
++                [re setFragmentBytes:&u length:sizeof(u) atIndex:0];
++                [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
++            }
++            [re endEncoding];
++            return placed;
++        };
++        leftTex = placeEye(leftTex, frameSource.left, &slot.leftPlacedTexture);
++        if (leftTex == nil)
++        {
++            return dropAcquiredSlot("failed to place the quad in the left eye");
++        }
++        if (stereo)
++        {
++            rightTex = placeEye(rightTex, frameSource.right, &slot.rightPlacedTexture);
++            if (rightTex == nil)
++            {
++                return dropAcquiredSlot("failed to place the quad in the right eye");
++            }
++        }
+     }
+ 
+     // Quad and cylinder layers, drawn into each eye from that eye's render pose and fov.
+@@ -2387,6 +2602,40 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
+ 
+     [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer)
+     {
++        if (commandBuffer.status != MTLCommandBufferStatusCompleted)
++        {
++            static std::atomic<int> failedLogs{0};
++            if (failedLogs.fetch_add(1) < 3)
++            {
++                spdlog::warn("VideoEncoder: encode command buffer status {} error {}", (int)commandBuffer.status,
++                             commandBuffer.error != nil ? commandBuffer.error.localizedDescription.UTF8String : "none");
++            }
++        }
++        else if (const char* dumpPath = std::getenv("OXRSYS_DUMP_SLOT"))
++        {
++            static std::atomic<int> completedCount{0};
++            // frame 1800, and again whenever <path>.req exists (touch it to grab the current frame)
++            const std::string reqPath = std::string(dumpPath) + ".req";
++            const bool requested = std::remove(reqPath.c_str()) == 0;
++            if (completedCount.fetch_add(1) == 1800 || requested)
++            {
++                CVPixelBufferRef pb = pixelBuffer;
++                CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
++                const size_t planes = CVPixelBufferGetPlaneCount(pb);
++                const void* base = planes > 0 ? CVPixelBufferGetBaseAddressOfPlane(pb, 0) : CVPixelBufferGetBaseAddress(pb);
++                const size_t bpr = planes > 0 ? CVPixelBufferGetBytesPerRowOfPlane(pb, 0) : CVPixelBufferGetBytesPerRow(pb);
++                const size_t h = planes > 0 ? CVPixelBufferGetHeightOfPlane(pb, 0) : CVPixelBufferGetHeight(pb);
++                if (FILE* f = std::fopen(dumpPath, "wb"))
++                {
++                    std::fwrite(base, 1, bpr * h, f);
++                    std::fclose(f);
++                }
++                spdlog::info("VideoEncoder: dumped encoder input plane 0 to {}: format 0x{:x} planes {} {}x{} bytesPerRow {}",
++                             dumpPath, (unsigned)CVPixelBufferGetPixelFormatType(pb), planes,
++                             CVPixelBufferGetWidth(pb), h, bpr);
++                CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
++            }
++        }
+         if (commandBuffer.status != MTLCommandBufferStatusCompleted || this->shuttingDown_.load())
+         {
+             FinalizeEncodeFrame(context, true);
+@@ -2587,6 +2836,16 @@ void VideoEncoder::DestroySlots()
+             [(id<MTLTexture>)slot.rightCropTexture release];
+             slot.rightCropTexture = nullptr;
+         }
++        if (slot.leftPlacedTexture != nullptr)
++        {
++            [(id<MTLTexture>)slot.leftPlacedTexture release];
++            slot.leftPlacedTexture = nullptr;
++        }
++        if (slot.rightPlacedTexture != nullptr)
++        {
++            [(id<MTLTexture>)slot.rightPlacedTexture release];
++            slot.rightPlacedTexture = nullptr;
++        }
+         if (slot.metalTexture != nullptr)
+         {
+             CFRelease(slot.metalTexture);
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,129 @@
+From 5c33c54f9e3c6e7d9a2158c3a0db147f03a6ab79 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 18:07:23 +0000
+Subject: [PATCH] steam-frame client: stamp each eye at its rendered position
+ (head +/- right*ipd/2, matching the server), a translation-slip statistic in
+ the pipeline summary (stamped vs displayed head centre, with its vertical
+ part), an eye-geometry probe log, and FRAME_CLIENT_STAMP_Y_M for the
+ stamp-position test
+
+---
+ clients/steam-frame/src/main.cpp | 56 ++++++++++++++++++++++++++++++--
+ 1 file changed, 53 insertions(+), 3 deletions(-)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 488eb39..7389612 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -824,6 +824,10 @@ struct LatencyWindow {
+     // moves): how much rotation the compositor is asked to warp between the stamped render pose and the
+     // pose it displays at (per presented frame), and whether the raw FOV it hands us moves while worn.
+     double warpDeg = 0, warpMaxDeg = 0; uint32_t fovChanges = 0; double fovMaxDeltaDeg = 0;
++    // 2026-10-19 (worn, the vertical parallax looked a little off): the compositor warps rotation only, so
++    // the head's TRANSLATION between the stamped render pose and the displayed pose is shown uncorrected.
++    // Mean/max of that distance per presented frame, and its vertical part on its own.
++    double slipMm = 0, slipMaxMm = 0, slipYMm = 0, slipYMaxMm = 0;
+ };
+ // Hidden session (no wearer): count loops and fresh frames so the repaint rate is measurable
+ // without a head, and how often the runtime hands us an invalid pose.
+@@ -859,6 +863,7 @@ static void LogArrivals(const char* who)
+              a.queueOverflow, a.catchUp, a.maxDepth);
+ }
+ static LatencyWindow g_lat;
++static float g_sentIpd = 0.0f;   // the eye separation last sent upstream (the server renders with it)
+ static std::chrono::steady_clock::time_point g_presentedReceivedAt{};   // of the frame on screen
+ static bool g_presentedValid = false;
+ static inline double MsSince(const std::chrono::steady_clock::time_point& t0)
+@@ -1249,11 +1254,36 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+         const float dz = views[1].pose.position.z - views[0].pose.position.z;
+         const float sep = sqrtf(dx * dx + dy * dy + dz * dz);
+         pkt.ipd = (sep > 0.045f && sep < 0.085f) ? sep : 0.0f;
++        if (pkt.ipd > 0.0f) g_sentIpd = pkt.ipd;
+         static bool ipdLogged = false;
+         if (!ipdLogged && pkt.ipd > 0.0f) {
+             ipdLogged = true;
+             LOG_INFO("IPD from xrLocateViews: %.1f mm, sent upstream (the server rendered 63.0 mm until now)", pkt.ipd * 1000.0f);
+         }
++        // Eye geometry probe (2026-10-19): the server places each eye at head +/- right*ipd/2 with the head's
++        // orientation. Log where the runtime really puts them, in the head frame, every ~20 s while worn.
++        static int geomCount = 0;
++        if (pkt.ipd > 0.0f && (geomCount++ % 1800) == 0) {
++            auto conj = [](const XrQuaternionf& q) { return XrQuaternionf{-q.x, -q.y, -q.z, q.w}; };
++            auto mul = [](const XrQuaternionf& a, const XrQuaternionf& b) {
++                return XrQuaternionf{a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
++                                     a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
++                                     a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
++                                     a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z}; };
++            auto rotv = [&](const XrQuaternionf& q, float x, float y, float z) {
++                XrQuaternionf v{x, y, z, 0.0f}; XrQuaternionf r = mul(mul(q, v), conj(q)); return XrVector3f{r.x, r.y, r.z}; };
++            const XrQuaternionf hinv = conj(head.orientation);
++            for (int e = 0; e < 2; e++) {
++                const XrVector3f d = rotv(hinv, views[e].pose.position.x - head.position.x,
++                                                views[e].pose.position.y - head.position.y,
++                                                views[e].pose.position.z - head.position.z);
++                const XrQuaternionf rel = mul(hinv, views[e].pose.orientation);
++                const float ang = 2.0f * acosf(fminf(1.0f, fabsf(rel.w))) * 57.2958f;
++                LOG_INFO("eye geometry: view[%d] in head frame pos=(%.1f, %.1f, %.1f) mm, rotation vs head %.2f deg (axis %.2f %.2f %.2f), fov L=%.3f R=%.3f U=%.3f D=%.3f",
++                         e, d.x * 1000.0f, d.y * 1000.0f, d.z * 1000.0f, ang, rel.x, rel.y, rel.z,
++                         views[e].fov.angleLeft, views[e].fov.angleRight, views[e].fov.angleUp, views[e].fov.angleDown);
++            }
++        }
+     }
+ }
+ 
+@@ -1566,9 +1596,20 @@ static void RenderFrame(App& app)
+                 if (rc++ % 120 == 0)
+                     LOG_INFO("timewarp: render-pose %s", haveRenderPose ? "in use (compositor reprojects)" : "not yet received");
+             }
++            // Stamp-position test (2026-10-19): FRAME_CLIENT_STAMP_Y_M raises the stamped render position by that
++            // many metres. If the compositor reprojects position the whole scene drops by it against the keyboard.
++            static const float kStampYM = getenv("FRAME_CLIENT_STAMP_Y_M") ? atof(getenv("FRAME_CLIENT_STAMP_Y_M")) : 0.0f;
++            static bool stampYLogged = false;
++            if (kStampYM != 0.0f && !stampYLogged) { stampYLogged = true; LOG_INFO("stamp-position test: layer pose raised %.3f m (FRAME_CLIENT_STAMP_Y_M)", kStampYM); }
+             for (uint32_t eye = 0; eye < VIEW_COUNT; eye++) {
+                 if (haveRenderPose) {
+-                    layerPose[eye].position = {rpPos[0], rpPos[1], rpPos[2]};
++                    // The server renders eye e at head + right * (+-ipd/2) with the head's orientation (InputManager::
++                    // GetEyeViews); stamp each eye with THAT position, not the head centre, so the compositor's
++                    // per-eye reprojection (if any) starts from where the pixels were really rendered.
++                    const float qx = rpOri[0], qy = rpOri[1], qz = rpOri[2], qw = rpOri[3];
++                    const float rx = 1.0f - 2.0f * (qy * qy + qz * qz), ry = 2.0f * (qx * qy + qw * qz), rz = 2.0f * (qx * qz - qw * qy);
++                    const float half = (g_sentIpd > 0.0f ? g_sentIpd : 0.063f) * 0.5f * (eye == 0 ? -1.0f : 1.0f);
++                    layerPose[eye].position = {rpPos[0] + rx * half, rpPos[1] + ry * half + kStampYM, rpPos[2] + rz * half};
+                     layerPose[eye].orientation = {rpOri[0], rpOri[1], rpOri[2], rpOri[3]};
+                 } else {
+                     layerPose[eye] = views[eye].pose;
+@@ -1580,6 +1621,13 @@ static void RenderFrame(App& app)
+                 if (dot > 1.0) dot = 1.0;
+                 const double deg = 2.0 * acos(dot) * 57.29578;
+                 g_lat.warpDeg += deg; if (deg > g_lat.warpMaxDeg) g_lat.warpMaxDeg = deg;
++                // translation slip: stamped head centre vs the displayed head centre (mid-point of the two views)
++                const double mx = 0.5 * (views[0].pose.position.x + views[1].pose.position.x) - rpPos[0];
++                const double my = 0.5 * (views[0].pose.position.y + views[1].pose.position.y) - rpPos[1];
++                const double mz = 0.5 * (views[0].pose.position.z + views[1].pose.position.z) - rpPos[2];
++                const double slip = sqrt(mx * mx + my * my + mz * mz) * 1000.0, slipY = fabs(my) * 1000.0;
++                g_lat.slipMm += slip; if (slip > g_lat.slipMaxMm) g_lat.slipMaxMm = slip;
++                g_lat.slipYMm += slipY; if (slipY > g_lat.slipYMaxMm) g_lat.slipYMaxMm = slipY;
+             }
+             // Stamp-honoured test (2026-10-18): FRAME_CLIENT_STAMP_YAW_DEG=5 yaws the pose we tell the compositor the
+             // frame was rendered from, about world Y, without touching the frame. If SteamVR honours the stamp the whole
+@@ -1717,12 +1765,14 @@ static void RenderFrame(App& app)
+                             LOG_INFO("client pipeline: receive->submit %.2f + decode %.2f + pickup %.2f + eyes %.2f = %.1f ms;"
+                                      " displayed frame age %.1f ms; %u presented, %u fresh, %u repaints, %u pose fallbacks;"
+                                      " waited for a frame %u times (%.2f ms avg, %u rescued; limit %.1f ms);"
+-                                     " warp stamped->displayed mean %.2f max %.2f deg; raw fov changes %u (max %.3f deg)",
++                                     " warp stamped->displayed mean %.2f max %.2f deg; raw fov changes %u (max %.3f deg);"
++                                     " translation slip mean %.1f max %.1f mm (vertical mean %.1f max %.1f mm)",
+                                      r.receiveToDecoderSubmitMs, r.decodeLatencyMs, g_lat.pickup / f, r.compositorLatencyMs,
+                                      r.totalClientLatencyMs, r.displayedFrameAgeMs, g_lat.presented, g_lat.fresh,
+                                      g_lat.stale, g_lat.poseFallbacks, g_lat.waits, g_lat.waits ? g_lat.waited / g_lat.waits : 0.0,
+                                      g_lat.waitsRescued, g_waitForFrameMs,
+-                                     g_lat.warpDeg / p, g_lat.warpMaxDeg, g_lat.fovChanges, g_lat.fovMaxDeltaDeg);
++                                     g_lat.warpDeg / p, g_lat.warpMaxDeg, g_lat.fovChanges, g_lat.fovMaxDeltaDeg,
++                                     g_lat.slipMm / p, g_lat.slipMaxMm, g_lat.slipYMm / p, g_lat.slipYMaxMm);
+                             LogArrivals("client pipeline");
+                         g_lat = LatencyWindow{};
+                     }
+-- 
+2.44.0
+

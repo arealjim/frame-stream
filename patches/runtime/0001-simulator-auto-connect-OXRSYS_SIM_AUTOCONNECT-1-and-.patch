@@ -1,0 +1,76 @@
+From 19345fc3d28d1a6b170eae61f2d8d8c2080d8085 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:11:53 +0000
+Subject: [PATCH 01/23] simulator: --auto-connect / OXRSYS_SIM_AUTOCONNECT=1
+ and line-buffered stdout for scripted runs
+
+---
+ .../Sources/OXRSysSimulator/OXRSysSimulatorView.swift |  5 +++++
+ .../Sources/OXRSysSimulator/SimulatorModel.swift      | 11 +++++++++++
+ .../OXRSys Simulator/OXRSysSimulatorApp.swift         |  5 +++++
+ 3 files changed, 21 insertions(+)
+
+diff --git a/clients/shared/OXRSysSimulator/Sources/OXRSysSimulator/OXRSysSimulatorView.swift b/clients/shared/OXRSysSimulator/Sources/OXRSysSimulator/OXRSysSimulatorView.swift
+index 344feba..8c106d0 100644
+--- a/clients/shared/OXRSysSimulator/Sources/OXRSysSimulator/OXRSysSimulatorView.swift
++++ b/clients/shared/OXRSysSimulator/Sources/OXRSysSimulator/OXRSysSimulatorView.swift
+@@ -37,6 +37,11 @@ public struct OXRSysSimulatorView: View {
+                 .presentationDragIndicator(.visible)
+             #endif
+         }
++        .onAppear {
++            if model.autoConnect, model.state == .disconnected {
++                model.startDiscovery()
++            }
++        }
+         .onDisappear {
+             #if os(macOS)
+             if model.inputManager.mouseCaptured {
+diff --git a/clients/shared/OXRSysSimulator/Sources/OXRSysSimulator/SimulatorModel.swift b/clients/shared/OXRSysSimulator/Sources/OXRSysSimulator/SimulatorModel.swift
+index ec44bae..d063fa1 100644
+--- a/clients/shared/OXRSysSimulator/Sources/OXRSysSimulator/SimulatorModel.swift
++++ b/clients/shared/OXRSysSimulator/Sources/OXRSysSimulator/SimulatorModel.swift
+@@ -46,6 +46,13 @@ final class SimulatorModel {
+ 
+     var state: State = .disconnected
+     var discoveredServer: DiscoveredServer?
++
++    /// Headless/CI convenience: `--auto-connect` or `OXRSYS_SIM_AUTOCONNECT=1` starts discovery on
++    /// appear and connects to the first runtime found, so the simulator can be driven from a script.
++    let autoConnect: Bool = {
++        let p = ProcessInfo.processInfo
++        return p.arguments.contains("--auto-connect") || p.environment["OXRSYS_SIM_AUTOCONNECT"] == "1"
++    }()
+     var statusText: String
+     var framesDecoded: UInt64 = 0
+     var isTracking: Bool = false
+@@ -169,6 +176,10 @@ final class SimulatorModel {
+                 self.discoveredServer = server
+                 self.updateSimulatorProjection()
+                 self.statusText = "Found: \(server.name) (\(server.resolution) @ \(server.refreshRate)Hz)"
++                if self.autoConnect {
++                    print("[Viewer] auto-connect: \(server.name) at \(server.address)")
++                    self.connect()
++                }
+             }
+         }
+     }
+diff --git a/clients/simulator/OXRSys Simulator/OXRSysSimulatorApp.swift b/clients/simulator/OXRSys Simulator/OXRSysSimulatorApp.swift
+index 5c48a07..edcfac2 100644
+--- a/clients/simulator/OXRSys Simulator/OXRSysSimulatorApp.swift	
++++ b/clients/simulator/OXRSys Simulator/OXRSysSimulatorApp.swift	
+@@ -7,6 +7,11 @@ import SwiftUI
+ 
+ @main
+ struct OXRSysSimulatorApp: App {
++    init() {
++        // Line-buffer stdout so `print` diagnostics reach a pipe or log file while streaming.
++        setvbuf(stdout, nil, _IOLBF, 0)
++    }
++
+     var body: some Scene {
+         WindowGroup {
+             OXRSysSimulatorView()
+-- 
+2.43.0
+

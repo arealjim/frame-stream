@@ -1,0 +1,62 @@
+From c9e465d4ae259059b82740e1e67c6df46154fa4c Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 14:59:36 +0000
+Subject: [PATCH 17/23] StreamingServer: the merge put the submit-to-sent
+ timing in SendPacedVideoDatagram; back into SendEncodedVideoFrame where frame
+ and sendStartNs live
+
+---
+ runtime/src/StreamingServer.cpp | 30 +++++++++++++++---------------
+ 1 file changed, 15 insertions(+), 15 deletions(-)
+
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index 152036d..ba58536 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -3123,6 +3123,21 @@ void StreamingServer::SendEncodedVideoFrame(const EncodedVideoFrame& frame)
+     {
+         videoPacingMaxLatenessUs_.store(latenessUs);
+     }
++
++    // SendFrame -> last packet handed to the socket: encode queue + encode + send (and pacing).
++    const int64_t sentNs = SteadyClockNowNs();
++    if (frame.timestampNs > 0 && sentNs > frame.timestampNs)
++    {
++        const float toSent = static_cast<float>(sentNs - frame.timestampNs) / 1.0e6f;
++        if (toSent < 200.0f)
++        {
++            const float toStart = static_cast<float>(sendStartNs - frame.timestampNs) / 1.0e6f;
++            const float prev = submitToSentMs_.load();
++            const float prevStart = submitToSendStartMs_.load();
++            submitToSentMs_.store(prev > 0.0f ? prev * 0.9f + toSent * 0.1f : toSent);
++            submitToSendStartMs_.store(prev > 0.0f ? prevStart * 0.9f + toStart * 0.1f : toStart);
++        }
++    }
+ }
+ 
+ void StreamingServer::SendPacedVideoDatagram(SocketHandle socket, const uint8_t* data, size_t size,
+@@ -3142,21 +3157,6 @@ void StreamingServer::SendPacedVideoDatagram(SocketHandle socket, const uint8_t*
+     {
+         videoUdpSendFailures_.fetch_add(1);
+     }
+-
+-    // SendFrame -> last packet handed to the socket: encode queue + encode + send (and pacing).
+-    const int64_t sentNs = SteadyClockNowNs();
+-    if (frame.timestampNs > 0 && sentNs > frame.timestampNs)
+-    {
+-        const float toSent = static_cast<float>(sentNs - frame.timestampNs) / 1.0e6f;
+-        if (toSent < 200.0f)
+-        {
+-            const float toStart = static_cast<float>(sendStartNs - frame.timestampNs) / 1.0e6f;
+-            const float prev = submitToSentMs_.load();
+-            const float prevStart = submitToSendStartMs_.load();
+-            submitToSentMs_.store(prev > 0.0f ? prev * 0.9f + toSent * 0.1f : toSent);
+-            submitToSendStartMs_.store(prev > 0.0f ? prevStart * 0.9f + toStart * 0.1f : toStart);
+-        }
+-    }
+ }
+ 
+ void StreamingServer::SendRenderPosePacket(const EncodedVideoFrame& frame)
+-- 
+2.43.0
+

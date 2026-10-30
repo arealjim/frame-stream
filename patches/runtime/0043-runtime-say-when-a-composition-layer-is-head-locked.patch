@@ -1,0 +1,44 @@
+From 7b2217842f0442a6a4e3c10d41478292c68b5ed0 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:32:57 +0000
+Subject: [PATCH] runtime: say when a composition layer is head-locked
+
+A VIEW-space quad or cylinder is baked into the eye image like a world
+layer, so the headset's rotation warp re-aims it with the scene and it
+trails head turns by the stream latency. Log that once, so a report of a
+swimming HUD can be matched to its cause.
+---
+ runtime/src/Session.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index 473baa5..7e217c4 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -1096,6 +1096,7 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+     static std::atomic_bool loggedUnderlay{false};
+     static std::atomic_bool loggedInfiniteCylinder{false};
+     static std::atomic_bool loggedFirstOverlay{false};
++    static std::atomic_bool loggedViewSpaceOverlay{false};
+ 
+     for (uint32_t i = 0; i < frameEndInfo.layerCount; ++i)
+     {
+@@ -1207,6 +1208,15 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+             std::memcpy(overlay.clipFromLayer[eye], &clip[0][0], sizeof(overlay.clipFromLayer[eye]));
+         }
+ 
++        if (layerSpace->GetType() == Space::Type::Reference &&
++            layerSpace->GetReferenceSpaceType() == XR_REFERENCE_SPACE_TYPE_VIEW &&
++            !loggedViewSpaceOverlay.exchange(true))
++        {
++            // Baked into the eye image, a head-locked layer is re-aimed by the headset's rotation warp like the
++            // scene, so during a head turn it trails the head by the warp angle and settles when the head stops.
++            spdlog::info("OXRSys: a {} layer is in VIEW space (head-locked); it is composited with the scene, so it trails head turns by the stream latency",
++                         isQuad ? "quad" : "cylinder");
++        }
+         if (!loggedFirstOverlay.exchange(true))
+         {
+             spdlog::info("OXRSys: compositing {} layer into the eye images ({}x{} m, image {}x{}, alpha={})",
+-- 
+2.43.0
+

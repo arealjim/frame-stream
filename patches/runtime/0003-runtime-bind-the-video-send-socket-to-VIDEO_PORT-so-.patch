@@ -1,0 +1,46 @@
+From 9f56a14edbb13d33bc032b1ae2724d27b479b405 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:36:21 +0000
+Subject: [PATCH 03/23] runtime: bind the video send socket to VIDEO_PORT so
+ firewalled clients can open the return path
+
+---
+ runtime/src/StreamingServer.cpp | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index e6fcb5c..1c503d4 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -688,6 +688,28 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
+         return false;
+     }
+ 
++    // Send video from a fixed, announced port so a client behind a stateful firewall or NAT can
++    // open the return path itself: one datagram from its video socket to <server>:VIDEO_PORT
++    // makes every video/pose packet we send a reply to an existing flow. Ephemeral source ports
++    // cannot be pre-opened by the client. Falls back to an ephemeral port if the bind fails.
++    {
++        oxrsys::runtime_socket::SetReuseAddress(videoSocket_);
++        sockaddr_in videoBind = {};
++        videoBind.sin_family = AF_INET;
++        videoBind.sin_port = htons(oxr::protocol::VIDEO_PORT);
++        videoBind.sin_addr.s_addr = INADDR_ANY;
++        if (bind(videoSocket_, (sockaddr*)&videoBind, sizeof(videoBind)) < 0)
++        {
++            spdlog::warn("StreamingServer: could not bind video send socket to port {} ({}); "
++                         "clients behind stateful firewalls will not receive video",
++                         oxr::protocol::VIDEO_PORT, oxrsys::runtime_socket::LastErrorText());
++        }
++        else
++        {
++            spdlog::info("StreamingServer: video send socket bound to port {}",
++                         oxr::protocol::VIDEO_PORT);
++        }
++    }
+     oxrsys::runtime_socket::SetSendBuffer(videoSocket_, 4 * 1024 * 1024);
+     {
+         std::lock_guard<std::mutex> lock(packetDispatchState_->mutex);
+-- 
+2.43.0
+

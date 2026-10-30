@@ -1,0 +1,149 @@
+From 37cbfe591a80fbf705132012529be4ac7151d414 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 16:49:55 +0000
+Subject: [PATCH 04/23] runtime: accept mutable-format Metal swapchains so
+ Godot 4 Metal apps can render
+
+Godot 4 with the Metal rendering driver asks for its colour swapchain with
+usage COLOR_ATTACHMENT | SAMPLED | MUTABLE_FORMAT (format 71,
+MTLPixelFormatRGBA8Unorm_sRGB, arraySize 2) because it renders through a
+view of the swapchain texture with the sibling sRGB/UNORM pixel format.
+SupportedUsageFlags only whitelisted XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT
+for Vulkan, so xrCreateSwapchain returned XR_ERROR_FEATURE_UNSUPPORTED,
+Godot logged "No swapchain could be acquired to render to!" and the stream
+stayed black.
+
+Mirror the Vulkan handling for Metal: accept the bit, and when it is
+requested create the swapchain textures with MTLTextureUsagePixelFormatView
+so the application can make a compatible-format view (RGBA8Unorm <->
+RGBA8Unorm_sRGB, BGRA8 likewise). The flag is only set on request because
+Metal may disable lossless texture compression for such textures. The
+runtime's own slice views keep the texture's pixel format, so the staging
+textures and the encoder path are unchanged.
+
+Tests: the Metal MUTABLE_FORMAT validation case now expects success for a
+colour format and rejection for a depth format, and the runtime API test
+creates and destroys a Godot-shaped Metal swapchain (format 71, arraySize 2,
+mutable format).
+
+---
+ AGENTS.md                               |  3 +++
+ CHANGES.md                              |  4 ++++
+ runtime/src/SwapchainCreateValidation.h |  4 ++++
+ runtime/src/SwapchainMetal.mm           |  7 +++++++
+ tests/TestRuntimeApi.cpp                | 15 +++++++++++----
+ tests/TestSwapchainCreateValidation.cpp | 10 +++++++++-
+ 6 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/AGENTS.md b/AGENTS.md
+index f6b3115..a2e600c 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -61,6 +61,9 @@ ## Core Runtime Contracts
+   their rendered view into the runtime-owned texture before releasing it.
+ - Vulkan swapchains accept `XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT` and create those images with
+   `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`; Godot renders through an sRGB view of UNORM images.
++- Metal swapchains accept `XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT` and create those textures with
++  `MTLTextureUsagePixelFormatView`; Godot's Metal driver renders through an sRGB/UNORM view of
++  the swapchain texture.
+ - Vulkan streaming snapshots released color images with application-dispatched Vulkan functions
+   into bounded exportable images. Queue submission is non-blocking; fence waits belong to the
+   encoder worker. Missing export support, exhausted slots, or wait failures drop the streaming frame
+diff --git a/CHANGES.md b/CHANGES.md
+index e619c7c..9f99c64 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -75,6 +75,10 @@ ### Fixed
+   failing at `xrCreateSwapchain` with `XR_ERROR_FEATURE_UNSUPPORTED`. Vulkan swapchains now accept
+   `XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT` and create images with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`.
+   Rejected swapchain requests are now logged with their format, size, and flags.
++- Fixed Godot 4 with the Metal rendering driver failing at `xrCreateSwapchain` with
++  `XR_ERROR_FEATURE_UNSUPPORTED` ("No swapchain could be acquired to render to!") because it
++  requests `XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT`. Metal swapchains now accept the bit and create
++  those textures with `MTLTextureUsagePixelFormatView`.
+ - Fixed H.264 streams on Quest holding about 16 frames (around 220 ms at 72 Hz) in the decoder before
+   output. The Android VR client now sets the Qualcomm decode-order and low-latency MediaCodec keys,
+   which brings H.264 decode on Quest 3 to about 11 ms.
+diff --git a/runtime/src/SwapchainCreateValidation.h b/runtime/src/SwapchainCreateValidation.h
+index 5cd5b98..ab6e3dd 100644
+--- a/runtime/src/SwapchainCreateValidation.h
++++ b/runtime/src/SwapchainCreateValidation.h
+@@ -23,6 +23,10 @@ constexpr XrSwapchainUsageFlags SupportedUsageFlags(GraphicsApi api)
+         // Metal blit destinations do not require an MTLTextureUsage flag. Blender
+         // copies its rendered view into the OpenXR texture and declares that use.
+         flags |= XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
++        // Godot's Metal driver renders through a view of the swapchain texture with the
++        // sibling sRGB/UNORM pixel format. SwapchainMetal maps this to
++        // MTLTextureUsagePixelFormatView.
++        flags |= XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
+     }
+     if (api == GraphicsApi::Vulkan)
+     {
+diff --git a/runtime/src/SwapchainMetal.mm b/runtime/src/SwapchainMetal.mm
+index e523c12..e47b3cb 100644
+--- a/runtime/src/SwapchainMetal.mm
++++ b/runtime/src/SwapchainMetal.mm
+@@ -177,6 +177,13 @@ void Swapchain::InitMetal(void* metalDevice, const XrSwapchainCreateInfo* create
+                                                                                    height:height_
+                                                                                 mipmapped:NO];
+     desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
++    if ((createInfo->usageFlags & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) != 0)
++    {
++        // Lets the application create texture views with a compatible pixel format, such as
++        // RGBA8Unorm <-> RGBA8Unorm_sRGB. Only set on request: Metal may disable lossless
++        // texture compression for textures that carry this usage.
++        desc.usage |= MTLTextureUsagePixelFormatView;
++    }
+     desc.storageMode = MTLStorageModePrivate;
+     if (arraySize_ > 1)
+     {
+diff --git a/tests/TestRuntimeApi.cpp b/tests/TestRuntimeApi.cpp
+index 03f329f..29a13e6 100644
+--- a/tests/TestRuntimeApi.cpp
++++ b/tests/TestRuntimeApi.cpp
+@@ -2883,10 +2883,17 @@ TEST_CASE("Swapchain creation validates supported flags and compatible usage",
+ 
+     swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
+     createInfo.createFlags = 0;
+-    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
+-    CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain) ==
+-          XR_ERROR_FEATURE_UNSUPPORTED);
+-    CHECK(swapchain == XR_NULL_HANDLE);
++    // Godot's Metal driver renders through an sRGB/UNORM view of the swapchain texture.
++    createInfo.format = 71; // MTLPixelFormatRGBA8Unorm_sRGB, Godot 4 Metal's first match.
++    createInfo.arraySize = 2;
++    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
++                            XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
++                            XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
++    XR_CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain));
++    REQUIRE(swapchain != XR_NULL_HANDLE);
++    XR_CHECK(xrDestroySwapchain(swapchain));
++    createInfo.format = 70;
++    createInfo.arraySize = 1;
+ 
+     swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
+     createInfo.createFlags = 0;
+diff --git a/tests/TestSwapchainCreateValidation.cpp b/tests/TestSwapchainCreateValidation.cpp
+index 51d2dae..de97485 100644
+--- a/tests/TestSwapchainCreateValidation.cpp
++++ b/tests/TestSwapchainCreateValidation.cpp
+@@ -47,7 +47,15 @@ TEST_CASE("Swapchain usage and creation flags are validated per graphics API",
+     CHECK(oxrsys::swapchain::ValidateCreateInfo(GraphicsApi::Metal, createInfo) ==
+           XR_ERROR_FEATURE_UNSUPPORTED);
+     createInfo.createFlags = 0;
+-    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
++    // Godot's Metal driver renders through an sRGB/UNORM view of the swapchain texture.
++    createInfo.format = 71;
++    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
++                            XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
++                            XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
++    CHECK(oxrsys::swapchain::ValidateCreateInfo(GraphicsApi::Metal, createInfo) == XR_SUCCESS);
++    createInfo.format = 252;
++    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
++                            XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
+     CHECK(oxrsys::swapchain::ValidateCreateInfo(GraphicsApi::Metal, createInfo) ==
+           XR_ERROR_FEATURE_UNSUPPORTED);
+     // Godot creates UNORM images and renders through an sRGB view of them.
+-- 
+2.43.0
+

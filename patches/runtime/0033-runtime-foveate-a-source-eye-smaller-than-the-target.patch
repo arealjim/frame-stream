@@ -1,0 +1,105 @@
+From 525d4973c20bbfb5d49fb123ffc6afaff32e4b2b Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 07:58:39 +0000
+Subject: [PATCH 33/33] runtime: foveate a source eye smaller than the target,
+ and count every drop before encode
+
+An app whose swapchain eye is smaller than the foveation target (Cyberpunk VR port, 1912x1928 against 2160x2160)
+had every frame dropped before encode, so the headset got no video. The kernel samples by UV with a linear
+sampler, so any source size works; the check now only refuses zero sizes, and the scale is logged once.
+Drops before encode are counted and logged with their reason on the 1st and every 450th.
+
+---
+ runtime/src/VideoEncoder.h  |  3 ++-
+ runtime/src/VideoEncoder.mm | 35 ++++++++++++++++++++++++-----------
+ 2 files changed, 26 insertions(+), 12 deletions(-)
+
+diff --git a/runtime/src/VideoEncoder.h b/runtime/src/VideoEncoder.h
+index 622a691..dafa886 100644
+--- a/runtime/src/VideoEncoder.h
++++ b/runtime/src/VideoEncoder.h
+@@ -273,7 +273,8 @@ class VideoEncoder
+     uint32_t frameCount_ = 0;
+     std::atomic<bool> forceKeyframe_{false};
+     std::atomic<bool> shuttingDown_{false};
+-    std::atomic<bool> foveationValidationWarningLogged_{false};
++    std::atomic<uint64_t> preEncodeDropCount_{0};
++    std::atomic<bool> foveationScaleLogged_{false};
+     std::atomic<bool> videoRangeConversionWarningLogged_{false};
+     std::atomic<uint32_t> droppedFrameCount_{0};
+     std::atomic<uint32_t> inFlightFrameCount_{0};
+diff --git a/runtime/src/VideoEncoder.mm b/runtime/src/VideoEncoder.mm
+index 522ee18..39bf472 100644
+--- a/runtime/src/VideoEncoder.mm
++++ b/runtime/src/VideoEncoder.mm
+@@ -577,18 +577,17 @@ bool IsFiniteNormalized(float value)
+ // through a linear sampler, so a supersampled render (Godot render_target_size_multiplier 1.333 gives 2879x2879
+ // for a 2160 target) is downsampled into the same encoded layout at no encode cost. A smaller source would be an
+ // upsample the layout never asked for and is still refused, as is a different aspect. (2026-10-19, sharpness work)
++// The foveation kernel samples the source by normalized coordinates with a linear sampler, so any source eye size
++// works: a source smaller than the target eye, or of another aspect, is scaled as the unfoveated path scales it.
++// This used to demand a source at least the target size and of its aspect, and every frame from an app whose
++// swapchain was smaller was dropped before encode, so the headset got no video at all (Cyberpunk's VR port,
++// 1912x1928 eyes against a 2160x2160 target, 2026-10-26). EncodeFrame logs the scale once per encoder.
+ bool SourceCoversFoveationTarget(const VideoEncoder::FoveationSettings& settings,
+                                  uint32_t sourceEyeWidth,
+                                  uint32_t sourceEyeHeight)
+ {
+-    if (settings.targetEyeWidth == 0 || settings.targetEyeHeight == 0 ||
+-        sourceEyeWidth < settings.targetEyeWidth || sourceEyeHeight < settings.targetEyeHeight)
+-    {
+-        return false;
+-    }
+-    const double targetAspect = (double)settings.targetEyeWidth / (double)settings.targetEyeHeight;
+-    const double sourceAspect = (double)sourceEyeWidth / (double)sourceEyeHeight;
+-    return std::fabs(sourceAspect - targetAspect) <= 0.01 * targetAspect;
++    return settings.targetEyeWidth != 0 && settings.targetEyeHeight != 0 &&
++           sourceEyeWidth != 0 && sourceEyeHeight != 0;
+ }
+ 
+ bool IsFoveationSettingsValid(const VideoEncoder::FoveationSettings& settings,
+@@ -879,7 +878,8 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+     graphicsContext_ = graphicsContext;
+     videoToolbox_.metalDevice = graphicsContext.metalDevice;
+     shuttingDown_.store(false);
+-    foveationValidationWarningLogged_.store(false);
++    preEncodeDropCount_.store(0);
++    foveationScaleLogged_.store(false);
+     droppedFrameCount_.store(0);
+     inFlightFrameCount_.store(0);
+     frameNumberCounter_.store(0);
+@@ -1866,9 +1866,12 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
+     id<MTLTexture> leftTex = (__bridge id<MTLTexture>)frameSource.left.GetImage();
+     id<MTLTexture> rightTex = stereo ? (__bridge id<MTLTexture>)frameSource.right.GetImage() : nil;
+     auto dropAcquiredSlot = [&](const char* reason) {
+-        if (reason != nullptr && !foveationValidationWarningLogged_.exchange(true))
++        // Every drop is counted; the first and then every 450th (about 5 s at 90 Hz) is logged with its reason, so a
++        // stream that drops every frame keeps saying so instead of going quiet after one line.
++        const uint64_t drops = preEncodeDropCount_.fetch_add(1) + 1;
++        if (reason != nullptr && (drops == 1 || drops % 450 == 0))
+         {
+-            spdlog::warn("VideoEncoder: dropping frame before encode: {}", reason);
++            spdlog::warn("VideoEncoder: dropping frame before encode: {} ({} dropped before encode so far)", reason, drops);
+         }
+         droppedFrameCount_.fetch_add(1);
+         ReleaseSlot(slotIndex);
+@@ -2054,6 +2057,16 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
+         }
+     }
+ 
++    if (useFoveatedEncoding &&
++        (leftTex.width != (NSUInteger)foveationSettings_.targetEyeWidth ||
++         leftTex.height != (NSUInteger)foveationSettings_.targetEyeHeight) &&
++        !foveationScaleLogged_.exchange(true))
++    {
++        spdlog::info("VideoEncoder: foveation scales the app's {}x{} eye to the {}x{} target eye",
++                     (uint32_t)leftTex.width, (uint32_t)leftTex.height,
++                     foveationSettings_.targetEyeWidth, foveationSettings_.targetEyeHeight);
++    }
++
+     if (useFoveatedEncoding)
+     {
+         id<MTLTexture> foveatedDstTexture = (id<MTLTexture>)slot.foveatedScratchTexture;
+-- 
+2.50.1 (Apple Git-155)
+

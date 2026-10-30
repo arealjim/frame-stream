@@ -1,0 +1,473 @@
+From 89a1101700f83a2d90c09a7c4c7f060a7f4dee2e Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 10:51:23 +0000
+Subject: [PATCH] runtime: go to the long snapshot wait only after late frames
+ in a row
+
+0036 waited up to max(frame period, 100 ms) for every snapshot, so a
+slow application streams at its own rate instead of black. This keeps
+that, but only for an application that needs it. The wait now has two
+modes (SnapshotWaitPolicy.h):
+
+- short, min(frame period, 16.7 ms), the wait before 0036, while
+  frames arrive on time. A stray late frame is dropped, as it was.
+- long, max(frame period, 100 ms), after three late frames in a row.
+  A frame is late when it was not ready in time or took longer than
+  the short wait, i.e. when the short wait would have dropped it.
+- back to short after two seconds of frames on time in a row.
+
+The gap between the two thresholds is the hysteresis: an application
+near the period reaches three late in a row quickly and then does not
+get two seconds on time, so it settles on the long wait instead of
+flapping. A slow application loses three frames per encoder life,
+about 40 ms, before it streams.
+
+Each switch is counted and logged at info, the first and then at most
+one line a second, carrying the switches it stood for; the encoder's
+shutdown logs the total when there were any. 0036's drop and late
+lines are unchanged.
+
+Asked for 2026-10-27 after an 80 Hz ABAB put 0036's reprojection
+about 0.4 points above rel34's in both pairs. Note that those 0036
+arms logged no wait over a period, so their frames took the path this
+change keeps, and the difference may be run order, not the wait.
+---
+ CMakeLists.txt                   |   1 +
+ runtime/src/SnapshotWaitPolicy.h |  85 ++++++++++++++
+ runtime/src/VideoEncoder.h       |   8 ++
+ runtime/src/VideoEncoder.mm      |  61 ++++++++--
+ tests/TestSnapshotWaitPolicy.cpp | 191 +++++++++++++++++++++++++++++++
+ 5 files changed, 338 insertions(+), 8 deletions(-)
+ create mode 100644 runtime/src/SnapshotWaitPolicy.h
+ create mode 100644 tests/TestSnapshotWaitPolicy.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 35afbf0..1d65a88 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -185,6 +185,7 @@ add_executable(oxrsys_runtime_tests
+     tests/TestPacketPacer.cpp
+     tests/TestStreamingReconfigure.cpp
+     tests/TestSnapshotLeasePool.cpp
++    tests/TestSnapshotWaitPolicy.cpp
+     tests/TestSwapchainCreateValidation.cpp
+     tests/TestVideoCodecSelection.cpp
+     tests/TestVideoTextureFormat.cpp
+diff --git a/runtime/src/SnapshotWaitPolicy.h b/runtime/src/SnapshotWaitPolicy.h
+new file mode 100644
+index 0000000..9a97e6f
+--- /dev/null
++++ b/runtime/src/SnapshotWaitPolicy.h
+@@ -0,0 +1,85 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++
++// How long the encoder worker waits for an application's snapshot before it
++// drops the frame, factored out of VideoEncoder so the switching is
++// unit-testable without a GPU.
++//
++// Two waits. The short one, min(frame period, 16.7 ms), is the wait an
++// application that keeps up has always had: a frame that misses it is dropped,
++// and the next, newer frame is encoded instead. The long one, up to 100 ms,
++// lets an application whose GPU frame outlasts a panel period stream at its
++// own rate instead of not at all. The long wait is entered only after a few
++// late frames in a row and left only after a long run of on-time ones, so an
++// application near the period settles in one mode instead of flapping, and a
++// stray late frame from an application that keeps up is dropped, as before,
++// not shown late.
++namespace oxrsys
++{
++
++struct SnapshotWaitSettings
++{
++    uint64_t shortWaitNs = 0;
++    uint64_t longWaitNs = 0;
++    uint32_t enterLongAfterLate = 0;    // consecutive late frames that switch to the long wait
++    uint32_t leaveLongAfterOnTime = 0;  // consecutive on-time frames that switch back
++};
++
++struct SnapshotWaitState
++{
++    bool longWait = false;
++    uint32_t lateStreak = 0;
++    uint32_t onTimeStreak = 0;
++};
++
++// Three late frames in a row (about 40 ms at 80-90 Hz) to go long; two seconds
++// of frames on time to come back.
++inline SnapshotWaitSettings SnapshotWaitSettingsForFps(uint32_t fps)
++{
++    const uint64_t framePeriodNs = 1'000'000'000ull / std::max(fps, 1u);
++    SnapshotWaitSettings settings;
++    settings.shortWaitNs = std::min<uint64_t>(framePeriodNs, 16'666'667ull);
++    settings.longWaitNs = std::max<uint64_t>(framePeriodNs, 100'000'000ull);
++    settings.enterLongAfterLate = 3;
++    settings.leaveLongAfterOnTime = std::max(fps, 1u) * 2;
++    return settings;
++}
++
++inline uint64_t SnapshotWaitNs(const SnapshotWaitState& state, const SnapshotWaitSettings& settings)
++{
++    return state.longWait ? settings.longWaitNs : settings.shortWaitNs;
++}
++
++// Records one frame's wait. A frame is late when it was not ready in time, or
++// when it took longer than the short wait, i.e. when the short wait would have
++// dropped it. Returns true when the mode switched.
++inline bool RecordSnapshotWait(SnapshotWaitState& state, const SnapshotWaitSettings& settings,
++                               bool ready, uint64_t waitedNs)
++{
++    const bool late = !ready || waitedNs > settings.shortWaitNs;
++    if (late)
++    {
++        state.onTimeStreak = 0;
++        state.lateStreak = std::min<uint32_t>(state.lateStreak + 1, settings.enterLongAfterLate);
++        if (!state.longWait && state.lateStreak >= settings.enterLongAfterLate)
++        {
++            state.longWait = true;
++            return true;
++        }
++        return false;
++    }
++    state.lateStreak = 0;
++    state.onTimeStreak = std::min<uint32_t>(state.onTimeStreak + 1, settings.leaveLongAfterOnTime);
++    if (state.longWait && state.onTimeStreak >= settings.leaveLongAfterOnTime)
++    {
++        state.longWait = false;
++        return true;
++    }
++    return false;
++}
++
++} // namespace oxrsys
+diff --git a/runtime/src/VideoEncoder.h b/runtime/src/VideoEncoder.h
+index c855c3f..0791b16 100644
+--- a/runtime/src/VideoEncoder.h
++++ b/runtime/src/VideoEncoder.h
+@@ -18,6 +18,7 @@
+ #include "GraphicsTypes.h"
+ #include "BoundedDrain.h"
+ #include "EncoderPathPolicy.h"
++#include "SnapshotWaitPolicy.h"
+ #include <oxrsys/protocol/Protocol.h>
+ 
+ // Runtime-side client for the out-of-process native-arm64 hardware HEVC
+@@ -275,6 +276,13 @@ class VideoEncoder
+     std::atomic<bool> shuttingDown_{false};
+     std::atomic<uint64_t> preEncodeDropCount_{0};
+     std::atomic<uint64_t> lateSnapshotCount_{0};
++    // The snapshot wait's mode (short while frames arrive on time, long after a few late ones in a row); touched only
++    // by the encoder worker in EncodeInternal, reset in Initialize.
++    oxrsys::SnapshotWaitSettings snapshotWaitSettings_{};
++    oxrsys::SnapshotWaitState snapshotWait_{};
++    uint64_t snapshotWaitSwitches_ = 0;
++    uint64_t snapshotWaitSwitchesLogged_ = 0;
++    std::chrono::steady_clock::time_point snapshotWaitLastLog_ = {};
+     std::atomic<bool> foveationScaleLogged_{false};
+     std::atomic<bool> videoRangeConversionWarningLogged_{false};
+     std::atomic<uint32_t> droppedFrameCount_{0};
+diff --git a/runtime/src/VideoEncoder.mm b/runtime/src/VideoEncoder.mm
+index 1eb71bd..2159af3 100644
+--- a/runtime/src/VideoEncoder.mm
++++ b/runtime/src/VideoEncoder.mm
+@@ -880,6 +880,11 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+     shuttingDown_.store(false);
+     preEncodeDropCount_.store(0);
+     lateSnapshotCount_.store(0);
++    snapshotWaitSettings_ = oxrsys::SnapshotWaitSettingsForFps(fps);
++    snapshotWait_ = {};
++    snapshotWaitSwitches_ = 0;
++    snapshotWaitSwitchesLogged_ = 0;
++    snapshotWaitLastLog_ = {};
+     foveationScaleLogged_.store(false);
+     droppedFrameCount_.store(0);
+     inFlightFrameCount_.store(0);
+@@ -1732,6 +1737,11 @@ bool VideoEncoder::Shutdown(std::chrono::nanoseconds timeout)
+ 
+     spdlog::info("VideoEncoder: Shut down (submitted={} dropped={})",
+                   frameCount_, droppedFrameCount_.load());
++    if (snapshotWaitSwitches_ > 0)
++    {
++        spdlog::info("VideoEncoder: snapshot wait switched {} times in this encoder, {} at the end",
++                     snapshotWaitSwitches_, snapshotWait_.longWait ? "long" : "short");
++    }
+     return true;
+ }
+ 
+@@ -1852,14 +1862,21 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
+     // fence signals only when the application's GPU frame is done. Wait for
+     // those copies only on this encoder worker, never from Session::EndFrame().
+     //
+-    // The wait used to be min(frame period, 16.7 ms), so that a stalled GPU
+-    // drops the frame instead of accumulating latency. But then an application
+-    // whose GPU frame takes longer than one panel period (11.1 ms at 90 Hz)
+-    // never had a single frame encoded: every snapshot timed out, silently, and
+-    // the headset got a black stream (a 27 fps scene with a 35.8 ms GPU frame,
+-    // 2026-10-27). A slow application now degrades to a slow picture instead.
++    // The wait was min(frame period, 16.7 ms), so that a stalled GPU drops the
++    // frame instead of accumulating latency. But then an application whose GPU
++    // frame takes longer than one panel period (11.1 ms at 90 Hz) never had a
++    // single frame encoded: every snapshot timed out, silently, and the headset
++    // got a black stream (a 27 fps scene with a 35.8 ms GPU frame, 2026-10-27).
++    //
++    // So the wait has two modes (SnapshotWaitPolicy.h). While frames arrive on
++    // time it is still the short wait, and a stray late frame is dropped as it
++    // always was. After three late frames in a row it becomes the long wait, up
++    // to 100 ms, and a slow application degrades to a slow picture instead of a
++    // black one; two seconds of frames on time bring it back. An application
++    // that keeps up gets exactly the wait it had before, and the hysteresis
++    // keeps one near the period from flapping between the two.
+     //
+-    // A longer wait cannot pile up latency: frameQueue_ is latest-only
++    // The long wait cannot pile up latency: frameQueue_ is latest-only
+     // (StreamingFrameQueue::PushLatest), so while this worker waits, newer
+     // frames replace one another in its single pending slot and the next one
+     // encoded is the newest. A frame that is already done returns at once, so
+@@ -1869,7 +1886,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
+     // still bounded, so a GPU that hangs or a swapchain being torn down lets
+     // the worker go: below about 10 fps the frame is dropped, and logged.
+     const uint64_t framePeriodNs = 1'000'000'000ull / std::max(fps_, 1u);
+-    const uint64_t snapshotWaitNs = std::max<uint64_t>(framePeriodNs, 100'000'000ull);
++    const uint64_t snapshotWaitNs = oxrsys::SnapshotWaitNs(snapshotWait_, snapshotWaitSettings_);
+     const auto snapshotWaitStart = Clock::now();
+     const char* notReady = nullptr;
+     for (const auto& overlay : frameSource.overlays)
+@@ -1889,6 +1906,34 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
+     }
+     const double snapshotWaitedMs =
+         std::chrono::duration<double, std::milli>(Clock::now() - snapshotWaitStart).count();
++    if (oxrsys::RecordSnapshotWait(snapshotWait_, snapshotWaitSettings_, notReady == nullptr,
++                                   (uint64_t)(snapshotWaitedMs * 1.0e6)))
++    {
++        // Each switch is counted; a line goes out for the first and then at most one a second, carrying the switches
++        // it stood for, so an application that flapped would show as a count, not a flood.
++        ++snapshotWaitSwitches_;
++        const auto now = Clock::now();
++        if (snapshotWaitSwitchesLogged_ == 0 || now - snapshotWaitLastLog_ >= std::chrono::seconds(1))
++        {
++            const uint64_t unlogged = snapshotWaitSwitches_ - snapshotWaitSwitchesLogged_ - 1;
++            if (snapshotWait_.longWait)
++            {
++                spdlog::info("VideoEncoder: snapshot wait now long ({:.1f} ms) after {} late frames in a row "
++                             "(switch {}, {} unlogged since the last line)",
++                             (double)snapshotWaitSettings_.longWaitNs / 1.0e6, snapshotWaitSettings_.enterLongAfterLate,
++                             snapshotWaitSwitches_, unlogged);
++            }
++            else
++            {
++                spdlog::info("VideoEncoder: snapshot wait now short ({:.1f} ms) after {} frames on time in a row "
++                             "(switch {}, {} unlogged since the last line)",
++                             (double)snapshotWaitSettings_.shortWaitNs / 1.0e6,
++                             snapshotWaitSettings_.leaveLongAfterOnTime, snapshotWaitSwitches_, unlogged);
++            }
++            snapshotWaitSwitchesLogged_ = snapshotWaitSwitches_;
++            snapshotWaitLastLog_ = now;
++        }
++    }
+     if (notReady != nullptr)
+     {
+         logPreEncodeDrop(notReady, snapshotWaitedMs);
+diff --git a/tests/TestSnapshotWaitPolicy.cpp b/tests/TestSnapshotWaitPolicy.cpp
+new file mode 100644
+index 0000000..936c067
+--- /dev/null
++++ b/tests/TestSnapshotWaitPolicy.cpp
+@@ -0,0 +1,191 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include <catch2/catch_test_macros.hpp>
++
++#include "SnapshotWaitPolicy.h"
++
++#include <cstdint>
++
++using oxrsys::RecordSnapshotWait;
++using oxrsys::SnapshotWaitNs;
++using oxrsys::SnapshotWaitSettings;
++using oxrsys::SnapshotWaitSettingsForFps;
++using oxrsys::SnapshotWaitState;
++
++namespace
++{
++constexpr uint64_t kMs = 1'000'000;
++
++// Fixed thresholds written out here, not taken from SnapshotWaitSettingsForFps,
++// so the switching tests do not inherit a mistake in the defaults.
++SnapshotWaitSettings TestSettings()
++{
++    SnapshotWaitSettings settings;
++    settings.shortWaitNs = 12'500'000;
++    settings.longWaitNs = 100 * kMs;
++    settings.enterLongAfterLate = 3;
++    settings.leaveLongAfterOnTime = 5;
++    return settings;
++}
++} // namespace
++
++TEST_CASE("Snapshot wait: the defaults are rel34's short wait and 0036's long one", "[snapshot-wait]")
++{
++    const auto at80 = SnapshotWaitSettingsForFps(80);
++    CHECK(at80.shortWaitNs == 12'500'000);
++    CHECK(at80.longWaitNs == 100 * kMs);
++    CHECK(at80.enterLongAfterLate == 3);
++    CHECK(at80.leaveLongAfterOnTime == 160);
++
++    const auto at90 = SnapshotWaitSettingsForFps(90);
++    CHECK(at90.shortWaitNs == 11'111'111);
++
++    // Below 60 Hz the short wait is capped at 16.7 ms, as it always was.
++    const auto at30 = SnapshotWaitSettingsForFps(30);
++    CHECK(at30.shortWaitNs == 16'666'667);
++    CHECK(at30.longWaitNs == 100 * kMs);
++
++    // fps 0 must not divide by zero; the long wait never drops under a period.
++    const auto at0 = SnapshotWaitSettingsForFps(0);
++    CHECK(at0.longWaitNs == 1'000'000'000);
++    CHECK(at0.shortWaitNs == 16'666'667);
++}
++
++TEST_CASE("Snapshot wait: an encoder starts on the short wait", "[snapshot-wait]")
++{
++    const SnapshotWaitState state;
++    CHECK(SnapshotWaitNs(state, TestSettings()) == 12'500'000);
++}
++
++TEST_CASE("Snapshot wait: an app on time never leaves the short wait", "[snapshot-wait]")
++{
++    const auto settings = TestSettings();
++    SnapshotWaitState state;
++    for (int i = 0; i < 1000; ++i)
++    {
++        CHECK_FALSE(RecordSnapshotWait(state, settings, true, 4 * kMs));
++    }
++    CHECK_FALSE(state.longWait);
++}
++
++TEST_CASE("Snapshot wait: two late frames in a row stay short, the third goes long", "[snapshot-wait]")
++{
++    const auto settings = TestSettings();
++    SnapshotWaitState state;
++    CHECK_FALSE(RecordSnapshotWait(state, settings, false, 12'500'000));
++    CHECK_FALSE(RecordSnapshotWait(state, settings, false, 12'500'000));
++    CHECK_FALSE(state.longWait);
++    CHECK(RecordSnapshotWait(state, settings, false, 12'500'000));
++    CHECK(state.longWait);
++    CHECK(SnapshotWaitNs(state, settings) == 100 * kMs);
++}
++
++TEST_CASE("Snapshot wait: an on-time frame breaks a late streak", "[snapshot-wait]")
++{
++    const auto settings = TestSettings();
++    SnapshotWaitState state;
++    // Late, late, on time, late, late: never three in a row, so never long.
++    for (int round = 0; round < 50; ++round)
++    {
++        CHECK_FALSE(RecordSnapshotWait(state, settings, false, 12'500'000));
++        CHECK_FALSE(RecordSnapshotWait(state, settings, false, 12'500'000));
++        CHECK_FALSE(RecordSnapshotWait(state, settings, true, 3 * kMs));
++    }
++    CHECK_FALSE(state.longWait);
++}
++
++TEST_CASE("Snapshot wait: a ready frame that took longer than the short wait counts as late", "[snapshot-wait]")
++{
++    // On the long wait a frame arrives in time for it but past the short wait:
++    // the short wait would have dropped it, so it keeps the long wait.
++    const auto settings = TestSettings();
++    SnapshotWaitState state;
++    state.longWait = true;
++    for (int i = 0; i < 100; ++i)
++    {
++        CHECK_FALSE(RecordSnapshotWait(state, settings, true, 13 * kMs));
++    }
++    CHECK(state.longWait);
++    // Exactly the short wait is on time.
++    SnapshotWaitState fresh;
++    RecordSnapshotWait(fresh, settings, true, 12'500'000);
++    CHECK(fresh.lateStreak == 0);
++    CHECK(fresh.onTimeStreak == 1);
++}
++
++TEST_CASE("Snapshot wait: the long wait is left only after a full run of on-time frames", "[snapshot-wait]")
++{
++    const auto settings = TestSettings();
++    SnapshotWaitState state;
++    state.longWait = true;
++    for (int i = 0; i < 4; ++i)
++    {
++        CHECK_FALSE(RecordSnapshotWait(state, settings, true, 5 * kMs));
++    }
++    CHECK(state.longWait);
++    // One late frame restarts the count.
++    CHECK_FALSE(RecordSnapshotWait(state, settings, true, 20 * kMs));
++    for (int i = 0; i < 4; ++i)
++    {
++        CHECK_FALSE(RecordSnapshotWait(state, settings, true, 5 * kMs));
++    }
++    CHECK(state.longWait);
++    CHECK(RecordSnapshotWait(state, settings, true, 5 * kMs));
++    CHECK_FALSE(state.longWait);
++    CHECK(SnapshotWaitNs(state, settings) == 12'500'000);
++}
++
++TEST_CASE("Snapshot wait: an app near the period settles long and does not flap", "[snapshot-wait]")
++{
++    // Half the frames late, alternating in pairs: it reaches three late in a
++    // row at once and then never gets 160 on time in a row.
++    const auto settings = SnapshotWaitSettingsForFps(80);
++    SnapshotWaitState state;
++    int switches = 0;
++    for (int i = 0; i < 80 * 600; ++i)
++    {
++        const bool late = (i % 7) < 3 || (i % 2 == 0);
++        if (RecordSnapshotWait(state, settings, true, late ? 13 * kMs : 12 * kMs))
++        {
++            ++switches;
++        }
++    }
++    CHECK(switches == 1);
++    CHECK(state.longWait);
++}
++
++TEST_CASE("Snapshot wait: a slow app that recovers comes back to the short wait once", "[snapshot-wait]")
++{
++    const auto settings = SnapshotWaitSettingsForFps(90);
++    SnapshotWaitState state;
++    int switches = 0;
++    // A loading screen at 27 fps (35.8 ms GPU frame), then 10 s of a normal app.
++    for (int i = 0; i < 300; ++i)
++    {
++        switches += RecordSnapshotWait(state, settings, i >= 3, state.longWait ? 36 * kMs : 11'111'111) ? 1 : 0;
++    }
++    CHECK(state.longWait);
++    for (int i = 0; i < 900; ++i)
++    {
++        switches += RecordSnapshotWait(state, settings, true, 6 * kMs) ? 1 : 0;
++    }
++    CHECK_FALSE(state.longWait);
++    CHECK(switches == 2);
++}
++
++TEST_CASE("Snapshot wait: streaks saturate instead of wrapping", "[snapshot-wait]")
++{
++    const auto settings = TestSettings();
++    SnapshotWaitState state;
++    for (int i = 0; i < 100'000; ++i)
++    {
++        RecordSnapshotWait(state, settings, true, 1 * kMs);
++    }
++    CHECK(state.onTimeStreak == settings.leaveLongAfterOnTime);
++    for (int i = 0; i < 100'000; ++i)
++    {
++        RecordSnapshotWait(state, settings, false, 100 * kMs);
++    }
++    CHECK(state.lateStreak == settings.enterLongAfterLate);
++    CHECK(state.longWait);
++}
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,287 @@
+From 72a1a63d5b256671a07a06b7eb9ea466f37e2df3 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 22:58:00 +0000
+Subject: [PATCH 55/56] runtime: cube swapchains (faceCount 6) on Metal and
+ Vulkan
+
+XR_KHR_composition_layer_cube samples a swapchain created with faceCount
+6, which CreateSwapchain refused. A square colour swapchain with six faces
+is now accepted (a depth or non-square one is FEATURE_UNSUPPORTED):
+
+- Metal: the images are MTLTextureTypeCube (CubeArray when arraySize > 1),
+  their staging copies too, and the frame image source of a cube swapchain
+  is a cube texture: the image itself, or a cube view of slices
+  (arrayIndex * 6, 6).
+- Vulkan: the images have arraySize * 6 layers and CUBE_COMPATIBLE; the
+  snapshot image, barriers and copies cover every layer, and the Metal
+  side of a cube image is a cube view of its texture.
+
+Swapchain::GetFaceCount() reports what was made. Nothing else changes for
+faceCount 1.
+---
+ runtime/src/Session.cpp                 |  2 +-
+ runtime/src/Swapchain.h                 |  7 +++
+ runtime/src/SwapchainCreateValidation.h |  6 +++
+ runtime/src/SwapchainMetal.mm           | 58 ++++++++++++++++++++++---
+ runtime/src/SwapchainVulkan.cpp         | 20 ++++++---
+ 5 files changed, 80 insertions(+), 13 deletions(-)
+
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index 82502a6..26219ae 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -1777,7 +1777,7 @@ XrResult Session::CreateSwapchain(const XrSwapchainCreateInfo* createInfo, XrSwa
+     if (createInfo->type != XR_TYPE_SWAPCHAIN_CREATE_INFO ||
+         createInfo->width == 0 ||
+         createInfo->height == 0 ||
+-        createInfo->faceCount != 1 ||
++        (createInfo->faceCount != 1 && createInfo->faceCount != 6) ||
+         createInfo->arraySize == 0 ||
+         createInfo->sampleCount != 1)
+     {
+diff --git a/runtime/src/Swapchain.h b/runtime/src/Swapchain.h
+index 9b06d73..3862ea6 100644
+--- a/runtime/src/Swapchain.h
++++ b/runtime/src/Swapchain.h
+@@ -130,6 +130,12 @@ class Swapchain
+         return arraySize_;
+     }
+ 
++    // 6 for a cube swapchain (its FrameImageSource is a cube texture), otherwise 1.
++    uint32_t GetFaceCount() const
++    {
++        return faceCount_;
++    }
++
+     bool HasReleasedImage() const;
+ 
+     // Release-time snapshots are only useful while a headset encoder is ready.
+@@ -251,6 +257,7 @@ class Swapchain
+     uint32_t height_ = 0;
+     int64_t format_ = 0;
+     uint32_t arraySize_ = 1;
++    uint32_t faceCount_ = 1;          // 6: each array element is a cube, arraySize_ * 6 image layers
+     uint32_t imageCount_ = SwapchainImageCount;
+ 
+     void* device_ = nullptr; // MTL::Device*
+diff --git a/runtime/src/SwapchainCreateValidation.h b/runtime/src/SwapchainCreateValidation.h
+index ab6e3dd..69abfe3 100644
+--- a/runtime/src/SwapchainCreateValidation.h
++++ b/runtime/src/SwapchainCreateValidation.h
+@@ -88,6 +88,12 @@ constexpr XrResult ValidateCreateInfo(GraphicsApi api,
+         // returned MTLTexture/VkImage does not have.
+         return XR_ERROR_FEATURE_UNSUPPORTED;
+     }
++    if (createInfo.faceCount == 6 && (isDepth || createInfo.width != createInfo.height))
++    {
++        // A cube swapchain (XR_KHR_composition_layer_cube) is a colour image the compositor samples;
++        // its faces are square, as Metal and Vulkan cube images require.
++        return XR_ERROR_FEATURE_UNSUPPORTED;
++    }
+     if (isDepth && (createInfo.usageFlags & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) != 0)
+     {
+         // Mutable format exists for UNORM color images viewed as sRGB; depth formats
+diff --git a/runtime/src/SwapchainMetal.mm b/runtime/src/SwapchainMetal.mm
+index db1b4ac..6715a41 100644
+--- a/runtime/src/SwapchainMetal.mm
++++ b/runtime/src/SwapchainMetal.mm
+@@ -57,6 +57,7 @@ std::shared_ptr<void> MakeStagingLease(const std::shared_ptr<SwapchainStagingSlo
+ 
+ FrameImageSource MakeMetalFrameImageSource(id<MTLTexture> texture,
+                                            uint32_t arraySize,
++                                           uint32_t faceCount,
+                                            uint32_t arrayIndex,
+                                            const std::shared_ptr<void>& lifetime,
+                                            const std::shared_ptr<void>& waitEvent,
+@@ -74,6 +75,26 @@ FrameImageSource MakeMetalFrameImageSource(id<MTLTexture> texture,
+         return {};
+     }
+ 
++    if (faceCount == 6)
++    {
++        // A cube layer samples the whole cube: hand out a cube view of this array element.
++        if (texture.textureType == MTLTextureTypeCube && arrayIndex == 0)
++        {
++            source.image = RetainMetalObject(texture);
++            return source;
++        }
++        id<MTLTexture> cubeView = [texture newTextureViewWithPixelFormat:texture.pixelFormat
++                                                             textureType:MTLTextureTypeCube
++                                                                  levels:NSMakeRange(0, 1)
++                                                                  slices:NSMakeRange(arrayIndex * 6, 6)];
++        if (cubeView == nil)
++        {
++            return {};
++        }
++        source.image = AdoptMetalObject(cubeView);
++        return source;
++    }
++
+     if (arraySize <= 1 || texture.textureType != MTLTextureType2DArray)
+     {
+         source.image = RetainMetalObject(texture);
+@@ -121,6 +142,20 @@ extern "C" void* OxrsysRetainMetalObjectForSwapchain(void* object)
+     return (void*)[(id)object retain];
+ }
+ 
++extern "C" void* OxrsysCreateMetalCubeViewForSwapchain(void* object, uint32_t arrayIndex)
++{
++    // MoltenVK may export a cube-compatible VkImage as a 2D array; a cube view reads either.
++    id<MTLTexture> texture = (__bridge id<MTLTexture>)object;
++    if (texture == nil)
++    {
++        return nullptr;
++    }
++    return (void*)[texture newTextureViewWithPixelFormat:texture.pixelFormat
++                                              textureType:MTLTextureTypeCube
++                                                   levels:NSMakeRange(0, 1)
++                                                   slices:NSMakeRange(arrayIndex * 6, 6)];
++}
++
+ extern "C" void* OxrsysCreateMetalTextureSliceForSwapchain(
+     void* object, uint32_t arraySize, uint32_t arrayIndex)
+ {
+@@ -160,6 +195,7 @@ void Swapchain::InitMetal(void* metalDevice, const XrSwapchainCreateInfo* create
+     height_ = createInfo->height;
+     format_ = createInfo->format;
+     arraySize_ = createInfo->arraySize > 0 ? createInfo->arraySize : 1;
++    faceCount_ = createInfo->faceCount == 6 ? 6 : 1;
+     imageCount_ = (createInfo->createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) != 0 ? 1 : SwapchainImageCount;
+ 
+     if (!IsSupportedMetalFormat(format_))
+@@ -185,7 +221,12 @@ void Swapchain::InitMetal(void* metalDevice, const XrSwapchainCreateInfo* create
+         desc.usage |= MTLTextureUsagePixelFormatView;
+     }
+     desc.storageMode = MTLStorageModePrivate;
+-    if (arraySize_ > 1)
++    if (faceCount_ == 6)
++    {
++        desc.textureType = arraySize_ > 1 ? MTLTextureTypeCubeArray : MTLTextureTypeCube;
++        desc.arrayLength = arraySize_;
++    }
++    else if (arraySize_ > 1)
+     {
+         desc.textureType = MTLTextureType2DArray;
+         desc.arrayLength = arraySize_;
+@@ -217,8 +258,8 @@ void Swapchain::InitMetal(void* metalDevice, const XrSwapchainCreateInfo* create
+     InitMetalStaging(metalDevice);
+ 
+     Runtime::Get().RegisterHandle(handle_, this);
+-    spdlog::info("OXRSys: Metal swapchain created {}x{} format={} arraySize={} images={}",
+-                  width_, height_, format_, arraySize_, imageCount_);
++    spdlog::info("OXRSys: Metal swapchain created {}x{} format={} arraySize={} faces={} images={}",
++                  width_, height_, format_, arraySize_, faceCount_, imageCount_);
+ }
+ 
+ void Swapchain::InitMetalStaging(void* metalDevice)
+@@ -240,7 +281,12 @@ void Swapchain::InitMetalStaging(void* metalDevice)
+                                                                                 mipmapped:NO];
+     desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+     desc.storageMode = MTLStorageModePrivate;
+-    if (arraySize_ > 1)
++    if (faceCount_ == 6)
++    {
++        desc.textureType = arraySize_ > 1 ? MTLTextureTypeCubeArray : MTLTextureTypeCube;
++        desc.arrayLength = arraySize_;
++    }
++    else if (arraySize_ > 1)
+     {
+         desc.textureType = MTLTextureType2DArray;
+         desc.arrayLength = arraySize_;
+@@ -429,11 +475,11 @@ FrameImageSource Swapchain::SnapshotMetalFrameImageSource(uint32_t arrayIndex) c
+         std::shared_ptr<void> waitEvent = RetainMetalObject((id)snapshotEvent_);
+         id<MTLTexture> texture = (__bridge id<MTLTexture>)stagingSlots_[lastSnapshotIndex_].texture;
+         return MakeMetalFrameImageSource(
+-            texture, arraySize_, arrayIndex, lastSnapshotLease_, waitEvent, lastSnapshotValue_);
++            texture, arraySize_, faceCount_, arrayIndex, lastSnapshotLease_, waitEvent, lastSnapshotValue_);
+     }
+ 
+     id<MTLTexture> texture = (__bridge id<MTLTexture>)textures_[lastReleasedIndex_];
+-    return MakeMetalFrameImageSource(texture, arraySize_, arrayIndex, {}, {}, 0);
++    return MakeMetalFrameImageSource(texture, arraySize_, faceCount_, arrayIndex, {}, {}, 0);
+ }
+ 
+ void Swapchain::ReleaseMetalTextureSlice(void* textureSlice)
+diff --git a/runtime/src/SwapchainVulkan.cpp b/runtime/src/SwapchainVulkan.cpp
+index d2dbb91..b4cdae1 100644
+--- a/runtime/src/SwapchainVulkan.cpp
++++ b/runtime/src/SwapchainVulkan.cpp
+@@ -22,6 +22,7 @@
+ extern "C" void* OxrsysRetainMetalObjectForSwapchain(void* object);
+ extern "C" void* OxrsysCreateMetalTextureSliceForSwapchain(
+     void* object, uint32_t arraySize, uint32_t arrayIndex);
++extern "C" void* OxrsysCreateMetalCubeViewForSwapchain(void* object, uint32_t arrayIndex);
+ #endif
+ 
+ namespace
+@@ -203,6 +204,7 @@ void Swapchain::InitVulkan(void* /*metalDevice*/, const VulkanGraphicsContext& v
+     height_ = createInfo->height;
+     format_ = createInfo->format;
+     arraySize_ = createInfo->arraySize > 0 ? createInfo->arraySize : 1;
++    faceCount_ = createInfo->faceCount == 6 ? 6 : 1;
+     imageCount_ = (createInfo->createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) != 0
+         ? 1
+         : SwapchainImageCount;
+@@ -256,7 +258,7 @@ void Swapchain::InitVulkan(void* /*metalDevice*/, const VulkanGraphicsContext& v
+     imageCI.format = static_cast<VkFormat>(format_);
+     imageCI.extent = {width_, height_, 1};
+     imageCI.mipLevels = 1;
+-    imageCI.arrayLayers = arraySize_;
++    imageCI.arrayLayers = arraySize_ * faceCount_;
+     imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
+     imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
+     // TRANSFER_SRC on depth: the release-time row capture for positional reprojection reads it.
+@@ -271,6 +273,10 @@ void Swapchain::InitVulkan(void* /*metalDevice*/, const VulkanGraphicsContext& v
+     {
+         imageCI.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+     }
++    if (faceCount_ == 6)
++    {
++        imageCI.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
++    }
+ 
+ #if defined(__APPLE__)
+     VkExportMetalObjectCreateInfoEXT exportCI{};
+@@ -403,7 +409,8 @@ bool Swapchain::InitVulkanSnapshotPool()
+         snapshotInfo.format = static_cast<VkFormat>(format_);
+         snapshotInfo.extent = {width_, height_, 1};
+         snapshotInfo.mipLevels = 1;
+-        snapshotInfo.arrayLayers = arraySize_;
++        snapshotInfo.arrayLayers = arraySize_ * faceCount_;
++        snapshotInfo.flags = faceCount_ == 6 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+         snapshotInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+         snapshotInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+         snapshotInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+@@ -753,7 +760,7 @@ void Swapchain::SnapshotVulkanReleasedImage(bool requested)
+     toTransfer[0].subresourceRange.baseMipLevel = 0;
+     toTransfer[0].subresourceRange.levelCount = 1;
+     toTransfer[0].subresourceRange.baseArrayLayer = 0;
+-    toTransfer[0].subresourceRange.layerCount = arraySize_;
++    toTransfer[0].subresourceRange.layerCount = arraySize_ * faceCount_;
+ 
+     toTransfer[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+     toTransfer[1].srcAccessMask = 0;
+@@ -774,7 +781,7 @@ void Swapchain::SnapshotVulkanReleasedImage(bool requested)
+     region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+     region.srcSubresource.mipLevel = 0;
+     region.srcSubresource.baseArrayLayer = 0;
+-    region.srcSubresource.layerCount = arraySize_;
++    region.srcSubresource.layerCount = arraySize_ * faceCount_;
+     region.srcOffset = {0, 0, 0};
+     region.dstSubresource = region.srcSubresource;
+     region.dstOffset = {0, 0, 0};
+@@ -819,8 +826,9 @@ void Swapchain::SnapshotVulkanReleasedImage(bool requested)
+ 
+     for (uint32_t arrayIndex = 0; arrayIndex < arraySize_; ++arrayIndex)
+     {
+-        void* textureSlice = OxrsysCreateMetalTextureSliceForSwapchain(
+-            slot.metalTexture, arraySize_, arrayIndex);
++        void* textureSlice = faceCount_ == 6
++            ? OxrsysCreateMetalCubeViewForSwapchain(slot.metalTexture, arrayIndex)
++            : OxrsysCreateMetalTextureSliceForSwapchain(slot.metalTexture, arraySize_, arrayIndex);
+         if (textureSlice == nullptr)
+         {
+             continue;
+-- 
+2.43.0
+

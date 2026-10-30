@@ -1,0 +1,522 @@
+From f2cbf182f924bb2d8a359fde7e62f3eee1285565 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:01:34 +0000
+Subject: [PATCH] steam-frame client: submit the server's depth grid as a depth
+ layer (positional reprojection)
+
+The client advertises CLIENT_CAPABILITY_DEPTH_GRID when the runtime offers
+XR_KHR_composition_layer_depth (FRAME_CLIENT_DEPTH_GRID=0 turns it off). Grids
+arrive as DepthGrid chunks (UDP datagrams flagged as render poses with a DRGD
+magic, or TCP DepthGrid records) and are assembled per eye. Each frame with a
+fresh grid for both eyes, the grid is written as standard Z into a grid x grid
+depth swapchain per eye and chained on the projection views; the stamp then
+carries the rendered eye position so the compositor warps translation per
+pixel. A stale grid, or a runtime that refuses the depth, falls back to the
+rotation-only stamp.
+---
+ clients/steam-frame/src/NetworkReceiver.cpp   |  52 +++++
+ clients/steam-frame/src/NetworkReceiver.h     |  20 ++
+ clients/steam-frame/src/main.cpp              | 195 +++++++++++++++++-
+ clients/steam-frame/src/stream_connection.cpp |  13 ++
+ clients/steam-frame/src/stream_connection.h   |   6 +
+ .../include/oxrsys/protocol/Protocol.h        |  24 +++
+ 6 files changed, 309 insertions(+), 1 deletion(-)
+
+diff --git a/clients/steam-frame/src/NetworkReceiver.cpp b/clients/steam-frame/src/NetworkReceiver.cpp
+index 77c3740..4c21886 100644
+--- a/clients/steam-frame/src/NetworkReceiver.cpp
++++ b/clients/steam-frame/src/NetworkReceiver.cpp
+@@ -457,6 +457,12 @@ void NetworkReceiver::ReceiveThread(OnNalUnitCallback callback)
+         // Handle render pose packets (server sends these before each frame)
+         if (header->flags & protocol::VIDEO_FLAG_RENDER_POSE)
+         {
++            if (header->totalPackets == 0 && payloadSize >= sizeof(protocol::DepthGridHeader) &&
++                reinterpret_cast<const protocol::DepthGridHeader*>(payload)->magic == protocol::DEPTH_GRID_MAGIC)
++            {
++                StoreDepthGrid(payload, payloadSize);
++                continue;
++            }
+             StoreRenderPose(*header, payload, payloadSize);
+             continue;
+         }
+@@ -499,6 +505,12 @@ void NetworkReceiver::ReceiveTcpThread(OnNalUnitCallback callback)
+             break;
+         }
+ 
++        if (header.type == protocol::TcpRecordType::DepthGrid)
++        {
++            StoreDepthGrid(payload.data(), payload.size());
++            continue;
++        }
++
+         if (header.type == protocol::TcpRecordType::RenderPose)
+         {
+             if (payload.size() >= sizeof(protocol::TcpRenderPose))
+@@ -549,6 +561,42 @@ void NetworkReceiver::ReceiveTcpThread(OnNalUnitCallback callback)
+     }
+ }
+ 
++void NetworkReceiver::StoreDepthGrid(const uint8_t* payload, size_t payloadSize)
++{
++    if (payloadSize < sizeof(protocol::DepthGridHeader)) return;
++    protocol::DepthGridHeader h;
++    memcpy(&h, payload, sizeof(h));
++    if (h.magic != protocol::DEPTH_GRID_MAGIC || h.eye > 1 || h.grid == 0 || h.grid > protocol::DEPTH_GRID_MAX_SIZE ||
++        h.rows == 0 || (uint32_t)h.row0 + h.rows > h.grid || payloadSize < sizeof(h) + (size_t)h.rows * h.grid)
++        return;
++    std::lock_guard<std::mutex> lock(depthGridMutex_);
++    DepthGrid& a = depthAssembling_[h.eye];
++    if (a.frameIndex != h.frameIndex || a.grid != h.grid || a.data.size() != (size_t)h.grid * h.grid) {
++        a.frameIndex = h.frameIndex; a.grid = h.grid; a.nearMm = h.nearMm ? h.nearMm : 250;
++        a.data.assign((size_t)h.grid * h.grid, 0); a.rowsHave = 0;
++    }
++    memcpy(a.data.data() + (size_t)h.row0 * h.grid, payload + sizeof(h), (size_t)h.rows * h.grid);
++    a.rowsHave += h.rows;
++    // Complete when every row has come (a lost chunk drops that eye's grid for this frame; the last one stands).
++    if (a.rowsHave >= a.grid) {
++        a.receivedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()).count();
++        a.valid = true;
++        depthLatest_[h.eye] = a;
++        a.rowsHave = 0; a.frameIndex = ~0u;
++        depthGridsReceived_.fetch_add(1);
++    }
++}
++
++bool NetworkReceiver::GetLatestDepthGrid(uint32_t eye, DepthGrid& out) const
++{
++    if (eye > 1) return false;
++    std::lock_guard<std::mutex> lock(depthGridMutex_);
++    if (!depthLatest_[eye].valid) return false;
++    out = depthLatest_[eye];
++    return true;
++}
++
+ void NetworkReceiver::StoreRenderPose(const protocol::VideoPacketHeader& header,
+                                       const uint8_t* payload, size_t payloadSize)
+ {
+@@ -787,6 +835,10 @@ void NetworkReceiver::Stop()
+         latestRenderPose_ = {};
+         renderPoses_.clear();
+     }
++    {
++        std::lock_guard<std::mutex> lock(depthGridMutex_);
++        for (int e = 0; e < 2; e++) { depthLatest_[e] = {}; depthAssembling_[e] = {}; }
++    }
+     connectionLostCallback_ = nullptr;
+ 
+     LOGI("Network receiver stopped");
+diff --git a/clients/steam-frame/src/NetworkReceiver.h b/clients/steam-frame/src/NetworkReceiver.h
+index e89faff..64d97a7 100644
+--- a/clients/steam-frame/src/NetworkReceiver.h
++++ b/clients/steam-frame/src/NetworkReceiver.h
+@@ -100,6 +100,21 @@ class NetworkReceiver
+         bool valid = false;
+     };
+     RenderPose GetLatestRenderPose() const;
++
++    // Positional reprojection (2026-10-28): the newest complete depth grid per eye (DepthGridHeader), q bytes
++    // row-major top to bottom, q = 255 * nearMm / z.
++    struct DepthGrid
++    {
++        uint32_t frameIndex = 0;
++        uint32_t grid = 0;
++        uint16_t nearMm = 250;
++        uint32_t rowsHave = 0;
++        int64_t receivedNs = 0;   // steady clock
++        bool valid = false;
++        std::vector<uint8_t> data;
++    };
++    bool GetLatestDepthGrid(uint32_t eye, DepthGrid& out) const;
++    uint32_t GetDepthGridsReceived() const { return depthGridsReceived_.load(); }
+     bool TakeRenderPoseForPresentationTimeUs(int64_t presentationTimeUs,
+                                              RenderPose* outPose);
+ 
+@@ -121,6 +136,11 @@ class NetworkReceiver
+     void StoreRenderPose(const protocol::VideoPacketHeader& header,
+                          const uint8_t* payload, size_t payloadSize);
+     void StoreRenderPose(const protocol::TcpRenderPose& pose);
++    void StoreDepthGrid(const uint8_t* payload, size_t payloadSize);
++    mutable std::mutex depthGridMutex_;
++    DepthGrid depthAssembling_[2];
++    DepthGrid depthLatest_[2];
++    std::atomic<uint32_t> depthGridsReceived_{0};
+ 
+     // Set from SERVER_FEATURE_FEC_INTERLEAVED in the announce; selects the FEC group layout.
+     std::atomic<bool> fecInterleaved_{false};
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 5e6c207..6d06d0c 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -93,6 +93,16 @@ struct App {
+     bool hasEyeGaze = false;
+     bool hasFrameController = false;   // XR_VALVE_frame_controller_interaction: the controllers as themselves, not as Touch
+     bool hasRefreshRate = false;
++    // Positional reprojection (2026-10-28): the app's depth arrives from the server as a small grid per eye and is
++    // submitted as an XR_KHR_composition_layer_depth layer, so SteamVR (steamvr/depthReprojection=true) warps
++    // head translation per pixel. The depth swapchains are made at the first grid, at the grid's size.
++    bool hasDepthLayer = false;        // extension enabled; the capability is advertised
++    bool depthBroken = false;          // xrEndFrame refused a frame with depth chained: never chain again
++    uint32_t depthGrid = 0;            // size the depth swapchains were made at (0 = not yet)
++    Swapchain depthSwapchains[2];
++    std::vector<VkBuffer> depthBufs[2];
++    std::vector<VkDeviceMemory> depthMems[2];
++    std::vector<void*> depthMaps[2];
+     float panelHz = 0.0f;          // what the panel actually runs (xrGetDisplayRefreshRateFB), 0 = unknown
+     PFN_xrGetDisplayRefreshRateFB pfnGetRefresh = nullptr;   // per instance, not a static (review L9)
+     bool lossPending = false;      // the runtime announced it is going away (review M2); main exits 3
+@@ -243,6 +253,14 @@ static bool CreateInstance(App& app)
+         enabled.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+         app.hasRefreshRate = true;
+     }
++    // Positional reprojection: on unless FRAME_CLIENT_DEPTH_GRID=0.
++    if (has(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) &&
++        !(getenv("FRAME_CLIENT_DEPTH_GRID") && atoi(getenv("FRAME_CLIENT_DEPTH_GRID")) == 0)) {
++        enabled.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
++        app.hasDepthLayer = true;
++    }
++    LOG_INFO("depth grid (positional reprojection): %s", app.hasDepthLayer ? "on" :
++             has(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) ? "off (FRAME_CLIENT_DEPTH_GRID=0)" : "off (no XR_KHR_composition_layer_depth)");
+ 
+     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
+     strncpy(ci.applicationInfo.applicationName, "FrameClient", XR_MAX_APPLICATION_NAME_SIZE - 1);
+@@ -611,6 +629,118 @@ static uint32_t FindMemoryType(App& app, uint32_t typeBits, VkMemoryPropertyFlag
+     return UINT32_MAX;
+ }
+ 
++// Depth layer for positional reprojection. The grid's value q is 255 * near / z (DepthGridHeader); it goes into a
++// grid x grid depth image per eye as standard Z over kDepthNear..kDepthFar, q = 0 being the far plane.
++static constexpr float kDepthNear = 0.1f, kDepthFar = 100.0f;
++static bool CreateDepthSwapchains(App& app, uint32_t grid)
++{
++    uint32_t count = 0;
++    xrEnumerateSwapchainFormats(app.session, 0, &count, nullptr);
++    std::vector<int64_t> formats(count);
++    xrEnumerateSwapchainFormats(app.session, count, &count, formats.data());
++    int64_t fmt = 0;
++    for (int64_t want : {(int64_t)VK_FORMAT_D32_SFLOAT, (int64_t)VK_FORMAT_D16_UNORM})
++        for (int64_t f : formats) if (!fmt && f == want) fmt = f;
++    if (!fmt) { LOG_ERROR("depth grid: no D32F/D16 swapchain format offered; off"); return false; }
++    const uint32_t bpp = fmt == VK_FORMAT_D32_SFLOAT ? 4 : 2;
++    for (uint32_t eye = 0; eye < VIEW_COUNT; eye++) {
++        Swapchain& d = app.depthSwapchains[eye];
++        d.format = fmt; d.width = grid; d.height = grid;
++        XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
++        ci.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
++        ci.format = fmt; ci.sampleCount = 1; ci.width = grid; ci.height = grid;
++        ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
++        if (XR_FAILED(xrCreateSwapchain(app.session, &ci, &d.handle))) {
++            LOG_ERROR("depth grid: xrCreateSwapchain(depth %ux%u) failed; off", grid, grid); return false;
++        }
++        uint32_t n = 0;
++        xrEnumerateSwapchainImages(d.handle, 0, &n, nullptr);
++        std::vector<XrSwapchainImageVulkanKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
++        xrEnumerateSwapchainImages(d.handle, n, &n, (XrSwapchainImageBaseHeader*)imgs.data());
++        for (auto& im : imgs) d.images.push_back(im.image);
++        // One host-visible staging buffer per image: image i is only re-acquired after the compositor has read it,
++        // which is after the copy out of buffer i ran.
++        for (uint32_t i = 0; i < n; i++) {
++            VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++            bci.size = (VkDeviceSize)grid * grid * bpp; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++            bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++            VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; void* map = nullptr;
++            VK_CHECK(vkCreateBuffer(app.device, &bci, nullptr, &buf));
++            VkMemoryRequirements mr; vkGetBufferMemoryRequirements(app.device, buf, &mr);
++            VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++            mai.allocationSize = mr.size;
++            mai.memoryTypeIndex = FindMemoryType(app, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++            VK_CHECK(vkAllocateMemory(app.device, &mai, nullptr, &mem));
++            VK_CHECK(vkBindBufferMemory(app.device, buf, mem, 0));
++            VK_CHECK(vkMapMemory(app.device, mem, 0, VK_WHOLE_SIZE, 0, &map));
++            app.depthBufs[eye].push_back(buf); app.depthMems[eye].push_back(mem); app.depthMaps[eye].push_back(map);
++        }
++    }
++    app.depthGrid = grid;
++    LOG_INFO("depth grid: depth swapchains %ux%u format %lld, %zu images per eye, near %.1f far %.0f",
++             grid, grid, (long long)fmt, app.depthSwapchains[0].images.size(), kDepthNear, kDepthFar);
++    return true;
++}
++
++static void DestroyDepthSwapchains(App& app)
++{
++    for (uint32_t eye = 0; eye < VIEW_COUNT; eye++) {
++        for (size_t i = 0; i < app.depthBufs[eye].size(); i++) {
++            vkDestroyBuffer(app.device, app.depthBufs[eye][i], nullptr);
++            vkFreeMemory(app.device, app.depthMems[eye][i], nullptr);
++        }
++        app.depthBufs[eye].clear(); app.depthMems[eye].clear(); app.depthMaps[eye].clear();
++        if (app.depthSwapchains[eye].handle) xrDestroySwapchain(app.depthSwapchains[eye].handle);
++        app.depthSwapchains[eye] = {};
++    }
++    app.depthGrid = 0;
++}
++
++// Acquire this frame's depth image for the eye and record the copy of the grid into it.
++static bool AcquireDepthGrid(App& app, uint32_t eye, VkCommandBuffer cmd, const std::vector<uint8_t>& q, uint16_t nearMm)
++{
++    Swapchain& d = app.depthSwapchains[eye];
++    uint32_t i = 0;
++    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
++    if (XR_FAILED(xrAcquireSwapchainImage(d.handle, &ai, &i))) return false;
++    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; wi.timeout = XR_INFINITE_DURATION;
++    if (XR_FAILED(xrWaitSwapchainImage(d.handle, &wi))) {   // acquired but not waited: it cannot be released, so stop
++        app.depthBroken = true; LOG_ERROR("depth grid: xrWaitSwapchainImage failed; depth off for this run"); return false;
++    }
++    const float nearM = nearMm / 1000.0f;
++    const size_t n = (size_t)d.width * d.height;
++    if (d.format == VK_FORMAT_D32_SFLOAT) {
++        float* out = (float*)app.depthMaps[eye][i];
++        for (size_t k = 0; k < n; k++) {
++            if (!q[k]) { out[k] = 1.0f; continue; }
++            const float z = std::max(kDepthNear, nearM * 255.0f / q[k]);
++            out[k] = std::min(1.0f, kDepthFar * (z - kDepthNear) / (z * (kDepthFar - kDepthNear)));
++        }
++    } else {
++        uint16_t* out = (uint16_t*)app.depthMaps[eye][i];
++        for (size_t k = 0; k < n; k++) {
++            if (!q[k]) { out[k] = 65535; continue; }
++            const float z = std::max(kDepthNear, nearM * 255.0f / q[k]);
++            out[k] = (uint16_t)(std::min(1.0f, kDepthFar * (z - kDepthNear) / (z * (kDepthFar - kDepthNear))) * 65535.0f + 0.5f);
++        }
++    }
++    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    b.image = d.images[i];
++    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
++    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
++    VkBufferImageCopy c = {};
++    c.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
++    c.imageExtent = {d.width, d.height, 1};
++    vkCmdCopyBufferToImage(cmd, app.depthBufs[eye][i], d.images[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
++    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
++    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
++    return true;
++}
++
+ static std::vector<char> LoadFile(const std::string& path)
+ {
+     std::ifstream f(path, std::ios::binary | std::ios::ate);
+@@ -1607,6 +1737,36 @@ static void RenderFrame(App& app)
+         {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+     XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+     bool submitLayer = false;
++    // Positional reprojection: this frame's depth layer per eye (chained on projViews, so it lives to xrEndFrame).
++    XrCompositionLayerDepthInfoKHR depthInfo[VIEW_COUNT] = {{XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR}, {XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR}};
++    bool depthAcquired[VIEW_COUNT] = {false, false};
++    bool depthChained = false;
++    static std::vector<uint8_t> depthQ[VIEW_COUNT];
++    static uint32_t depthQGrid[VIEW_COUNT] = {0, 0};
++    static uint16_t depthQNear[VIEW_COUNT] = {250, 250};
++    bool depthFresh = false;
++    if (g_streamMode && app.hasDepthLayer && !app.depthBroken) {
++        // Fresh = both eyes have a grid of one size that arrived in the last 250 ms. A stale grid is worse than none:
++        // without depth the stamp falls back to the rotation-only warp below.
++        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++        bool ok = true;
++        for (uint32_t eye = 0; eye < VIEW_COUNT; eye++) {
++            int64_t rx = 0; uint32_t fi = 0;
++            if (!g_stream.LatestDepthGrid(eye, depthQ[eye], depthQGrid[eye], depthQNear[eye], rx, fi) || nowNs - rx > 250000000) ok = false;
++        }
++        depthFresh = ok && depthQGrid[0] == depthQGrid[1] && depthQ[0].size() == (size_t)depthQGrid[0] * depthQGrid[0] &&
++                     depthQ[1].size() == depthQ[0].size();
++        if (depthFresh && app.depthGrid != depthQGrid[0]) {
++            if (app.depthGrid) DestroyDepthSwapchains(app);
++            if (!CreateDepthSwapchains(app, depthQGrid[0])) { DestroyDepthSwapchains(app); app.depthBroken = true; depthFresh = false; }
++        }
++        static bool lastFresh = false; static uint32_t freshFlips = 0;
++        if (depthFresh != lastFresh && freshFlips < 40) {
++            freshFlips++; lastFresh = depthFresh;
++            LOG_INFO("depth grid: %s (%ux%u); the stamp carries the %s eye position", depthFresh ? "fresh, chained" : "stale or absent, not chained",
++                     depthQGrid[0], depthQGrid[0], depthFresh ? "rendered" : "displayed");
++        }
++    }
+     // Passthrough (2026-10-19): a server frame flagged alpha-blend is submitted with source alpha over the
+     // headset's passthrough; the shader keys black to transparent. Opaque frames are unchanged.
+     // The displayed frame's own flag (review L7), refreshed below when a new frame is taken.
+@@ -1931,7 +2091,9 @@ static void RenderFrame(App& app)
+                     const float rx = 1.0f - 2.0f * (qy * qy + qz * qz), ry = 2.0f * (qx * qy + qw * qz), rz = 2.0f * (qx * qz - qw * qy);
+                     const float half = (g_sentIpd > 0.0f ? g_sentIpd : 0.063f) * 0.5f * (eye == 0 ? -1.0f : 1.0f);
+                     layerPose[eye].position = {rpPos[0] + rx * half, rpPos[1] + ry * half + kStampYM, rpPos[2] + rz * half};
+-                    if (kStampPosLive) layerPose[eye].position = views[eye].pose.position;
++                    // With depth chained the compositor warps translation itself, per pixel, so it needs the honest
++                    // rendered position; the displayed-position trick is only for the depth-less warp.
++                    if (kStampPosLive && !depthFresh) layerPose[eye].position = views[eye].pose.position;
+                     layerPose[eye].orientation = {rpOri[0], rpOri[1], rpOri[2], rpOri[3]};
+                 } else {
+                     layerPose[eye] = views[eye].pose;
+@@ -2098,6 +2260,26 @@ static void RenderFrame(App& app)
+                     projViews[eye].subImage.imageRect.extent = {(int32_t)sc.width, (int32_t)sc.height};
+                     projViews[eye].subImage.imageArrayIndex = 0;
+                 }
++                if (depthFresh && cmdOpen && acquired[0] && acquired[1]) {
++                    bool all = true;
++                    for (uint32_t eye = 0; eye < VIEW_COUNT; eye++) {
++                        depthAcquired[eye] = AcquireDepthGrid(app, eye, app.frameCmd[app.frameSlot], depthQ[eye], depthQNear[eye]);
++                        all = all && depthAcquired[eye];
++                    }
++                    if (all) {
++                        for (uint32_t eye = 0; eye < VIEW_COUNT; eye++) {
++                            const Swapchain& d = app.depthSwapchains[eye];
++                            depthInfo[eye].subImage.swapchain = d.handle;
++                            depthInfo[eye].subImage.imageRect.offset = {0, 0};
++                            depthInfo[eye].subImage.imageRect.extent = {(int32_t)d.width, (int32_t)d.height};
++                            depthInfo[eye].subImage.imageArrayIndex = 0;
++                            depthInfo[eye].minDepth = 0.0f; depthInfo[eye].maxDepth = 1.0f;
++                            depthInfo[eye].nearZ = kDepthNear; depthInfo[eye].farZ = kDepthFar;
++                            projViews[eye].next = &depthInfo[eye];
++                        }
++                        depthChained = true;
++                    }
++                }
+                 // One submission for the upload and both eyes, then hand the images to the
+                 // runtime without waiting for the GPU (it synchronises on our queue).
+                 if (cmdOpen) { EndFrameCommands(app); cmdOpen = false; }
+@@ -2107,6 +2289,11 @@ static void RenderFrame(App& app)
+                     XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                     xrReleaseSwapchainImage(app.swapchains[eye].handle, &ri);
+                 }
++                for (uint32_t eye = 0; eye < VIEW_COUNT; eye++) {
++                    if (!depthAcquired[eye]) continue;
++                    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
++                    xrReleaseSwapchainImage(app.depthSwapchains[eye].handle, &ri);
++                }
+                 {
+                     double ms = MsSince(compositorT0);
+                     g_rt.eyes += ms; if (ms > g_rt.eyesMax) g_rt.eyesMax = ms;
+@@ -2174,6 +2361,10 @@ static void RenderFrame(App& app)
+     if (XR_FAILED(endRes)) {   // review 2026-10-21 (M3): a failed EndFrame is a vanished picture, so say so
+         static uint32_t endFails = 0; endFails++;
+         if (endFails <= 10 || endFails % 900 == 0) LOG_ERROR("xrEndFrame failed: %d (%u so far; layer %s)", (int)endRes, endFails, submitLayer ? "submitted" : "none");
++        if (depthChained && submitLayer) {   // the runtime refused our depth: stop chaining, keep the picture
++            app.depthBroken = true;
++            LOG_ERROR("depth grid: xrEndFrame refused a frame with depth chained (%d); depth off for this run", (int)endRes);
++        }
+     }
+     if (submitLayer) {
+         double endMs = MsSince(tEnd0), threadMs = MsSince(tThread0);
+@@ -2209,6 +2400,7 @@ static void Destroy(App& app)
+     // (on macOS, DisplayXR presents through MoltenVK/CAMetalDrawable). Destroying
+     // the VkDevice before the session lets a pending present callback fire against
+     // a freed MoltenVK device — MVKDevice locks a destroyed mutex and aborts.
++    DestroyDepthSwapchains(app);
+     for (auto& sc : app.swapchains) {
+         for (auto fb : sc.framebuffers) if (fb) vkDestroyFramebuffer(app.device, fb, nullptr);
+         for (auto v : sc.views) if (v) vkDestroyImageView(app.device, v, nullptr);
+@@ -2279,6 +2471,7 @@ int main(int argc, char** argv)
+             LOG_ERROR("stream decoder open failed"); Destroy(app); return 1;
+         }
+         LOG_INFO("Discovering oxrsys server...");
++        StreamConnection::SetDepthGridCapable(app.hasDepthLayer);
+         if (!g_stream.Connect(&g_decoder)) {
+             LOG_ERROR("Could not connect to an oxrsys server"); Destroy(app); return 1;
+         }
+diff --git a/clients/steam-frame/src/stream_connection.cpp b/clients/steam-frame/src/stream_connection.cpp
+index 7996461..67eb854 100644
+--- a/clients/steam-frame/src/stream_connection.cpp
++++ b/clients/steam-frame/src/stream_connection.cpp
+@@ -161,6 +161,18 @@ bool StreamConnection::AppGone(double idleS, const char** reason) const
+     return true;
+ }
+ 
++static std::atomic<bool> s_depthGridCapable{false};
++void StreamConnection::SetDepthGridCapable(bool on) { s_depthGridCapable.store(on); }
++bool StreamConnection::LatestDepthGrid(uint32_t eye, std::vector<uint8_t>& data, uint32_t& grid, uint16_t& nearMm,
++                                       int64_t& receivedNs, uint32_t& frameIndex) const
++{
++    if (!net_) return false;
++    NetworkReceiver::DepthGrid g;
++    if (!net_->GetLatestDepthGrid(eye, g)) return false;
++    data.swap(g.data); grid = g.grid; nearMm = g.nearMm; receivedNs = g.receivedNs; frameIndex = g.frameIndex;
++    return true;
++}
++
+ bool StreamConnection::Ended() const { return connected_.load() && net_ && net_->StreamEnded(); }
+ 
+ bool StreamConnection::VideoStalled(double stallS, std::string* detail) const
+@@ -300,6 +312,7 @@ bool StreamConnection::WireUp(protocol::ServerAnnounce srv, const char* ip, Vide
+     // composes the app over black); FRAME_CLIENT_PASSTHROUGH=0 withholds the capability.
+     if (!(getenv("FRAME_CLIENT_PASSTHROUGH") && atoi(getenv("FRAME_CLIENT_PASSTHROUGH")) == 0))
+         cc.clientCapabilities |= protocol::CLIENT_CAPABILITY_MIXED_REALITY_PASSTHROUGH;
++    if (s_depthGridCapable.load()) cc.clientCapabilities |= protocol::CLIENT_CAPABILITY_DEPTH_GRID;
+     strncpy(cc.deviceName, "FrameClient", sizeof(cc.deviceName) - 1);
+     { std::lock_guard<std::mutex> lk(connectMu_); lastConnect_ = cc; }
+     if (!SendClientConnect(cc, 1)) return fail("ClientConnect send failed");
+diff --git a/clients/steam-frame/src/stream_connection.h b/clients/steam-frame/src/stream_connection.h
+index d02964c..e36473e 100644
+--- a/clients/steam-frame/src/stream_connection.h
++++ b/clients/steam-frame/src/stream_connection.h
+@@ -11,6 +11,7 @@
+ #include <mutex>
+ #include <string>
+ #include <thread>
++#include <vector>
+ 
+ #include <oxrsys/protocol/Protocol.h>   // ClientConnect is stored (re-sent on a panel rate change)
+ 
+@@ -57,6 +58,11 @@ class StreamConnection {
+     bool AppGone(double idleS, const char** reason) const;
+     // True when the server's stream-end marker arrived on this connection.
+     bool Ended() const;
++    // Positional reprojection (2026-10-28): set before Connect when the client can submit a depth layer, so the
++    // ClientConnect carries CLIENT_CAPABILITY_DEPTH_GRID; LatestDepthGrid copies the newest complete grid for an eye.
++    static void SetDepthGridCapable(bool on);
++    bool LatestDepthGrid(uint32_t eye, std::vector<uint8_t>& data, uint32_t& grid, uint16_t& nearMm,
++                         int64_t& receivedNs, uint32_t& frameIndex) const;
+ 
+     // Send a fully-built tracking packet upstream (V4: head + controllers + hands).
+     void SendTrackingPacket(const oxr::protocol::TrackingPacket& pkt);
+diff --git a/common/protocol/include/oxrsys/protocol/Protocol.h b/common/protocol/include/oxrsys/protocol/Protocol.h
+index c0b250e..a46f33e 100644
+--- a/common/protocol/include/oxrsys/protocol/Protocol.h
++++ b/common/protocol/include/oxrsys/protocol/Protocol.h
+@@ -50,6 +50,7 @@ enum class TcpRecordType : uint16_t
+     Disconnect = 0x0007,
+     Audio = 0x0008,
+     Spatial = 0x0009,
++    DepthGrid = 0x000A, // DepthGridHeader + rows * grid bytes
+ };
+ 
+ struct TcpRecordHeader
+@@ -153,6 +154,8 @@ enum ClientCapabilityFlags : uint32_t
+     // Mac gate opens for it either way); 0x00002000 is the first bit free in both trees - the Mac definition
+     // should move here.
+     CLIENT_CAPABILITY_PACING_LOCK = 0x00002000,
++    // The client submits a depth layer built from DepthGrid chunks (positional reprojection, 2026-10-28).
++    CLIENT_CAPABILITY_DEPTH_GRID = 0x00004000,
+ };
+ 
+ enum ClientCodecCapabilityFlags : uint32_t
+@@ -292,6 +295,27 @@ enum VideoFlags : uint8_t
+     VIDEO_FLAG_FOVEATION_CENTER = 0x80, // foveationCenterX/Y carry this frame's gaze-driven centre
+ };
+ 
++// ─── Depth grid (positional reprojection) ────────────────────────────────
++// The app's submitted depth (XR_KHR_composition_layer_depth), reduced to a grid x grid inverse-depth image per eye,
++// sent only to a client that set CLIENT_CAPABILITY_DEPTH_GRID. Value q (0-255) = round(255 * nearMm / z), clamped:
++// 255 = at or nearer than nearMm, 0 = infinitely far. Rows run top to bottom in the eye's image space, the same space
++// as that eye's colour (before foveation). Wi-Fi: a VideoPacketHeader with VIDEO_FLAG_RENDER_POSE and totalPackets 0
++// whose payload starts with this header (a render pose is 28 bytes and has no magic); USB: TcpRecordType::DepthGrid.
++constexpr uint32_t DEPTH_GRID_MAGIC = 0x44475244; // "DRGD" little-endian
++constexpr uint32_t DEPTH_GRID_MAX_SIZE = 128;
++
++struct DepthGridHeader
++{
++    uint32_t magic = DEPTH_GRID_MAGIC;
++    uint32_t frameIndex = 0;  // the server's frame counter at capture (diagnostic; the client uses the newest)
++    uint8_t eye = 0;          // 0 left, 1 right
++    uint8_t grid = 0;         // columns = rows of the full grid
++    uint8_t row0 = 0;         // first row in this chunk
++    uint8_t rows = 0;         // rows in this chunk; payload after the header is rows * grid bytes
++    uint16_t nearMm = 250;    // the distance q = 255 stands for
++    uint16_t reserved = 0;
++};
++
+ struct AudioPacketHeader
+ {
+     int64_t presentationTimeNs = 0;
+-- 
+2.43.0
+

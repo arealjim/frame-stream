@@ -1,0 +1,424 @@
+From 1bad88ddbdafe94af1707b39f779c8345a35f345 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:43:45 +0000
+Subject: [PATCH 2/2] runtime: wrap-aware tracking phase lock (pacing_lock_on =
+ "tracking", 0035b)
+
+0035 steered by a plain median of raw sample ages. The age is a phase on [0, period): off the setpoint the
+median sat mid-period, the integral wound up, the trim pinned at -5000 ppm and slewed the phase ~5.5 ms/s,
+faster than one step per 90 frames (10-26, gated: lock err +8-9 ms, trim -5000, sample age 8-11 ms).
+
+TrackingPhaseLock (header-only, pure) wraps each sample's error to +/-P/2 around pacing_lock_age_ms,
+averages a step's errors on the circle, resets the integral on a wrap, steps every 15 frames and caps
+the trim at 1500 ppm. Ages over 1.5 periods (lost tracking packets) are skipped. The pacing log line
+gains wraps=N.
+
+tests/TestTrackingPhaseLock.cpp simulates 24 sessions per case (start phase across the period, clock
+offset -500/0/+500 ppm, arrival jitter 0.5/1.5/3.5 ms, age reaching the lock 2 frames late): every
+session's median age lands at 3.05-3.60 ms, spread <= 0.16 ms, trim pinned <= 1 %. The sim also says
+the wrap is the fix: 0035's step and cap with the wrapped error hold too. Not yet run on the stand.
+
+---
+ CMakeLists.txt                  |   1 +
+ runtime/src/Session.cpp         |  37 +++-----
+ runtime/src/Session.h           |   7 +-
+ runtime/src/TrackingPhaseLock.h | 112 ++++++++++++++++++++++
+ tests/TestTrackingPhaseLock.cpp | 159 ++++++++++++++++++++++++++++++++
+ 5 files changed, 290 insertions(+), 26 deletions(-)
+ create mode 100644 runtime/src/TrackingPhaseLock.h
+ create mode 100644 tests/TestTrackingPhaseLock.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1d65a88..fc0c1dd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -173,6 +173,7 @@ add_executable(oxrsys_runtime_tests
+     tests/TestClientAdmission.cpp
+     tests/TestClientLiveness.cpp
+     tests/TestConfig.cpp
++    tests/TestTrackingPhaseLock.cpp
+     tests/TestEncodedFrameStats.cpp
+     tests/TestEncoderHelperIpc.cpp
+     tests/TestEncoderPathPolicy.cpp
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index 662c002..473baa5 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -588,29 +588,22 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+             const bool onTracking = cfg->pacingLockOn == "tracking";
+             if (onTracking && setpoint > 0.0f && streamingServer_ && streamingServer_->IsClientConnected())
+             {
+-                // pacing_lock_on = "tracking" (2026-10-26): hold the sample's age at the pose fetch at
+-                // pacing_lock_age_ms. Too old means this frame starts late against the headset's tracking
+-                // send, so shorten the period: the opposite sign to the queue wait's.
++                // pacing_lock_on = "tracking": hold the sample's age at the pose fetch at pacing_lock_age_ms.
++                // TrackingPhaseLock.h is the controller (wrap-aware since 0035b, 2026-10-26); one raw age per sent frame.
+                 const uint32_t count = streamingServer_->GetSampleAgeAtFetchCount();
+-                if (count < lockLastAgeCount_) { lockIntegralMs_ = 0.0; lockTrimNs_ = 0.0; lockAgeSamplesMs_.clear(); }
++                const double periodNs = (double)targetFrameTime.count();
++                phaseLock_.SetPeriodMs(periodNs / 1e6);
++                phaseLock_.SetSetpointMs((double)cfg->pacingLockAgeMs);
++                if (count < lockLastAgeCount_) { phaseLock_.Reset(); lockTrimNs_ = 0.0; }
+                 if (count != lockLastAgeCount_)
+                 {
+                     lockLastAgeCount_ = count;
+-                    const double age = (double)streamingServer_->GetSampleAgeAtFetchRawMs();
+-                    if (std::isfinite(age) && age >= 0.0 && age < 200.0) lockAgeSamplesMs_.push_back(age);
+-                }
+-                if (lockAgeSamplesMs_.size() >= 90)
+-                {
+-                    auto mid = lockAgeSamplesMs_.begin() + lockAgeSamplesMs_.size() / 2;
+-                    std::nth_element(lockAgeSamplesMs_.begin(), mid, lockAgeSamplesMs_.end());
+-                    const double errMs = *mid - (double)cfg->pacingLockAgeMs;
+-                    lockAgeSamplesMs_.clear();
+-                    lockIntegralMs_ = std::clamp(lockIntegralMs_ + errMs, -15.0, 15.0);
+-                    const double periodNs = (double)targetFrameTime.count();
+-                    const double maxTrim = 0.005 * periodNs;
+-                    lockTrimNs_ = std::clamp(-(0.0006 * errMs + 0.0001 * lockIntegralMs_) * periodNs, -maxTrim, maxTrim);
+-                    lockErrMs_ = errMs;
+-                    lockTrimPpm_ = lockTrimNs_ / periodNs * 1e6;
++                    if (phaseLock_.AddSample((double)streamingServer_->GetSampleAgeAtFetchRawMs()))
++                    {
++                        lockTrimPpm_ = phaseLock_.TrimPpm();
++                        lockTrimNs_ = lockTrimPpm_ * 1e-6 * periodNs;
++                        lockErrMs_ = phaseLock_.ErrMs();
++                    }
+                 }
+             }
+             else if (!onTracking && setpoint > 0.0f && streamingServer_ && streamingServer_->IsClientConnected() &&
+@@ -638,7 +631,7 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+             else
+             {
+                 lockLastReportCount_ = 0; lockIntegralMs_ = 0.0; lockTrimNs_ = 0.0; lockErrMs_ = 0.0; lockTrimPpm_ = 0.0;
+-                lockLastAgeCount_ = 0; lockAgeSamplesMs_.clear();
++                lockLastAgeCount_ = 0; phaseLock_.Reset();
+             }
+             if (std::isfinite(lockTrimNs_))
+             {
+@@ -676,13 +669,13 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+             auto mm = std::minmax_element(intervalSamplesMs.begin(), intervalSamplesMs.end());
+             spdlog::info("OXRSys: Session::WaitFrame pacing target={}Hz ({:.2f}ms) "
+                          "actual mean={:.2f}ms stddev={:.2f}ms min/max={:.2f}/{:.2f}ms (n={}) "
+-                         "sleep overshoot mean={:.2f}ms max={:.2f}ms ({} slept) app late {} (mean {:.2f}ms) spin={:.1f}ms lock err={:+.1f}ms trim={:+.0f}ppm on={}",
++                         "sleep overshoot mean={:.2f}ms max={:.2f}ms ({} slept) app late {} (mean {:.2f}ms) spin={:.1f}ms lock err={:+.1f}ms trim={:+.0f}ppm on={} wraps={}",
+                          targetRefreshHz,
+                          std::chrono::duration<double, std::milli>(targetFrameTime).count(),
+                          mean, stddev, *mm.first, *mm.second, intervalSamplesMs.size(),
+                          pacing.slept ? pacing.overshootSum / pacing.slept : 0.0, pacing.overshootMax, pacing.slept,
+                          pacing.appLate, pacing.appLate ? pacing.lateSum / pacing.appLate : 0.0,
+-                         cfg->pacingSpinMs, lockErrMs_, lockTrimPpm_, cfg->pacingLockOn);
++                         cfg->pacingSpinMs, lockErrMs_, lockTrimPpm_, cfg->pacingLockOn, phaseLock_.Wraps());
+             pacing = PacingDiag{};
+             intervalSamplesMs.clear();
+             lastPacingLog = now;
+diff --git a/runtime/src/Session.h b/runtime/src/Session.h
+index ee5cffb..cc84455 100644
+--- a/runtime/src/Session.h
++++ b/runtime/src/Session.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include <openxr/openxr.h>
++#include "TrackingPhaseLock.h"
+ #include "GraphicsTypes.h"
+ #include <memory>
+ #include <vector>
+@@ -195,10 +196,8 @@ class Session
+     double lockTrimNs_ = 0.0;
+     double lockErrMs_ = 0.0;     // for the pacing log line
+     double lockTrimPpm_ = 0.0;
+-    // pacing_lock_on = "tracking": the raw sample ages gathered since the last PI step (one step per 90
+-    // frames, about the client's report rate the gains were tuned at; the median rides out the odd
+-    // sample that lands after the fetch) and the frame count last read.
+-    std::vector<double> lockAgeSamplesMs_;
++    // pacing_lock_on = "tracking": the controller (TrackingPhaseLock.h) and the sample-age count last read.
++    oxr::TrackingPhaseLock phaseLock_;
+     uint32_t lockLastAgeCount_ = 0;
+ 
+     std::vector<DebugUtilsLabelState> debugUtilsLabelRegions_;
+diff --git a/runtime/src/TrackingPhaseLock.h b/runtime/src/TrackingPhaseLock.h
+new file mode 100644
+index 0000000..474696c
+--- /dev/null
++++ b/runtime/src/TrackingPhaseLock.h
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier: MPL-2.0
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++
++namespace oxr
++{
++
++// pacing_lock_on = "tracking": hold the newest tracking sample's age at the app's pose fetch at a setpoint by
++// trimming the frame period. The age is a phase: it lives on [0, period) and wraps when a fetch passes a
++// tracking arrival (the previous sample, a period older, is then used). The first version (2026-10-26, 0035)
++// took a plain median of raw ages and missed that: with the phase anywhere off the setpoint the median sat
++// near the middle of the period, the integral wound up to its clamp, the trim pinned at -5000 ppm, and that
++// trim slewed the phase ~5.5 ms/s, faster than its one step per 90 frames could follow.
++// This version:
++//   - wraps each sample's error to (-period/2, period/2] around the setpoint and averages the step's errors on
++//     the circle, so a phase near the wrap does not read as its middle;
++//   - resets the integral when the error jumps more than half a period between steps (a wrap);
++//   - steps every 15 frames (~167 ms at 90 Hz) instead of 90;
++//   - caps the trim at 1500 ppm, so the phase moves at most ~1.5 ms/s and no step can overrun it.
++// Pure: fed one raw age per frame, it returns the trim; tests/TestTrackingPhaseLock.cpp simulates sessions.
++class TrackingPhaseLock
++{
++public:
++    struct Params
++    {
++        double setpointMs = 3.0;
++        double periodMs = 1000.0 / 90.0;
++        int framesPerStep = 15;
++        double kpPpmPerMs = 800.0;     // loop gain ~0.13 a step (800 ppm x 15 frames x 11.1 ms); 1200 pinned 7 % at 3.5 ms jitter
++        double kiPpmPerMsStep = 40.0;  // removes the clocks' steady offset (~500 ppm measured 10-26)
++        double maxTrimPpm = 1500.0;
++    };
++
++    TrackingPhaseLock() = default;
++    explicit TrackingPhaseLock(const Params& params) : params_(params) {}
++
++    // The error of one raw age against the setpoint, wrapped to (-period/2, period/2].
++    static double WrappedErrorMs(double ageMs, double setpointMs, double periodMs)
++    {
++        double e = std::fmod(ageMs - setpointMs, periodMs);
++        if (e > periodMs / 2.0) e -= periodMs;
++        else if (e <= -periodMs / 2.0) e += periodMs;
++        return e;
++    }
++
++    void SetSetpointMs(double ms) { params_.setpointMs = ms; }
++    // The phase's period is the frame period (both ends run at the panel's rate); a rate change resets.
++    void SetPeriodMs(double ms)
++    {
++        if (std::fabs(ms - params_.periodMs) > 1e-6) { params_.periodMs = ms; Reset(); }
++    }
++
++    void Reset()
++    {
++        sumSin_ = sumCos_ = 0.0;
++        samples_ = 0;
++        integral_ = 0.0;
++        trimPpm_ = 0.0;
++        errMs_ = 0.0;
++        haveErr_ = false;
++    }
++
++    // One raw age per sent frame. Ages over 1.5 periods mean tracking packets went missing: they say nothing
++    // about the phase and are skipped. Returns true when this sample completed a step.
++    bool AddSample(double ageMs)
++    {
++        const double period = params_.periodMs;
++        if (!std::isfinite(ageMs) || ageMs < 0.0 || ageMs >= 1.5 * period || period <= 0.0) return false;
++        const double angle = 2.0 * kPi * WrappedErrorMs(ageMs, params_.setpointMs, period) / period;
++        sumSin_ += std::sin(angle);
++        sumCos_ += std::cos(angle);
++        if (++samples_ < params_.framesPerStep) return false;
++
++        const double err = std::atan2(sumSin_, sumCos_) / (2.0 * kPi) * period;   // circular mean, (-P/2, P/2]
++        sumSin_ = sumCos_ = 0.0;
++        samples_ = 0;
++        if (haveErr_ && std::fabs(err - errMs_) > period / 2.0)
++        {
++            integral_ = 0.0;
++            ++wraps_;
++        }
++        errMs_ = err;
++        haveErr_ = true;
++        const double iMax = params_.maxTrimPpm / params_.kiPpmPerMsStep;
++        integral_ = std::clamp(integral_ + err, -iMax, iMax);
++        // Too old means this frame starts late against the tracking send: shorten the period (negative trim).
++        trimPpm_ = std::clamp(-(params_.kpPpmPerMs * err + params_.kiPpmPerMsStep * integral_),
++                              -params_.maxTrimPpm, params_.maxTrimPpm);
++        return true;
++    }
++
++    double TrimPpm() const { return trimPpm_; }
++    double ErrMs() const { return errMs_; }
++    int Wraps() const { return wraps_; }
++    const Params& GetParams() const { return params_; }
++
++private:
++    static constexpr double kPi = 3.14159265358979323846;
++    Params params_{};
++    double sumSin_ = 0.0;
++    double sumCos_ = 0.0;
++    int samples_ = 0;
++    double integral_ = 0.0;
++    double trimPpm_ = 0.0;
++    double errMs_ = 0.0;
++    bool haveErr_ = false;
++    int wraps_ = 0;
++};
++
++}  // namespace oxr
+diff --git a/tests/TestTrackingPhaseLock.cpp b/tests/TestTrackingPhaseLock.cpp
+new file mode 100644
+index 0000000..3b94c33
+--- /dev/null
++++ b/tests/TestTrackingPhaseLock.cpp
+@@ -0,0 +1,159 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include <catch2/catch_test_macros.hpp>
++
++#include "TrackingPhaseLock.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <deque>
++#include <random>
++#include <vector>
++
++using oxr::TrackingPhaseLock;
++
++TEST_CASE("Tracking phase lock wraps the age error around the setpoint", "[phaselock]")
++{
++    const double p = 1000.0 / 90.0;
++    CHECK(std::fabs(TrackingPhaseLock::WrappedErrorMs(3.0, 3.0, p)) < 1e-9);
++    CHECK(std::fabs(TrackingPhaseLock::WrappedErrorMs(5.0, 3.0, p) - 2.0) < 1e-9);
++    // 10.5 ms old = 0.6 ms before the next arrival: 3.6 ms early, not 7.5 ms late.
++    CHECK(std::fabs(TrackingPhaseLock::WrappedErrorMs(10.5, 3.0, p) - (10.5 - 3.0 - p)) < 1e-9);
++    CHECK(TrackingPhaseLock::WrappedErrorMs(3.0 + p / 2.0 + 0.01, 3.0, p) < 0.0);
++}
++
++TEST_CASE("Tracking phase lock skips ages that mean lost tracking packets", "[phaselock]")
++{
++    TrackingPhaseLock lock;
++    const double p = lock.GetParams().periodMs;
++    for (int i = 0; i < 100; ++i) CHECK_FALSE(lock.AddSample(2.0 * p));
++    CHECK(lock.TrimPpm() == 0.0);
++}
++
++namespace
++{
++
++struct SimResult
++{
++    double medianAgeMs;   // over the last half of the run
++    double pinnedFraction;
++    int wraps;
++};
++
++// A session: the headset sends tracking every headsetPeriod (the Mac's period off by offsetPpm), each packet
++// arriving after a fixed delay plus |N(0, jitter)|. The Mac's frame fetches the newest arrived sample; its age
++// reaches the lock two frames later (it is measured at send). Starts at startPhaseMs between a send and the
++// first fetch.
++SimResult RunSession(double startPhaseMs, double offsetPpm, double jitterMs, unsigned seed, int frames = 5400,
++                     TrackingPhaseLock::Params params = {})
++{
++    TrackingPhaseLock lock(params);
++    const double p = params.periodMs;
++    const double headsetPeriod = p * (1.0 + offsetPpm * 1e-6);
++    std::mt19937 rng(seed);
++    std::normal_distribution<double> jitter(0.0, jitterMs);
++    std::vector<double> arrivals;
++    double nextSend = 0.0;
++    double newestArrival = -1e9;
++    std::deque<double> pending;
++    std::vector<double> ages;
++    int pinned = 0;
++    double fetch = startPhaseMs + p;
++    for (int f = 0; f < frames; ++f)
++    {
++        while (nextSend <= fetch + 50.0)
++        {
++            arrivals.push_back(nextSend + 1.0 + std::fabs(jitter(rng)));
++            nextSend += headsetPeriod;
++        }
++        for (double a : arrivals)
++            if (a <= fetch) newestArrival = std::max(newestArrival, a);
++        arrivals.erase(std::remove_if(arrivals.begin(), arrivals.end(), [&](double a) { return a <= fetch; }),
++                       arrivals.end());
++        const double age = fetch - newestArrival;
++        pending.push_back(age);
++        if (pending.size() > 2)
++        {
++            lock.AddSample(pending.front());
++            pending.pop_front();
++        }
++        if (f >= frames / 2)
++        {
++            ages.push_back(age);
++            if (std::fabs(lock.TrimPpm()) >= params.maxTrimPpm - 1e-9) ++pinned;
++        }
++        fetch += p * (1.0 + lock.TrimPpm() * 1e-6);
++    }
++    std::nth_element(ages.begin(), ages.begin() + ages.size() / 2, ages.end());
++    return {ages[ages.size() / 2], (double)pinned / (frames - frames / 2), lock.Wraps()};
++}
++
++}  // namespace
++
++TEST_CASE("Tracking phase lock holds every session's sample age at the setpoint", "[phaselock]")
++{
++    const TrackingPhaseLock::Params params{};
++    const double p = params.periodMs;
++    for (double jitterMs : {0.5, 1.5})
++    {
++        for (double offsetPpm : {-500.0, 0.0, 500.0})
++        {
++            double lo = 1e9, hi = -1e9, worstPinned = 0.0;
++            for (int s = 0; s < 24; ++s)
++            {
++                const SimResult r = RunSession(p * s / 24.0, offsetPpm, jitterMs, 1000u + s);
++                lo = std::min(lo, r.medianAgeMs);
++                hi = std::max(hi, r.medianAgeMs);
++                worstPinned = std::max(worstPinned, r.pinnedFraction);
++            }
++            std::printf("[phaselock-sim] jitter %.1f ms offset %+.0f ppm: 24 sessions' median age %.2f-%.2f ms "
++                        "(spread %.2f), worst pinned %.0f %%\n",
++                        jitterMs, offsetPpm, lo, hi, hi - lo, 100.0 * worstPinned);
++            // the arrival jitter's own mean (|N(0, s)| = 0.8 s) sits inside the age the lock holds
++            CHECK(hi - lo < 1.0);
++            CHECK(lo > params.setpointMs - 1.5);
++            CHECK(hi < params.setpointMs + 1.5);
++            CHECK(worstPinned < 0.05);
++        }
++    }
++}
++
++TEST_CASE("With the wrapped error, 0035's step and cap also hold the phase", "[phaselock]")
++{
++    // Not the 10-26 failure: that came from the unwrapped median (this class has no such mode). The sim says
++    // the wrap is the fix; the 15-frame step and the 1500 ppm cap are margin. Printed, not asserted.
++    TrackingPhaseLock::Params old{};
++    old.framesPerStep = 90;
++    old.maxTrimPpm = 5000.0;
++    old.kpPpmPerMs = 600.0;
++    old.kiPpmPerMsStep = 100.0;
++    double lo = 1e9, hi = -1e9;
++    for (int s = 0; s < 24; ++s)
++    {
++        const SimResult r = RunSession(old.periodMs * s / 24.0, -500.0, 0.5, 2000u + s, 5400, old);
++        lo = std::min(lo, r.medianAgeMs);
++        hi = std::max(hi, r.medianAgeMs);
++    }
++    std::printf("[phaselock-sim] 0035 step/cap with the wrapped error: median age %.2f-%.2f ms\n", lo, hi);
++    SUCCEED();
++}
++
++TEST_CASE("Tracking phase lock under the hidden loop's measured arrival jitter", "[phaselock]")
++{
++    // 10-26 hidden-loop arrivals: inter-arrival sd 3.7 ms. Late packets reorder and many fetches use the
++    // previous sample; the lock must still not wander or pin.
++    const TrackingPhaseLock::Params params{};
++    double lo = 1e9, hi = -1e9, worstPinned = 0.0;
++    for (int s = 0; s < 24; ++s)
++    {
++        const SimResult r = RunSession(params.periodMs * s / 24.0, -500.0, 3.5, 3000u + s);
++        lo = std::min(lo, r.medianAgeMs);
++        hi = std::max(hi, r.medianAgeMs);
++        worstPinned = std::max(worstPinned, r.pinnedFraction);
++    }
++    std::printf("[phaselock-sim] jitter 3.5 ms offset -500 ppm: median age %.2f-%.2f ms (spread %.2f), worst pinned %.0f %%\n",
++                lo, hi, hi - lo, 100.0 * worstPinned);
++    CHECK(hi - lo < 2.0);
++    CHECK(worstPinned < 0.05);
++}
+-- 
+2.50.1 (Apple Git-155)
+

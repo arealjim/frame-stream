@@ -1,0 +1,200 @@
+From 24fa54bea3cb8de684271294bb2a28d185cb5f49 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 11:19:49 +0000
+Subject: [PATCH 1/2] steam-frame client: video watchdog - reconnect when the
+ receive thread stops reading, exit 4 when it is stuck
+
+About 4 starts in 11 froze on the first frame (frame-lab C10, 2026-10-26): the server encoded and sent at
+90 Hz, the client socket filled (Udp RcvbufErrors climbing) and no access unit completed again. The existing
+reconnect rules never fire there: video did start, and a server that goes quiet is an idle app.
+
+The new rule tells the two apart by the socket: FRAME_CLIENT_VIDEO_STALL_S seconds (default 2; 0 = off) with
+no access unit AND datagrams unread in the video socket (FIONREAD) means the receive thread stopped reading.
+The client then reconnects the way a lost stream does. Disconnect joins the receive thread, which may be the
+stuck one, so a deadman exits with status 4 if Disconnect has not returned in 2.5 s (discovery's 1 s receive
+timeout bounds a healthy one); a second stall within 15 s of a stall reconnect also exits 4, for a fresh
+decoder. The frame-stream launcher restarts the unit on status 4 only.
+
+---
+ clients/steam-frame/src/NetworkReceiver.cpp   | 10 ++++++
+ clients/steam-frame/src/NetworkReceiver.h     |  5 +++
+ clients/steam-frame/src/main.cpp              | 36 ++++++++++++++++++-
+ clients/steam-frame/src/stream_connection.cpp | 19 ++++++++++
+ clients/steam-frame/src/stream_connection.h   |  5 +++
+ 5 files changed, 74 insertions(+), 1 deletion(-)
+
+diff --git a/clients/steam-frame/src/NetworkReceiver.cpp b/clients/steam-frame/src/NetworkReceiver.cpp
+index 44d650b..ae834e1 100644
+--- a/clients/steam-frame/src/NetworkReceiver.cpp
++++ b/clients/steam-frame/src/NetworkReceiver.cpp
+@@ -15,6 +15,7 @@
+ #include <netinet/in.h>
+ #include <netinet/tcp.h>
+ 
++#include <sys/ioctl.h>
+ #include <sys/socket.h>
+ #include <unistd.h>
+ 
+@@ -416,6 +417,7 @@ void NetworkReceiver::ReceiveThread(OnNalUnitCallback callback)
+     uint32_t foreign = 0, malformed = 0;
+     while (receiving_.load())
+     {
++        receiveLoopNs_.store(SteadyClockNowNs());
+         PunchVideoPath();
+         sockaddr_in from = {};
+         socklen_t fromLen = sizeof(from);
+@@ -733,6 +735,13 @@ void NetworkReceiver::SendNack(uint32_t frameIndex, uint32_t totalPackets,
+     }
+ }
+ 
++int NetworkReceiver::PendingVideoBytes() const
++{
++    int n = 0;
++    if (videoSocket_ < 0 || ioctl(videoSocket_, FIONREAD, &n) != 0) return -1;
++    return n;
++}
++
+ void NetworkReceiver::Stop()
+ {
+     discovering_.store(false);
+@@ -751,6 +760,7 @@ void NetworkReceiver::Stop()
+     {
+         receiveThread_.join();
+     }
++    receiveLoopNs_.store(0);
+ 
+     if (discoverySocket_ >= 0)
+     {
+diff --git a/clients/steam-frame/src/NetworkReceiver.h b/clients/steam-frame/src/NetworkReceiver.h
+index ccd1e6b..ae7340f 100644
+--- a/clients/steam-frame/src/NetworkReceiver.h
++++ b/clients/steam-frame/src/NetworkReceiver.h
+@@ -105,6 +105,10 @@ class NetworkReceiver
+     {
+         return lastCompletedFrameReceiveTimeNs_.load();
+     }
++    // Video watchdog (frame-lab C10, 2026-10-26): when the UDP receive loop last ran (steady clock ns; 0 = not
++    // running, or the TCP path), and the bytes waiting unread in the video socket (-1 = no socket).
++    int64_t GetReceiveLoopNs() const { return receiveLoopNs_.load(); }
++    int PendingVideoBytes() const;
+ 
+ private:
+     void DiscoveryThread(OnServerFoundCallback callback);
+@@ -157,6 +161,7 @@ class NetworkReceiver
+     std::atomic<uint32_t> fecRecoveries_{0};
+     std::atomic<uint32_t> nacksSent_{0};
+     std::atomic<int64_t> lastCompletedFrameReceiveTimeNs_{0};
++    std::atomic<int64_t> receiveLoopNs_{0};
+ 
+     // Latest render pose from server
+     mutable std::mutex renderPoseMutex_;
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 9266511..0836373 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -37,6 +37,8 @@
+ #include <string>
+ #include <vector>
+ #include <thread>
++#include <atomic>
++#include <memory>
+ #include <unistd.h>
+ 
+ #define LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
+@@ -2297,6 +2299,27 @@ int main(int argc, char** argv)
+     // by hand. frame-stream down stops it at any point.
+     const double kReconnectS = getenv("FRAME_CLIENT_RECONNECT_S") ? atof(getenv("FRAME_CLIENT_RECONNECT_S")) : 5.0;
+     constexpr double kReconnectGiveUpS = 600.0;
++    // Video watchdog (frame-lab C10, 2026-10-26): about 4 starts in 11 froze on the first frame - the receive thread
++    // stopped reading while the server sent at full rate. FRAME_CLIENT_VIDEO_STALL_S seconds (default 2; 0 = off) with
++    // no access unit and datagrams unread in the video socket reconnect (StreamConnection::VideoStalled). Disconnect
++    // joins the receive thread, which may be the stuck one, so a deadman exits with status 4 when it has not returned
++    // in 2.5 s (discovery's 1 s receive timeout bounds a healthy one); a second stall within 15 s of a stall reconnect
++    // exits 4 too, for a fresh decoder. The launcher's unit restarts the client on status 4 and on no other.
++    const double kStallS = getenv("FRAME_CLIENT_VIDEO_STALL_S") ? atof(getenv("FRAME_CLIENT_VIDEO_STALL_S")) : 2.0;
++    static constexpr int kStuckExit = 4;
++    std::chrono::steady_clock::time_point lastStallAt{};
++    auto disconnectOrExit = [](const char* why) {
++        auto done = std::make_shared<std::atomic<bool>>(false);
++        std::thread([done, why] {
++            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
++            if (done->load()) return;
++            LOG_ERROR("disconnect after %s did not return in 2.5 s: the receive thread is stuck; exiting with status %d for a restart", why, kStuckExit);
++            fflush(stdout); fflush(stderr); _exit(kStuckExit);
++        }).detach();
++        g_stream.Disconnect();
++        done->store(true);
++    };
++    if (g_streamMode) LOG_INFO("video watchdog: %s", kStallS > 0 ? "on - reconnect after FRAME_CLIENT_VIDEO_STALL_S with no video and data unread, exit 4 if stuck" : "off (FRAME_CLIENT_VIDEO_STALL_S=0)");
+     if (g_streamMode) LOG_INFO("reconnect: %s", kReconnectS > 0 ? "on - when the server announces again, the link closes, or no first video arrives (FRAME_CLIENT_RECONNECT_S)" : "off (FRAME_CLIENT_RECONNECT_S=0)");
+     std::chrono::steady_clock::time_point searchingSince{};
+     uint32_t reconnects = 0;
+@@ -2314,7 +2337,18 @@ int main(int argc, char** argv)
+         if (exitAsked && std::chrono::steady_clock::now() - exitAskedAt > std::chrono::seconds(3)) { LOG_INFO("no EXITING within 3 s; leaving the loop"); break; }
+         if (g_streamMode && kReconnectS > 0 && !exitAsked) {
+             const char* why = nullptr;
+-            if (!g_stream.Reconnecting() && g_stream.Lost(kReconnectS, &why)) {
++            std::string stall;
++            if (!g_stream.Reconnecting() && g_stream.VideoStalled(kStallS, &stall)) {
++                const bool again = lastStallAt.time_since_epoch().count() != 0 && MsSince(lastStallAt) < 15000.0;
++                LOG_ERROR("video stalled: %s; %s (reconnect %u)", stall.c_str(),
++                          again ? "the second stall within 15 s: exiting with status 4 for a fresh decoder" : "looking for the server again", ++reconnects);
++                if (again) { fflush(stdout); fflush(stderr); _exit(kStuckExit); }
++                lastStallAt = std::chrono::steady_clock::now();
++                disconnectOrExit("a video stall");
++                searchingSince = std::chrono::steady_clock::now();
++                g_poseEpoch++;
++                if (!g_stream.StartReconnect(&g_decoder)) LOG_ERROR("could not restart discovery; staying disconnected on the last frame");
++            } else if (!g_stream.Reconnecting() && g_stream.Lost(kReconnectS, &why)) {
+                 LOG_ERROR("stream lost: %s; looking for the server again (reconnect %u)", why ? why : "?", ++reconnects);
+                 g_stream.Disconnect();
+                 searchingSince = std::chrono::steady_clock::now();
+diff --git a/clients/steam-frame/src/stream_connection.cpp b/clients/steam-frame/src/stream_connection.cpp
+index 13f1a3b..4fd6954 100644
+--- a/clients/steam-frame/src/stream_connection.cpp
++++ b/clients/steam-frame/src/stream_connection.cpp
+@@ -148,6 +148,25 @@ bool StreamConnection::Lost(double firstVideoS, const char** reason) const
+     return false;
+ }
+ 
++bool StreamConnection::VideoStalled(double stallS, std::string* detail) const
++{
++    if (stallS <= 0.0 || !connected_.load() || !net_) return false;
++    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++    const int64_t lastFrame = net_->GetLastCompletedFrameReceiveTimeNs();
++    if (lastFrame <= connectedAtNs_.load() || now - lastFrame < (int64_t)(stallS * 1e9)) return false;
++    const int unread = net_->PendingVideoBytes();
++    if (unread <= 0) return false;
++    if (detail) {
++        const int64_t loop = net_->GetReceiveLoopNs();
++        char b[200];
++        snprintf(b, sizeof(b), "no access unit for %.1f s with %d bytes unread in the video socket; receive loop last ran %s",
++                 (now - lastFrame) / 1e9, unread, loop ? (std::to_string((now - loop) / 1000000) + " ms ago").c_str() : "never");
++        *detail = b;
++    }
++    return true;
++}
++
+ bool StreamConnection::WireUp(protocol::ServerAnnounce srv, const char* ip, VideoDecoder* decoder)
+ {
+     srv.serverName[sizeof(srv.serverName) - 1] = 0;   // review L4: printed with %s below; the wire need not terminate it
+diff --git a/clients/steam-frame/src/stream_connection.h b/clients/steam-frame/src/stream_connection.h
+index 7a92503..9ccc83d 100644
+--- a/clients/steam-frame/src/stream_connection.h
++++ b/clients/steam-frame/src/stream_connection.h
+@@ -46,6 +46,11 @@ class StreamConnection {
+     // A server that stays silent after sending video is NOT lost: that is an idle app, and the server would drop
+     // and re-announce if the link itself had died. reason names which.
+     bool Lost(double firstVideoS, const char** reason) const;
++    // Video watchdog (frame-lab C10, 2026-10-26): true when video had started on this connection, no access unit
++    // has completed for stallS seconds, AND datagrams sit unread in the video socket: the receive thread stopped
++    // reading (the start-up freeze: first frame, then nothing, while the server sends at full rate). An idle app
++    // leaves the socket empty, so it never trips this. detail (optional) gets the numbers for the log.
++    bool VideoStalled(double stallS, std::string* detail) const;
+ 
+     // Send a fully-built tracking packet upstream (V4: head + controllers + hands).
+     void SendTrackingPacket(const oxr::protocol::TrackingPacket& pkt);
+-- 
+2.50.1 (Apple Git-155)
+

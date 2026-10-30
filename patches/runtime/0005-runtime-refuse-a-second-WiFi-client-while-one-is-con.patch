@@ -1,0 +1,322 @@
+From 69489af939568dfabda14b6b1dafbb139c6aa8b2 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 16:53:49 +0000
+Subject: [PATCH 05/23] runtime: refuse a second WiFi client while one is
+ connected
+
+The control thread accepted any ClientConnect while WiFi was enabled, whatever
+the server state, and HandleClientConnect reset the tracking history and rebuilt
+the encoder for the newcomer. A second client that connected while a headset was
+streaming therefore took the session over, and two tracking clocks interleaved in
+the single TrackingReceiver made the rendered head pose jump (violent shaking in
+a Steam Frame when the desktop simulator auto-connected beside it, 2026-10-17).
+
+A ClientConnect from a different address while a client is connected is now
+refused, logged at most once per 5 s per address. The connected address may
+always reconnect: that is how a lost ClientConnect is resent and how a restarted
+client (new port, same host) gets back in before the liveness watchdog has
+noticed. The port is deliberately not part of the identity.
+
+The decision is a pure function in ClientAdmission.h with Catch2 tests, in the
+style of ClientLiveness.h.
+
+---
+ AGENTS.md                       |  3 ++
+ CHANGES.md                      |  4 ++
+ CMakeLists.txt                  |  1 +
+ runtime/src/ClientAdmission.h   | 66 +++++++++++++++++++++++++++
+ runtime/src/StreamingServer.cpp | 38 +++++++++++++++-
+ runtime/src/StreamingServer.h   |  5 +++
+ tests/TestClientAdmission.cpp   | 80 +++++++++++++++++++++++++++++++++
+ 7 files changed, 195 insertions(+), 2 deletions(-)
+ create mode 100644 runtime/src/ClientAdmission.h
+ create mode 100644 tests/TestClientAdmission.cpp
+
+diff --git a/AGENTS.md b/AGENTS.md
+index a2e600c..30d213a 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -64,6 +64,9 @@ ## Core Runtime Contracts
+ - Metal swapchains accept `XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT` and create those textures with
+   `MTLTextureUsagePixelFormatView`; Godot's Metal driver renders through an sRGB/UNORM view of
+   the swapchain texture.
++- The WiFi control thread admits one client at a time: a `ClientConnect` from a second address
++  while a client is connected is refused (logged at most every 5 s per address); the connected
++  address may always reconnect. `ClientAdmission.h` holds the pure decision and its tests.
+ - Vulkan streaming snapshots released color images with application-dispatched Vulkan functions
+   into bounded exportable images. Queue submission is non-blocking; fence waits belong to the
+   encoder worker. Missing export support, exhausted slots, or wait failures drop the streaming frame
+diff --git a/CHANGES.md b/CHANGES.md
+index 9f99c64..b77a903 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -79,6 +79,10 @@ ### Fixed
+   `XR_ERROR_FEATURE_UNSUPPORTED` ("No swapchain could be acquired to render to!") because it
+   requests `XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT`. Metal swapchains now accept the bit and create
+   those textures with `MTLTextureUsagePixelFormatView`.
++- Fixed a second WiFi client hijacking a live session: a `ClientConnect` from a different address
++  while a client is connected is now refused instead of resetting the tracking history and
++  rebuilding the encoder for the newcomer (two interleaved tracking clocks shook the rendered
++  view). The connected address can still reconnect.
+ - Fixed H.264 streams on Quest holding about 16 frames (around 220 ms at 72 Hz) in the decoder before
+   output. The Android VR client now sets the Qualcomm decode-order and low-latency MediaCodec keys,
+   which brings H.264 decode on Quest 3 to about 11 ms.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 80601cb..d4697ef 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -170,6 +170,7 @@ set(OXRSYS_LOGCAT_TEST_ENV
+ 
+ add_executable(oxrsys_runtime_tests
+     tests/TestBoundedDrain.cpp
++    tests/TestClientAdmission.cpp
+     tests/TestClientLiveness.cpp
+     tests/TestConfig.cpp
+     tests/TestEncoderHelperIpc.cpp
+diff --git a/runtime/src/ClientAdmission.h b/runtime/src/ClientAdmission.h
+new file mode 100644
+index 0000000..262e43f
+--- /dev/null
++++ b/runtime/src/ClientAdmission.h
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++// Pure admission decision for a WiFi ClientConnect, factored out of StreamingServer
++// so the second-client case is unit-testable without a live session.
++//
++// The control thread accepts any ClientConnect while WiFi is enabled, whatever the
++// server state. HandleClientConnect then resets the tracking history and rebuilds
++// the encoder for the newcomer, so a second client that connects while a headset is
++// streaming hijacks the session: the single TrackingReceiver interleaves two clocks
++// and the rendered head pose jumps (seen as violent shaking in the headset when the
++// desktop simulator auto-connected beside a real Steam Frame, 2026-10-17).
++//
++// Policy: while a client is connected, a ClientConnect from a DIFFERENT address is
++// refused. A ClientConnect from the same address is still accepted, because that is
++// how a client resends a lost ClientConnect and how a restarted client (new source
++// port, same host) reconnects before the liveness watchdog has noticed the old one
++// is gone. The port is deliberately not compared.
++namespace oxrsys
++{
++
++struct ClientAdmissionDecision
++{
++    bool accept = true;
++    // True when the refusal should be logged: the first refusal of a given address,
++    // then at most once per logIntervalNs for the same address, so a retrying
++    // client cannot flood the log.
++    bool log = false;
++};
++
++// Remembered between decisions: which address was last refused and when it was
++// last logged.
++struct ClientAdmissionState
++{
++    std::string lastRefusedIp;
++    int64_t lastRefusalLogNs = 0;
++};
++
++inline ClientAdmissionDecision EvaluateClientAdmission(ClientAdmissionState& state,
++                                                       bool clientConnected,
++                                                       const std::string& connectedIp,
++                                                       const std::string& candidateIp,
++                                                       int64_t nowNs,
++                                                       int64_t logIntervalNs)
++{
++    ClientAdmissionDecision decision;
++    if (!clientConnected || connectedIp.empty() || connectedIp == candidateIp)
++    {
++        return decision;
++    }
++    decision.accept = false;
++    if (state.lastRefusedIp != candidateIp || state.lastRefusalLogNs == 0 ||
++        nowNs - state.lastRefusalLogNs >= logIntervalNs)
++    {
++        decision.log = true;
++        state.lastRefusedIp = candidateIp;
++        state.lastRefusalLogNs = nowNs;
++    }
++    return decision;
++}
++
++} // namespace oxrsys
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index 1c503d4..6e2292e 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -51,6 +51,11 @@ constexpr int64_t kStreamConfigAckTimeoutNs =
+         std::chrono::milliseconds(500)).count();
+ constexpr uint32_t kStreamConfigMaxRetries = 2;
+ // Treat a connected client as gone if it sends no tracking for this long (abrupt UDP kill).
++// A refused ClientConnect is logged at most this often per address: the desktop
++// simulator retries every second when it auto-connects.
++constexpr int64_t kClientAdmissionLogIntervalNs =
++    std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::seconds(5)).count();
+ constexpr int64_t kClientLivenessTimeoutNs =
+     std::chrono::duration_cast<std::chrono::nanoseconds>(
+         std::chrono::seconds(3)).count();
+@@ -1658,6 +1663,37 @@ void StreamingServer::EncodeThread()
+ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& clientConnect,
+                                           const sockaddr_in& clientAddr)
+ {
++    char ipStr[INET_ADDRSTRLEN];
++    inet_ntop(AF_INET, &clientAddr.sin_addr, ipStr, sizeof(ipStr));
++
++    // One client at a time. A ClientConnect from a second address while a client is
++    // streaming would reset its tracking history and rebuild its encoder underneath it,
++    // and two tracking clocks interleaved in one TrackingReceiver make the rendered head
++    // pose jump. The connected address may always reconnect (a resent ClientConnect, or a
++    // restart on a new port before the liveness watchdog has noticed).
++    {
++        std::string connectedIp;
++        std::string connectedName;
++        {
++            std::lock_guard<std::mutex> lock(clientMutex_);
++            connectedIp = clientIp_;
++            connectedName = clientName_;
++        }
++        const oxrsys::ClientAdmissionDecision admission = oxrsys::EvaluateClientAdmission(
++            clientAdmission_, state_.load() == State::Connected, connectedIp, ipStr,
++            SteadyClockNowNs(), kClientAdmissionLogIntervalNs);
++        if (!admission.accept)
++        {
++            if (admission.log)
++            {
++                spdlog::warn("StreamingServer: refusing ClientConnect from {} while '{}' ({}) is "
++                             "connected; disconnect it first",
++                             ipStr, connectedName, connectedIp);
++            }
++            return;
++        }
++    }
++
+     // A new client brings a new clock; drop the previous client's tracking history so its
+     // last timestamp cannot shadow every packet of this one (see TrackingReceiver::ResetHistory).
+     if (trackingReceiver_)
+@@ -1665,8 +1701,6 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
+         trackingReceiver_->ResetHistory();
+     }
+ 
+-    char ipStr[INET_ADDRSTRLEN];
+-    inet_ntop(AF_INET, &clientAddr.sin_addr, ipStr, sizeof(ipStr));
+     std::string clientName(clientConnect.deviceName,
+         BoundedStringLength(clientConnect.deviceName, sizeof(clientConnect.deviceName)));
+ 
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index 4645839..b283746 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -2,6 +2,8 @@
+ 
+ #pragma once
+ 
++#include "ClientAdmission.h"
++
+ #include <array>
+ #include <atomic>
+ #include <condition_variable>
+@@ -179,6 +181,9 @@ class StreamingServer
+     void CheckClientLiveness(int64_t nowNs);
+     std::atomic<uint64_t> lastTrackingCountSeen_{0};
+     std::atomic<int64_t> lastClientActivityNs_{0};
++    // Control-thread only: which address was last refused a ClientConnect and when
++    // that was last logged (see ClientAdmission.h).
++    oxrsys::ClientAdmissionState clientAdmission_;
+     void HandleLatencyReport(const oxr::protocol::LatencyReport& report);
+     void HandleKeyframeRequest(const oxr::protocol::RequestKeyframe& request);
+     void HandleStreamConfigAck(const oxr::protocol::StreamConfigAck& ack);
+diff --git a/tests/TestClientAdmission.cpp b/tests/TestClientAdmission.cpp
+new file mode 100644
+index 0000000..6cef01c
+--- /dev/null
++++ b/tests/TestClientAdmission.cpp
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include <catch2/catch_test_macros.hpp>
++
++#include "ClientAdmission.h"
++
++#include <cstdint>
++
++using oxrsys::ClientAdmissionState;
++using oxrsys::EvaluateClientAdmission;
++
++namespace
++{
++constexpr int64_t kLogIntervalNs = 5'000'000'000; // 5s, matching kClientAdmissionLogIntervalNs
++constexpr int64_t kMs = 1'000'000;
++} // namespace
++
++TEST_CASE("Client admission: nothing connected accepts anyone", "[client-admission]")
++{
++    ClientAdmissionState state;
++    const auto decision = EvaluateClientAdmission(state, /*clientConnected=*/false, "",
++                                                  "198.51.100.170", 0, kLogIntervalNs);
++    CHECK(decision.accept);
++    CHECK_FALSE(decision.log);
++}
++
++TEST_CASE("Client admission: the connected address may reconnect (resend, restart)",
++          "[client-admission]")
++{
++    ClientAdmissionState state;
++    // A resent ClientConnect, or a restarted client on a new port, comes from the
++    // same host. The port is not part of the identity.
++    const auto decision = EvaluateClientAdmission(state, /*clientConnected=*/true,
++                                                  "10.0.0.13", "10.0.0.13",
++                                                  1'000 * kMs, kLogIntervalNs);
++    CHECK(decision.accept);
++    CHECK_FALSE(decision.log);
++}
++
++TEST_CASE("Client admission: a second address is refused and logged once", "[client-admission]")
++{
++    ClientAdmissionState state;
++    const auto first = EvaluateClientAdmission(state, true, "10.0.0.13", "127.0.0.1",
++                                               1'000 * kMs, kLogIntervalNs);
++    CHECK_FALSE(first.accept);
++    CHECK(first.log);
++    // The simulator's auto-connect retries every second: refused again, not logged.
++    const auto second = EvaluateClientAdmission(state, true, "10.0.0.13", "127.0.0.1",
++                                                2'000 * kMs, kLogIntervalNs);
++    CHECK_FALSE(second.accept);
++    CHECK_FALSE(second.log);
++    // Past the interval it is logged again, so a long-running refusal stays visible.
++    const auto later = EvaluateClientAdmission(state, true, "10.0.0.13", "127.0.0.1",
++                                               6'500 * kMs, kLogIntervalNs);
++    CHECK_FALSE(later.accept);
++    CHECK(later.log);
++}
++
++TEST_CASE("Client admission: a different refused address is logged immediately",
++          "[client-admission]")
++{
++    ClientAdmissionState state;
++    (void)EvaluateClientAdmission(state, true, "10.0.0.13", "127.0.0.1", 1'000 * kMs,
++                                  kLogIntervalNs);
++    const auto other = EvaluateClientAdmission(state, true, "10.0.0.13", "198.51.100.99",
++                                               1'100 * kMs, kLogIntervalNs);
++    CHECK_FALSE(other.accept);
++    CHECK(other.log);
++}
++
++TEST_CASE("Client admission: a connected state with no address recorded accepts",
++          "[client-admission]")
++{
++    // Defensive: state_ says Connected but the address was already cleared by a
++    // disconnect in flight. Refusing here could strand the next client.
++    ClientAdmissionState state;
++    const auto decision = EvaluateClientAdmission(state, true, "", "127.0.0.1", 1'000 * kMs,
++                                                  kLogIntervalNs);
++    CHECK(decision.accept);
++}
+-- 
+2.43.0
+

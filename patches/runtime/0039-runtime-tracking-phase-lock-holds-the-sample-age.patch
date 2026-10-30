@@ -1,0 +1,252 @@
+From bd65bd566fef7c30420a0a27a4482c225ce1c842 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:43:56 +0000
+Subject: [PATCH 1/2] runtime: pacing_lock_on = "tracking" holds the sample age
+ at the pose fetch
+
+The rate lock (pacing_lock_wait_ms) holds the client's queue wait. On the release
+toml the app then fetches its pose ~9 ms after the headset's newest tracking
+sample arrived (the measured line's "sample age at fetch"; 10-26, unworn, gated).
+pacing_lock_on = "tracking" steers the same PI by that age instead, at
+pacing_lock_age_ms (default 3), one step per 90 frames on the median of the raw
+per-frame ages; the sign is the queue wait's opposite. Tracking packets are sent on
+the headset's display clock, so this still locks the rate to the panel. Default
+"queue": no change unless a toml asks for it.
+
+---
+ runtime/oxrsys-runtime.toml     |  6 ++++++
+ runtime/src/Config.cpp          |  9 +++++++++
+ runtime/src/Config.h            | 11 +++++++++++
+ runtime/src/Session.cpp         | 35 ++++++++++++++++++++++++++++++---
+ runtime/src/Session.h           |  5 +++++
+ runtime/src/StreamingServer.cpp |  6 ++++++
+ runtime/src/StreamingServer.h   |  7 +++++++
+ tests/TestConfig.cpp            | 16 +++++++++++++++
+ 8 files changed, 92 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/oxrsys-runtime.toml b/runtime/oxrsys-runtime.toml
+index e362046..d4eb467 100644
+--- a/runtime/oxrsys-runtime.toml
++++ b/runtime/oxrsys-runtime.toml
+@@ -72,6 +72,12 @@ pose_prediction_horizon_ms = 0
+ # for a client that advertises CLIENT_CAPABILITY_PACING_LOCK in its ClientConnect.
+ pacing_lock_wait_ms = 0
+ 
++# What that lock holds: "queue" (default) = the client's queue wait above; "tracking" = the age of the
++# newest tracking sample when the app fetches its pose, at pacing_lock_age_ms (0.5-10, default 3), so a
++# frame starts just after the headset's tracking packet arrives. Server-side numbers only.
++pacing_lock_on = "queue"
++pacing_lock_age_ms = 3
++
+ # Network RTT probe (ICMP echo to the client, else one UDP byte to a closed port, from inside
+ # the app process). "auto" = only while pose_prediction is "measured", the one mode that reads
+ # it; "on" = always; "off" = never. rtt_assumed_ms is used when the probe has no answer:
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index d66846c..457829c 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -438,6 +438,15 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             {
+                 values.pacingLockWaitMs = std::max(0.0f, std::min(30.0f, std::stof(value)));
+             }
++            else if (key == "pacing_lock_on")
++            {
++                value = ParseString(value);
++                values.pacingLockOn = (value == "tracking") ? value : "queue";
++            }
++            else if (key == "pacing_lock_age_ms")
++            {
++                values.pacingLockAgeMs = std::max(0.5f, std::min(10.0f, std::stof(value)));
++            }
+             else if (key == "pose_prediction")
+             {
+                 value = ParseString(value);
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index 6a2f818..530bc4b 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -73,6 +73,17 @@ struct ConfigValues
+     // CLIENT_CAPABILITY_PACING_LOCK (its displayed-frame age and pipeline parts are the ones
+     // GetClientQueueWaitMs expects). Non-finite or absurd reports are dropped before they reach it.
+     float pacingLockWaitMs = 0.0f;
++    // pacing_lock_on: what the rate lock (engaged by pacing_lock_wait_ms > 0) holds. "queue" (default) = the
++    // client's queue wait at pacing_lock_wait_ms, as above. "tracking" = the newest tracking sample's age
++    // when the app fetches its pose ("sample age at fetch" in the measured latency line), at
++    // pacing_lock_age_ms: the app's frame starts just after the headset's tracking packet arrives, instead
++    // of ~9 ms after it (measured 2026-10-26 on the release toml). The tracking packets are sent on the
++    // headset's display clock, so this locks to the panel too. Server-side numbers only, so it does not
++    // need CLIENT_CAPABILITY_PACING_LOCK.
++    std::string pacingLockOn = "queue";
++    // pacing_lock_age_ms: the "tracking" lock's setpoint, 0.5-10 (default 3: room for the arrival jitter
++    // before a sample lands after the fetch and the previous one, a period older, is used).
++    float pacingLockAgeMs = 3.0f;
+     // pose_prediction: how far ahead of the client's tracking sample the head pose a frame is
+     // rendered with is predicted. "fixed" (default) = the server encode pipeline + the client's
+     // reported pipeline, as before (10.4 ms on the Frame, 2026-10-18). "measured" = the measured
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index f70d522..662c002 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -585,7 +585,35 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+         // LatencyReport means something else must not steer the app's cadence.
+         {
+             const float setpoint = cfg->pacingLockWaitMs;
+-            if (setpoint > 0.0f && streamingServer_ && streamingServer_->IsClientConnected() &&
++            const bool onTracking = cfg->pacingLockOn == "tracking";
++            if (onTracking && setpoint > 0.0f && streamingServer_ && streamingServer_->IsClientConnected())
++            {
++                // pacing_lock_on = "tracking" (2026-10-26): hold the sample's age at the pose fetch at
++                // pacing_lock_age_ms. Too old means this frame starts late against the headset's tracking
++                // send, so shorten the period: the opposite sign to the queue wait's.
++                const uint32_t count = streamingServer_->GetSampleAgeAtFetchCount();
++                if (count < lockLastAgeCount_) { lockIntegralMs_ = 0.0; lockTrimNs_ = 0.0; lockAgeSamplesMs_.clear(); }
++                if (count != lockLastAgeCount_)
++                {
++                    lockLastAgeCount_ = count;
++                    const double age = (double)streamingServer_->GetSampleAgeAtFetchRawMs();
++                    if (std::isfinite(age) && age >= 0.0 && age < 200.0) lockAgeSamplesMs_.push_back(age);
++                }
++                if (lockAgeSamplesMs_.size() >= 90)
++                {
++                    auto mid = lockAgeSamplesMs_.begin() + lockAgeSamplesMs_.size() / 2;
++                    std::nth_element(lockAgeSamplesMs_.begin(), mid, lockAgeSamplesMs_.end());
++                    const double errMs = *mid - (double)cfg->pacingLockAgeMs;
++                    lockAgeSamplesMs_.clear();
++                    lockIntegralMs_ = std::clamp(lockIntegralMs_ + errMs, -15.0, 15.0);
++                    const double periodNs = (double)targetFrameTime.count();
++                    const double maxTrim = 0.005 * periodNs;
++                    lockTrimNs_ = std::clamp(-(0.0006 * errMs + 0.0001 * lockIntegralMs_) * periodNs, -maxTrim, maxTrim);
++                    lockErrMs_ = errMs;
++                    lockTrimPpm_ = lockTrimNs_ / periodNs * 1e6;
++                }
++            }
++            else if (!onTracking && setpoint > 0.0f && streamingServer_ && streamingServer_->IsClientConnected() &&
+                 streamingServer_->ClientSupportsPacingLock())
+             {
+                 const uint32_t count = streamingServer_->GetClientLatencyReportCount();
+@@ -610,6 +638,7 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+             else
+             {
+                 lockLastReportCount_ = 0; lockIntegralMs_ = 0.0; lockTrimNs_ = 0.0; lockErrMs_ = 0.0; lockTrimPpm_ = 0.0;
++                lockLastAgeCount_ = 0; lockAgeSamplesMs_.clear();
+             }
+             if (std::isfinite(lockTrimNs_))
+             {
+@@ -647,13 +676,13 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+             auto mm = std::minmax_element(intervalSamplesMs.begin(), intervalSamplesMs.end());
+             spdlog::info("OXRSys: Session::WaitFrame pacing target={}Hz ({:.2f}ms) "
+                          "actual mean={:.2f}ms stddev={:.2f}ms min/max={:.2f}/{:.2f}ms (n={}) "
+-                         "sleep overshoot mean={:.2f}ms max={:.2f}ms ({} slept) app late {} (mean {:.2f}ms) spin={:.1f}ms lock err={:+.1f}ms trim={:+.0f}ppm",
++                         "sleep overshoot mean={:.2f}ms max={:.2f}ms ({} slept) app late {} (mean {:.2f}ms) spin={:.1f}ms lock err={:+.1f}ms trim={:+.0f}ppm on={}",
+                          targetRefreshHz,
+                          std::chrono::duration<double, std::milli>(targetFrameTime).count(),
+                          mean, stddev, *mm.first, *mm.second, intervalSamplesMs.size(),
+                          pacing.slept ? pacing.overshootSum / pacing.slept : 0.0, pacing.overshootMax, pacing.slept,
+                          pacing.appLate, pacing.appLate ? pacing.lateSum / pacing.appLate : 0.0,
+-                         cfg->pacingSpinMs, lockErrMs_, lockTrimPpm_);
++                         cfg->pacingSpinMs, lockErrMs_, lockTrimPpm_, cfg->pacingLockOn);
+             pacing = PacingDiag{};
+             intervalSamplesMs.clear();
+             lastPacingLog = now;
+diff --git a/runtime/src/Session.h b/runtime/src/Session.h
+index 376d1c1..ee5cffb 100644
+--- a/runtime/src/Session.h
++++ b/runtime/src/Session.h
+@@ -195,6 +195,11 @@ class Session
+     double lockTrimNs_ = 0.0;
+     double lockErrMs_ = 0.0;     // for the pacing log line
+     double lockTrimPpm_ = 0.0;
++    // pacing_lock_on = "tracking": the raw sample ages gathered since the last PI step (one step per 90
++    // frames, about the client's report rate the gains were tuned at; the median rides out the odd
++    // sample that lands after the fetch) and the frame count last read.
++    std::vector<double> lockAgeSamplesMs_;
++    uint32_t lockLastAgeCount_ = 0;
+ 
+     std::vector<DebugUtilsLabelState> debugUtilsLabelRegions_;
+     std::optional<DebugUtilsLabelState> debugUtilsInsertedLabel_;
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index b6e38db..a4179f1 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -1814,6 +1814,8 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
+     rttProbe_.SetTarget(ShouldProbeRtt() ? std::string(ipStr) : std::string());
+     sampleToSubmitMs_.store(0.0f);
+     sampleAgeAtFetchMs_.store(0.0f);
++    sampleAgeAtFetchRawMs_.store(0.0f);
++    sampleAgeAtFetchCount_.store(0);
+     submitToSentMs_.store(0.0f);
+     clientSupportsPacingLock_.store(
+         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_PACING_LOCK));
+@@ -2075,6 +2077,8 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
+     rttProbe_.SetTarget(std::string());   // USB: no network RTT to measure
+     sampleToSubmitMs_.store(0.0f);
+     sampleAgeAtFetchMs_.store(0.0f);
++    sampleAgeAtFetchRawMs_.store(0.0f);
++    sampleAgeAtFetchCount_.store(0);
+     submitToSentMs_.store(0.0f);
+     clientSupportsPacingLock_.store(
+         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_PACING_LOCK));
+@@ -3007,6 +3011,8 @@ void StreamingServer::SendFrame(FrameSource frameSource,
+                 const float prevFetch = sampleAgeAtFetchMs_.load();
+                 sampleToSubmitMs_.store(prevSubmit > 0.0f ? prevSubmit * 0.9f + toSubmit * 0.1f : toSubmit);
+                 sampleAgeAtFetchMs_.store(prevSubmit > 0.0f ? prevFetch * 0.9f + atFetch * 0.1f : atFetch);
++                sampleAgeAtFetchRawMs_.store(atFetch);
++                sampleAgeAtFetchCount_.fetch_add(1);
+             }
+         }
+     }
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index eac55ad..ce7c61a 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -102,6 +102,11 @@ class StreamingServer
+              - clientDecodeLatencyMs_.load() - clientCompositorLatencyMs_.load();
+     }
+ 
++    // The newest frame's tracking-sample age at the app's pose fetch (ms, raw, not the EMA) and a count
++    // that moves once per frame scored, for the "tracking" rate lock (pacing_lock_on). Reset on connect.
++    float GetSampleAgeAtFetchRawMs() const { return sampleAgeAtFetchRawMs_.load(); }
++    uint32_t GetSampleAgeAtFetchCount() const { return sampleAgeAtFetchCount_.load(); }
++
+     // Get the connected client info
+     std::string GetClientName() const;
+ 
+@@ -259,6 +264,8 @@ class StreamingServer
+     // plus the network RTT (rttProbe_) and the client's displayed frame age (receive -> eye pass).
+     std::atomic<float> sampleToSubmitMs_{0.0f};
+     std::atomic<float> sampleAgeAtFetchMs_{0.0f};
++    std::atomic<float> sampleAgeAtFetchRawMs_{0.0f};
++    std::atomic<uint32_t> sampleAgeAtFetchCount_{0};
+     std::atomic<float> submitToSentMs_{0.0f};
+     std::atomic<float> submitToSendStartMs_{0.0f};  // the encode share of submitToSentMs_
+     std::atomic<int64_t> lastMeasuredLatencyLogNs_{0};
+diff --git a/tests/TestConfig.cpp b/tests/TestConfig.cpp
+index 382ea89..4bbf188 100644
+--- a/tests/TestConfig.cpp
++++ b/tests/TestConfig.cpp
+@@ -338,6 +338,22 @@ TEST_CASE("Config parser: the rate lock is off by default and clamps when set",
+     CHECK(ParseConfigToml(high).pacingLockWaitMs == 30.0f);
+ }
+ 
++TEST_CASE("Config parser: the rate lock holds the queue wait unless told to hold the tracking age", "[config][pacing]")
++{
++    CHECK(ConfigValues{}.pacingLockOn == "queue");
++    CHECK(ConfigValues{}.pacingLockAgeMs == 3.0f);
++    std::istringstream tracking("[streaming]\npacing_lock_on = \"tracking\"\npacing_lock_age_ms = 2.5\n");
++    const ConfigValues t = ParseConfigToml(tracking);
++    CHECK(t.pacingLockOn == "tracking");
++    CHECK(t.pacingLockAgeMs == 2.5f);
++    std::istringstream odd("[streaming]\npacing_lock_on = \"sideways\"\npacing_lock_age_ms = 40\n");
++    const ConfigValues o = ParseConfigToml(odd);
++    CHECK(o.pacingLockOn == "queue");
++    CHECK(o.pacingLockAgeMs == 10.0f);
++    std::istringstream low("[streaming]\npacing_lock_age_ms = 0\n");
++    CHECK(ParseConfigToml(low).pacingLockAgeMs == 0.5f);
++}
++
+ TEST_CASE("Config parser reads rtt_probe, rtt_assumed_ms and video_send_port", "[config]")
+ {
+     {
+-- 
+2.50.1 (Apple Git-155)
+

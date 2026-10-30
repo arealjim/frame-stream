@@ -1,0 +1,41 @@
+From 11279d3b7c3115def10a00059453e2a3140446cb Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 18:47:28 +0000
+Subject: [PATCH] tests: time the overlay bench quad as an underlay too
+
+---
+ tests/TestOverlayCompositor.mm | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/tests/TestOverlayCompositor.mm b/tests/TestOverlayCompositor.mm
+index 499d7a0..28e6d9a 100644
+--- a/tests/TestOverlayCompositor.mm
++++ b/tests/TestOverlayCompositor.mm
+@@ -426,12 +426,14 @@ TEST_CASE("Overlay pass GPU time on a Frame-sized eye", "[.overlay-bench]")
+ 
+         // Width at 2 m, and the minification it gives a 2048-texel image on this 2048-pixel eye (NDC 2 m per 4 m):
+         // 3.6 m -> 0.9 of the eye, 1.1x; 1.0 m -> 512 px, 4x; 0.25 m -> 128 px, 16x (capped).
++        for (bool under : {false, true})
+         for (float width : {3.6f, 1.0f, 0.25f})
+         {
+             FrameOverlayLayer quad = Overlay(panel, fov, At(0, 0, -2));
+             quad.width = width;
+             quad.height = width / 2.0f;
+             quad.sourceAlpha = true;
++            quad.underlay = under;
+             std::vector<double> ms;
+             for (int i = 0; i < 300; ++i)
+             {
+@@ -445,7 +447,8 @@ TEST_CASE("Overlay pass GPU time on a Frame-sized eye", "[.overlay-bench]")
+                 }
+             }
+             std::sort(ms.begin(), ms.end());
+-            printf("overlay bench: quad %.2f m (%.0f px wide), GPU p50 %.3f ms p95 %.3f ms\n", width,
++            printf("overlay bench: %s quad %.2f m (%.0f px wide), GPU p50 %.3f ms p95 %.3f ms\n",
++                   under ? "underlay" : "overlay ", width,
+                    width / 4.0f * kFrameEye, ms[ms.size() / 2], ms[ms.size() * 95 / 100]);
+         }
+         [eye release];
+-- 
+2.43.0
+

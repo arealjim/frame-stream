@@ -1,0 +1,86 @@
+From 96b44479889d07188ec3aeb6e9365aa1edfe2e57 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 19:00:04 +0000
+Subject: [PATCH] steam-frame client: signed translation slip along the head
+ motion (sign of the prediction error) and a live prediction-horizon override
+ in /dev/shm/frame-predict-ms
+
+---
+ clients/steam-frame/src/main.cpp | 33 +++++++++++++++++++++++++++++---
+ 1 file changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index f72b587..747b734 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -828,6 +828,9 @@ struct LatencyWindow {
+     // the head's TRANSLATION between the stamped render pose and the displayed pose is shown uncorrected.
+     // Mean/max of that distance per presented frame, and its vertical part on its own.
+     double slipMm = 0, slipMaxMm = 0, slipYMm = 0, slipYMaxMm = 0;
++    // signed slip along the head's own motion: + = the displayed head is AHEAD of the stamped one (prediction too
++    // short, the scene lags), - = the stamp is ahead (prediction too long, the scene leads = exaggerated parallax)
++    double slipAlongMm = 0; uint32_t slipAlongN = 0;
+ };
+ // Hidden session (no wearer): count loops and fresh frames so the repaint rate is measurable
+ // without a head, and how often the runtime hands us an invalid pose.
+@@ -1198,9 +1201,19 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+     // headset's runtime for the head pose that far in the FUTURE (its own tracker's predictor, the one
+     // the compositor's panels get) and send zero velocity, so the server renders exactly that pose and
+     // extrapolates nothing. The layer is still stamped with the pose the server rendered from.
+-    static const float kPredictMs = getenv("FRAME_CLIENT_PREDICT_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_MS")) : 0.0f;
++    static float kPredictMs = getenv("FRAME_CLIENT_PREDICT_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_MS")) : 0.0f;
+     static bool predictLogged = false;
+     if (kPredictMs > 0 && !predictLogged) { predictLogged = true; LOG_INFO("head pose sampled %.1f ms ahead by the runtime (FRAME_CLIENT_PREDICT_MS); velocity sent as zero", kPredictMs); }
++    // Live override (2026-10-19): /dev/shm/frame-predict-ms, read once a second, so a wear can tune the horizon.
++    {
++        static uint32_t predictPoll = 0;
++        if (predictPoll++ % 90 == 0) {
++            if (FILE* pf = fopen("/dev/shm/frame-predict-ms", "r")) {
++                float v; if (fscanf(pf, "%f", &v) == 1 && v >= 0.0f && v <= 200.0f && v != kPredictMs) { kPredictMs = v; LOG_INFO("prediction horizon now %.1f ms (/dev/shm/frame-predict-ms)", v); }
++                fclose(pf);
++            }
++        }
++    }
+     const XrTime tLocate = kPredictMs > 0 ? t + (XrTime)(kPredictMs * 1e6) : t;
+     XrSpaceVelocity hv = {XR_TYPE_SPACE_VELOCITY};
+     XrSpaceLocation hl = {XR_TYPE_SPACE_LOCATION, &hv};
+@@ -1643,6 +1656,19 @@ static void RenderFrame(App& app)
+                 const double slip = sqrt(mx * mx + my * my + mz * mz) * 1000.0, slipY = fabs(my) * 1000.0;
+                 g_lat.slipMm += slip; if (slip > g_lat.slipMaxMm) g_lat.slipMaxMm = slip;
+                 g_lat.slipYMm += slipY; if (slipY > g_lat.slipYMaxMm) g_lat.slipYMaxMm = slipY;
++                {
++                    static double pmx = 0, pmy = 0, pmz = 0; static bool havePm = false;
++                    const double cx = 0.5 * (views[0].pose.position.x + views[1].pose.position.x);
++                    const double cy = 0.5 * (views[0].pose.position.y + views[1].pose.position.y);
++                    const double cz = 0.5 * (views[0].pose.position.z + views[1].pose.position.z);
++                    if (havePm) {
++                        const double vx = cx - pmx, vy = cy - pmy, vz = cz - pmz, vn = sqrt(vx*vx + vy*vy + vz*vz);
++                        if (vn > 0.0005) {   // moving faster than ~45 mm/s: the direction is meaningful
++                            g_lat.slipAlongMm += (mx*vx + my*vy + mz*vz) / vn * 1000.0; g_lat.slipAlongN++;
++                        }
++                    }
++                    pmx = cx; pmy = cy; pmz = cz; havePm = true;
++                }
+             }
+             // Stamp-honoured test (2026-10-18): FRAME_CLIENT_STAMP_YAW_DEG=5 yaws the pose we tell the compositor the
+             // frame was rendered from, about world Y, without touching the frame. If SteamVR honours the stamp the whole
+@@ -1781,13 +1807,14 @@ static void RenderFrame(App& app)
+                                      " displayed frame age %.1f ms; %u presented, %u fresh, %u repaints, %u pose fallbacks;"
+                                      " waited for a frame %u times (%.2f ms avg, %u rescued; limit %.1f ms);"
+                                      " warp stamped->displayed mean %.2f max %.2f deg; raw fov changes %u (max %.3f deg);"
+-                                     " translation slip mean %.1f max %.1f mm (vertical mean %.1f max %.1f mm)",
++                                     " translation slip mean %.1f max %.1f mm (vertical mean %.1f max %.1f mm; along motion %+.1f mm over %u moving frames)",
+                                      r.receiveToDecoderSubmitMs, r.decodeLatencyMs, g_lat.pickup / f, r.compositorLatencyMs,
+                                      r.totalClientLatencyMs, r.displayedFrameAgeMs, g_lat.presented, g_lat.fresh,
+                                      g_lat.stale, g_lat.poseFallbacks, g_lat.waits, g_lat.waits ? g_lat.waited / g_lat.waits : 0.0,
+                                      g_lat.waitsRescued, g_waitForFrameMs,
+                                      g_lat.warpDeg / p, g_lat.warpMaxDeg, g_lat.fovChanges, g_lat.fovMaxDeltaDeg,
+-                                     g_lat.slipMm / p, g_lat.slipMaxMm, g_lat.slipYMm / p, g_lat.slipYMaxMm);
++                                     g_lat.slipMm / p, g_lat.slipMaxMm, g_lat.slipYMm / p, g_lat.slipYMaxMm,
++                                     g_lat.slipAlongN ? g_lat.slipAlongMm / g_lat.slipAlongN : 0.0, g_lat.slipAlongN);
+                             LogArrivals("client pipeline");
+                         g_lat = LatencyWindow{};
+                     }
+-- 
+2.44.0
+

@@ -1,0 +1,319 @@
+From e276c0ee3db602af801c02c4e6fd1fe7ad28e65a Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 18:27:29 +0000
+Subject: [PATCH] runtime: hear only the connected client on the tracking and
+ control sockets
+
+Both UDP sockets are bound on every interface, so any host that could reach
+the Mac could send head pose and controller input (9945), keep a vanished
+client alive (the liveness watchdog counts tracking packets), or end the
+session with a one-byte ServerDisconnect (9946).
+
+While a Wi-Fi client is connected, only its address is heard there now;
+with none, tracking is ignored and control is limited to discovery and
+ClientConnect, which client admission already rules on. The port is not
+compared: a restarted client returns on a new port from the same host.
+Foreign datagrams are counted and logged (first five, then every 1000).
+OXRSYS_ACCEPT_ANY_SOURCE=1 restores the old behaviour.
+
+This stops a stranger on the network, not one who can forge the client's
+source address on the same link; that needs a shared key.
+---
+ CMakeLists.txt                   |  1 +
+ runtime/src/SourcePinning.h      | 42 ++++++++++++++++++++++++++++++
+ runtime/src/StreamingServer.cpp  | 35 +++++++++++++++++++++++++
+ runtime/src/StreamingServer.h    |  6 +++++
+ runtime/src/TrackingReceiver.cpp | 28 +++++++++++++++++++-
+ runtime/src/TrackingReceiver.h   |  7 +++++
+ tests/TestSourcePinning.cpp      | 44 ++++++++++++++++++++++++++++++++
+ 7 files changed, 162 insertions(+), 1 deletion(-)
+ create mode 100644 runtime/src/SourcePinning.h
+ create mode 100644 tests/TestSourcePinning.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fc0c1dd..6c6bb69 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -171,6 +171,7 @@ set(OXRSYS_LOGCAT_TEST_ENV
+ add_executable(oxrsys_runtime_tests
+     tests/TestBoundedDrain.cpp
+     tests/TestClientAdmission.cpp
++    tests/TestSourcePinning.cpp
+     tests/TestClientLiveness.cpp
+     tests/TestConfig.cpp
+     tests/TestTrackingPhaseLock.cpp
+diff --git a/runtime/src/SourcePinning.h b/runtime/src/SourcePinning.h
+new file mode 100644
+index 0000000..5893ca1
+--- /dev/null
++++ b/runtime/src/SourcePinning.h
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#pragma once
++
++#include <cstdint>
++#include <cstdlib>
++
++// Which datagrams the Wi-Fi tracking and control sockets act on. Both are bound on every
++// interface, so before this any host that could reach the Mac could send head pose and
++// controller input (UDP 9945), keep a vanished client "alive" (the liveness watchdog counts
++// tracking packets), or end the session with a one-byte ServerDisconnect (UDP 9946). The
++// headset client already drops video that is not from its server (review 2026-10-21, H3).
++//
++// Policy: while a Wi-Fi client is connected, only its address is heard on these sockets.
++// With no client connected, tracking is ignored (there is nobody to render for) and control
++// is limited to discovery and ClientConnect, which ClientAdmission already rules on. The
++// port is not compared, for the same reason as there: a restarted client comes back on a new
++// source port from the same host. This stops a stranger on the network; it does not stop one
++// who can forge the client's source address on the same link, which needs a shared key
++// to authenticate the stream.
++//
++// OXRSYS_ACCEPT_ANY_SOURCE=1 restores the old behaviour.
++namespace oxrsys
++{
++
++// Addresses are IPv4 in network byte order, as in sockaddr_in::sin_addr.s_addr. 0 = none.
++inline bool AcceptFromSource(uint32_t pinnedAddress, uint32_t fromAddress, bool acceptAny)
++{
++    if (acceptAny)
++    {
++        return true;
++    }
++    return pinnedAddress != 0 && fromAddress == pinnedAddress;
++}
++
++inline bool AcceptAnySourceFromEnv()
++{
++    const char* value = std::getenv("OXRSYS_ACCEPT_ANY_SOURCE");
++    return value != nullptr && std::atoi(value) != 0;
++}
++
++} // namespace oxrsys
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index e25b24e..50eb990 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -785,6 +785,11 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
+         packetDispatchState_->acceptingPackets = true;
+     }
+ 
++    acceptAnySource_ = oxrsys::AcceptAnySourceFromEnv();
++    if (acceptAnySource_)
++    {
++        spdlog::warn("StreamingServer: OXRSYS_ACCEPT_ANY_SOURCE set; control messages accepted from any address");
++    }
+     trackingReceiver_ = std::make_unique<TrackingReceiver>();
+     if (!trackingReceiver_->Start())
+     {
+@@ -1091,6 +1096,20 @@ void StreamingServer::ControlThread()
+                 HandleClientConnect(clientConnect, clientAddr);
+             }
+         }
++        else if (!oxrsys::AcceptFromSource(pinnedClientAddress_.load(), clientAddr.sin_addr.s_addr,
++                                           acceptAnySource_))
++        {
++            // A disconnect, NACK, keyframe request or latency report from anyone but the
++            // connected client (SourcePinning.h).
++            const uint64_t foreign = foreignControlDropCount_.fetch_add(1) + 1;
++            if (foreign <= 5 || foreign % 1000 == 0)
++            {
++                char who[INET_ADDRSTRLEN] = {};
++                inet_ntop(AF_INET, &clientAddr.sin_addr, who, sizeof(who));
++                spdlog::warn("StreamingServer: dropped control message 0x{:02x} from {} (not the connected "
++                             "client; {} so far)", type, who, foreign);
++            }
++        }
+         else if (type == static_cast<uint8_t>(oxr::protocol::MessageType::ServerDisconnect))
+         {
+             HandleClientDisconnect();
+@@ -1847,6 +1866,11 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
+         clientName_ = clientName;
+         clientUsesUsbAdb_.store(false);
+     }
++    pinnedClientAddress_.store(clientAddr.sin_addr.s_addr);
++    if (trackingReceiver_)
++    {
++        trackingReceiver_->SetPinnedSource(clientAddr.sin_addr.s_addr);
++    }
+     // rtt_probe: only the "measured" prediction mode reads the RTT (or rtt_probe = "on").
+     rttProbe_.SetTarget(ShouldProbeRtt() ? std::string(ipStr) : std::string());
+     sampleToSubmitMs_.store(0.0f);
+@@ -2111,6 +2135,12 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
+         clientName_ = clientName;
+         clientUsesUsbAdb_.store(true);
+     }
++    // A USB ADB client speaks TCP on loopback only; nobody is heard on the UDP sockets.
++    pinnedClientAddress_.store(0);
++    if (trackingReceiver_)
++    {
++        trackingReceiver_->SetPinnedSource(0);
++    }
+     rttProbe_.SetTarget(std::string());   // USB: no network RTT to measure
+     sampleToSubmitMs_.store(0.0f);
+     sampleAgeAtFetchMs_.store(0.0f);
+@@ -2351,6 +2381,11 @@ void StreamingServer::HandleClientDisconnect()
+         clientPort_ = 0;
+         clientUsesUsbAdb_.store(false);
+     }
++    pinnedClientAddress_.store(0);
++    if (trackingReceiver_)
++    {
++        trackingReceiver_->SetPinnedSource(0);
++    }
+     rttProbe_.SetTarget(std::string());
+     if (previousState != State::Connected && !hadClient)
+     {
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index f9f0fe7..dc822ca 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include "ClientAdmission.h"
++#include "SourcePinning.h"
+ 
+ #include <array>
+ #include <atomic>
+@@ -206,6 +207,11 @@ class StreamingServer
+     // Control-thread only: which address was last refused a ClientConnect and when
+     // that was last logged (see ClientAdmission.h).
+     oxrsys::ClientAdmissionState clientAdmission_;
++    // The connected Wi-Fi client's address (network byte order), 0 when none: the only source the
++    // UDP control socket acts on beyond discovery and ClientConnect (SourcePinning.h).
++    std::atomic<uint32_t> pinnedClientAddress_{0};
++    std::atomic<uint64_t> foreignControlDropCount_{0};
++    bool acceptAnySource_ = false;
+     void HandleLatencyReport(const oxr::protocol::LatencyReport& report);
+     void HandleKeyframeRequest(const oxr::protocol::RequestKeyframe& request);
+     void HandleStreamConfigAck(const oxr::protocol::StreamConfigAck& ack);
+diff --git a/runtime/src/TrackingReceiver.cpp b/runtime/src/TrackingReceiver.cpp
+index 84a0529..9161b5d 100644
+--- a/runtime/src/TrackingReceiver.cpp
++++ b/runtime/src/TrackingReceiver.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include "TrackingReceiver.h"
+ 
++#include "SourcePinning.h"
++
+ #include <spdlog/spdlog.h>
+ 
+ #include <algorithm>
+@@ -229,12 +231,36 @@ static void ClearFieldsBeyond(oxr::protocol::TrackingPacket& packet, size_t rece
+ void TrackingReceiver::ReceiveThread()
+ {
+     uint8_t buffer[sizeof(oxr::protocol::TrackingPacket)];
++    const bool acceptAny = oxrsys::AcceptAnySourceFromEnv();
++    if (acceptAny)
++    {
++        spdlog::warn("TrackingReceiver: OXRSYS_ACCEPT_ANY_SOURCE set; tracking accepted from any address");
++    }
+ 
+     while (running_.load())
+     {
+         oxrsys::runtime_socket::SetReceiveTimeout(socket_, 0, 5000);
+ 
+-        int received = oxrsys::runtime_socket::Receive(socket_, buffer, sizeof(buffer), 0);
++        sockaddr_in from = {};
++        oxrsys::runtime_socket::SocketLength fromLength = sizeof(from);
++        int received = oxrsys::runtime_socket::ReceiveFrom(socket_, buffer, sizeof(buffer), 0,
++                                                           reinterpret_cast<sockaddr*>(&from), &fromLength);
++        if (received < 1)
++        {
++            continue;
++        }
++        if (!oxrsys::AcceptFromSource(pinnedSource_.load(), from.sin_addr.s_addr, acceptAny))
++        {
++            const uint64_t foreign = foreignDropCount_.fetch_add(1) + 1;
++            if (foreign <= 5 || foreign % 1000 == 0)
++            {
++                char who[INET_ADDRSTRLEN] = {};
++                inet_ntop(AF_INET, &from.sin_addr, who, sizeof(who));
++                spdlog::warn("TrackingReceiver: dropped tracking from {} (not the connected client; {} so far)",
++                             who, foreign);
++            }
++            continue;
++        }
+         if (received < static_cast<int>(kMinTrackingPacketSize))
+         {
+             continue;
+diff --git a/runtime/src/TrackingReceiver.h b/runtime/src/TrackingReceiver.h
+index a76ba48..7910198 100644
+--- a/runtime/src/TrackingReceiver.h
++++ b/runtime/src/TrackingReceiver.h
+@@ -41,6 +41,11 @@ class TrackingReceiver
+     // Inject a tracking packet from TCP (USB mode) — same effect as receiving via UDP
+     void InjectPacket(const uint8_t* data, size_t size);
+ 
++    // The connected Wi-Fi client's address (network byte order); 0 when none. UDP tracking from
++    // any other address is dropped (SourcePinning.h). InjectPacket is not affected.
++    void SetPinnedSource(uint32_t address) { pinnedSource_.store(address); }
++    uint64_t GetForeignDropCount() const { return foreignDropCount_.load(); }
++
+     void SetPredictionHorizonMs(float predictionHorizonMs);
+     // Fraction of the horizon the head position is predicted over (pose_prediction_position_scale).
+     void SetPositionHorizonScale(float scale) { positionHorizonScale_.store(std::clamp(scale, 0.0f, 2.0f)); }
+@@ -104,6 +109,8 @@ class TrackingReceiver
+     std::atomic<bool> hasData_{false};
+     std::atomic<uint64_t> packetCount_{0};
+     std::atomic<uint64_t> reorderedDropCount_{0};
++    std::atomic<uint32_t> pinnedSource_{0};
++    std::atomic<uint64_t> foreignDropCount_{0};
+ 
+     mutable std::mutex poseMutex_;
+     oxr::protocol::TrackingPacket latestPacket_ = {};
+diff --git a/tests/TestSourcePinning.cpp b/tests/TestSourcePinning.cpp
+new file mode 100644
+index 0000000..992b12b
+--- /dev/null
++++ b/tests/TestSourcePinning.cpp
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include <catch2/catch_test_macros.hpp>
++
++#include "SourcePinning.h"
++
++#include <arpa/inet.h>
++#include <cstdint>
++
++using oxrsys::AcceptFromSource;
++
++namespace
++{
++uint32_t Ip(const char* text)
++{
++    in_addr address = {};
++    REQUIRE(inet_pton(AF_INET, text, &address) == 1);
++    return address.s_addr;
++}
++} // namespace
++
++TEST_CASE("Source pinning: the connected client is heard", "[source-pinning]")
++{
++    CHECK(AcceptFromSource(Ip("10.35.78.1"), Ip("10.35.78.1"), false));
++}
++
++TEST_CASE("Source pinning: another host on the network is not", "[source-pinning]")
++{
++    CHECK_FALSE(AcceptFromSource(Ip("10.35.78.1"), Ip("10.35.78.99"), false));
++    // The Mac's own other interface is a different address too.
++    CHECK_FALSE(AcceptFromSource(Ip("10.86.200.233"), Ip("198.51.100.20"), false));
++}
++
++TEST_CASE("Source pinning: nobody is heard with no client connected", "[source-pinning]")
++{
++    CHECK_FALSE(AcceptFromSource(0, Ip("10.35.78.1"), false));
++    CHECK_FALSE(AcceptFromSource(0, 0, false));
++}
++
++TEST_CASE("Source pinning: the escape hatch accepts anyone", "[source-pinning]")
++{
++    CHECK(AcceptFromSource(0, Ip("10.35.78.99"), true));
++    CHECK(AcceptFromSource(Ip("10.35.78.1"), Ip("10.35.78.99"), true));
++}
+-- 
+2.43.0
+

@@ -1,0 +1,41 @@
+From 41c37233eb977a93020fa30eab009811363e9bc7 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 18:51:43 +0000
+Subject: [PATCH] steam-frame client: FRAME_CLIENT_STAMP_POS_LIVE keeps the
+ render orientation on the stamp but puts the displayed eye position on it, so
+ the compositor warps rotation only (stamp-live made the parallax right and
+ the picture shaky)
+
+---
+ clients/steam-frame/src/main.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 923fa25..f72b587 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -1606,6 +1606,13 @@ static void RenderFrame(App& app)
+             // warps nothing and the eye sees the server's prediction error alone. If the exaggeration goes, the
+             // compositor's positional warp (its assumed layer depth) is the cause; if it stays, it is upstream.
+             static const bool kStampLive = getenv("FRAME_CLIENT_STAMP_LIVE") && atoi(getenv("FRAME_CLIENT_STAMP_LIVE")) != 0;
++            // Rotation-only warp (2026-10-19, fifth wear: stamp-live made the parallax right and the picture shaky):
++            // FRAME_CLIENT_STAMP_POS_LIVE=1 keeps the RENDER orientation on the stamp (the compositor still warps
++            // rotation, which is what keeps it steady) but puts the DISPLAYED eye position on it, so the compositor
++            // applies no positional warp and its depth guess cannot exaggerate the parallax.
++            static const bool kStampPosLive = getenv("FRAME_CLIENT_STAMP_POS_LIVE") && atoi(getenv("FRAME_CLIENT_STAMP_POS_LIVE")) != 0;
++            static bool stampPosLiveLogged = false;
++            if (kStampPosLive && !stampPosLiveLogged) { stampPosLiveLogged = true; LOG_INFO("stamp-pos-live: render orientation + displayed eye position on the stamp (FRAME_CLIENT_STAMP_POS_LIVE), compositor warps rotation only"); }
+             static bool stampLiveLogged = false;
+             if (kStampLive && !stampLiveLogged) { stampLiveLogged = true; LOG_INFO("stamp-live test: layers stamped with the displayed view pose (FRAME_CLIENT_STAMP_LIVE), compositor warps nothing"); }
+             for (uint32_t eye = 0; eye < VIEW_COUNT; eye++) {
+@@ -1617,6 +1624,7 @@ static void RenderFrame(App& app)
+                     const float rx = 1.0f - 2.0f * (qy * qy + qz * qz), ry = 2.0f * (qx * qy + qw * qz), rz = 2.0f * (qx * qz - qw * qy);
+                     const float half = (g_sentIpd > 0.0f ? g_sentIpd : 0.063f) * 0.5f * (eye == 0 ? -1.0f : 1.0f);
+                     layerPose[eye].position = {rpPos[0] + rx * half, rpPos[1] + ry * half + kStampYM, rpPos[2] + rz * half};
++                    if (kStampPosLive) layerPose[eye].position = views[eye].pose.position;
+                     layerPose[eye].orientation = {rpOri[0], rpOri[1], rpOri[2], rpOri[3]};
+                 } else {
+                     layerPose[eye] = views[eye].pose;
+-- 
+2.44.0
+

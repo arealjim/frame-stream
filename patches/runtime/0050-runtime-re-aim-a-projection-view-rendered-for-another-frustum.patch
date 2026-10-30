@@ -1,0 +1,76 @@
+From 0a7496a0f6895acf81a5187cc88d6ca09dd61114 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 16:47:41 +0000
+Subject: [PATCH 50/50] runtime: re-aim a projection view rendered for another
+ frustum
+
+CyberpunkVRPort renders both eyes with the right eye's FOV. On a headset with
+asymmetric eye frusta the left eye's image then lands shifted, which reads as
+double vision. When a submitted view's fov differs from the headset's, place
+the image into the headset's frustum with the encoder's existing ray-cast;
+uncovered edges stay black. The depth for a re-aimed view is dropped, since it
+was captured in the app's frustum.
+---
+ runtime/src/Session.cpp | 46 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index 670b7aa..4ad8f01 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -1102,6 +1102,52 @@ XrResult Session::ValidateProjectionLayer(const XrCompositionLayerProjection& la
+         imageSource.sourceWidth = static_cast<uint32_t>(view.subImage.imageRect.extent.width);
+         imageSource.sourceHeight = static_cast<uint32_t>(view.subImage.imageRect.extent.height);
+         CollectProjectionDepth(view, frameSource.depth[viewIndex]);
++
++        // An app may render an eye for a frustum other than the one the headset shows it through
++        // (CyberpunkVRPort renders both eyes with the right eye's FOV). Re-aim the image into the
++        // headset's frustum: the encoder ray-casts each display pixel onto the image's own plane at
++        // z = -1, so content lands where it was meant to; uncovered edges stay black.
++        if (imageSource.IsValid() && inputManager_ && inputManager_->IsStreaming())
++        {
++            XrView display[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
++            inputManager_->GetEyeViews(display, 2);
++            const XrFovf& want = display[viewIndex].fov;
++            const XrFovf& have = view.fov;
++            const float worst = std::max({std::fabs(want.angleLeft - have.angleLeft), std::fabs(want.angleRight - have.angleRight),
++                                          std::fabs(want.angleUp - have.angleUp), std::fabs(want.angleDown - have.angleDown)});
++            if (worst > 0.005f)
++            {
++                const float hl = std::tan(have.angleLeft), hr = std::tan(have.angleRight);
++                const float hu = std::tan(have.angleUp), hd = std::tan(have.angleDown);
++                const float wl = std::tan(want.angleLeft), wr = std::tan(want.angleRight);
++                const float wu = std::tan(want.angleUp), wd = std::tan(want.angleDown);
++                imageSource.placeInEye = true;
++                imageSource.eyeWidth = imageSource.sourceWidth;
++                imageSource.eyeHeight = imageSource.sourceHeight;
++                const float corner[3] = {hl, hu, -1.0f}, ex[3] = {hr - hl, 0.0f, 0.0f}, ey[3] = {0.0f, hd - hu, 0.0f};
++                for (int k = 0; k < 3; ++k)
++                {
++                    imageSource.quadCorner[k] = corner[k];
++                    imageSource.quadEdgeX[k] = ex[k];
++                    imageSource.quadEdgeY[k] = ey[k];
++                }
++                imageSource.eyeTan[0] = wl; imageSource.eyeTan[1] = wr; imageSource.eyeTan[2] = wu; imageSource.eyeTan[3] = wd;
++                imageSource.placeX = (hl - wl) / (wr - wl);
++                imageSource.placeY = (wu - hu) / (wu - wd);
++                imageSource.placeW = (hr - hl) / (wr - wl);
++                imageSource.placeH = (hu - hd) / (wu - wd);
++                // the depth was captured in the app's frustum, not the headset's: positional
++                // reprojection against it would misplace the eye, so a re-aimed eye goes without
++                frameSource.depth[viewIndex] = {};
++                static std::atomic<int> reaimLogs{0};
++                if (reaimLogs.fetch_add(1) < 2)
++                {
++                    spdlog::info("OXRSys: re-aiming projection view {}: rendered fov ({:.3f},{:.3f},{:.3f},{:.3f}), headset ({:.3f},{:.3f},{:.3f},{:.3f})",
++                                 viewIndex, have.angleLeft, have.angleRight, have.angleUp, have.angleDown,
++                                 want.angleLeft, want.angleRight, want.angleUp, want.angleDown);
++                }
++            }
++        }
+         if (viewIndex == 0)
+         {
+             frameSource.left = std::move(imageSource);
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,287 @@
+From df504c700573966392ff5d42c4078744a4503735 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 18:16:35 +0000
+Subject: [PATCH 07/23] VideoEncoder: classify the low-latency rtvc session
+ honestly, convert only what needs it
+
+With EnableLowLatencyRateControl VideoToolbox serves the session from the rtvc hardware encoder, whose session answers UsingHardwareAcceleratedVideoEncoder with kVTPropertyNotSupportedErr (-12900). The runtime read that as software, warned about it, and - correctly, it turns out - fed it the video-range 4:2:0 conversion: the rtvc encoder, like the software ones, writes a full-range stream for a BGRA source (the encoder test VUI check fails without the conversion). So: session kind from the property when it answers and from the encoder id otherwise (EncoderSessionKind.h, unit-tested), the conversion decided by whether the session keeps video range from BGRA (only the classic ave encoder does), and the init log names the encoder id and says why a hardware session is converted (about 1 ms of submit per frame at 2272x1264).
+
+---
+ CHANGES.md                       | 11 ++++++
+ CMakeLists.txt                   |  1 +
+ runtime/src/EncoderSessionKind.h | 61 ++++++++++++++++++++++++++++++++
+ runtime/src/VideoEncoder.h       |  3 ++
+ runtime/src/VideoEncoder.mm      | 51 ++++++++++++++++++++------
+ tests/TestEncoderSessionKind.cpp | 54 ++++++++++++++++++++++++++++
+ 6 files changed, 170 insertions(+), 11 deletions(-)
+ create mode 100644 runtime/src/EncoderSessionKind.h
+ create mode 100644 tests/TestEncoderSessionKind.cpp
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 6fc03f0..017e806 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -46,6 +46,17 @@ ### Added
+ 
+ ### Changed
+ 
++- Low-latency sessions are no longer mislabelled as software. With low-latency rate
++  control VideoToolbox serves the session from its real-time hardware encoder
++  (`…videoencoder.hevc.rtvc`), whose session returns `kVTPropertyNotSupportedErr` for
++  `UsingHardwareAcceleratedVideoEncoder`; the runtime read that failure as "software",
++  warned about it, and fed the session a per-frame BT.709 4:2:0 conversion it does not
++  need - or so it seemed: the rtvc encoder, like the software ones, writes a FULL-range
++  stream for a BGRA source (the encoder test's VUI check catches it), so the conversion
++  stays for it. The session kind is now decided by the property when it answers and by
++  the encoder id otherwise, the conversion by whether the session keeps video range from
++  BGRA (`EncoderSessionKind.h`, unit-tested), and the init log names the encoder id and
++  says why a hardware session is being converted.
+ - The in-process hardware VideoToolbox session enables low-latency rate control
+   (`kVTVideoEncoderSpecification_EnableLowLatencyRateControl`), new config key
+   `encoder_low_latency` (default true). Measured on an M5 Pro at 2272x1264 H.265 72 Hz: the
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d4697ef..3eaa1d6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -175,6 +175,7 @@ add_executable(oxrsys_runtime_tests
+     tests/TestConfig.cpp
+     tests/TestEncoderHelperIpc.cpp
+     tests/TestEncoderPathPolicy.cpp
++    tests/TestEncoderSessionKind.cpp
+     tests/TestInputManager.cpp
+     tests/TestRuntimePlatform.cpp
+     tests/TestStreamingAbr.cpp
+diff --git a/runtime/src/EncoderSessionKind.h b/runtime/src/EncoderSessionKind.h
+new file mode 100644
+index 0000000..5dcd553
+--- /dev/null
++++ b/runtime/src/EncoderSessionKind.h
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#pragma once
++
++#include <string_view>
++
++// Is a VideoToolbox compression session hardware-accelerated?
++//
++// kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder answers for the
++// classic Apple hardware encoder ("com.apple.videotoolbox.videoencoder.ave.hevc"),
++// but a session created with EnableLowLatencyRateControl is served by a different
++// hardware encoder ("com.apple.videotoolbox.videoencoder.hevc.rtvc") whose session
++// returns kVTPropertyNotSupportedErr (-12900) for that key. Trusting the failed
++// query as "software" (measured 2026-10-17 on an M5 Pro) made the runtime warn about
++// a software session and feed it a per-frame 4:2:0 conversion it does not need
++// (+1 ms of submit time). So: the property when it answers, the encoder id otherwise.
++namespace oxrsys
++{
++
++enum class EncoderSessionKind
++{
++    Hardware,
++    Software,
++    Unknown,
++};
++
++// hardwareQueryAnswered / hardwareQueryValue: the UsingHardwareAcceleratedVideoEncoder
++// property (answered = status noErr and a value was returned).
++// encoderId: kVTCompressionPropertyKey_EncoderID, or empty when unavailable.
++inline EncoderSessionKind ClassifyEncoderSession(bool hardwareQueryAnswered, bool hardwareQueryValue,
++                                                 std::string_view encoderId)
++{
++    if (hardwareQueryAnswered)
++    {
++        return hardwareQueryValue ? EncoderSessionKind::Hardware : EncoderSessionKind::Software;
++    }
++    // Apple's hardware encoder ids: ".ave." (Apple Video Encoder, the classic path)
++    // and ".rtvc" (the real-time encoder behind low-latency rate control). The
++    // software encoders carry neither token.
++    if (encoderId.find(".ave.") != std::string_view::npos ||
++        encoderId.find(".rtvc") != std::string_view::npos)
++    {
++        return EncoderSessionKind::Hardware;
++    }
++    return encoderId.empty() ? EncoderSessionKind::Unknown : EncoderSessionKind::Software;
++}
++
++// Does this session write a limited-range (video-range) stream when fed the BGRA
++// compose surface? Only the classic hardware encoder (".ave.") does. The software
++// encoders and the low-latency rtvc hardware encoder write FULL range for a BGRA
++// source (measured 2026-10-17: the stream's VUI flipped to full range the moment the
++// rtvc session was fed BGRA), so every other session is fed the video-range 4:2:0
++// conversion (EncoderSessionColor.h) and keeps the stream limited-range. That
++// conversion costs about 1 ms of submit time per 2272x1264 frame.
++inline bool SessionWritesVideoRangeFromBGRA(EncoderSessionKind kind, std::string_view encoderId)
++{
++    return kind == EncoderSessionKind::Hardware &&
++           encoderId.find(".ave.") != std::string_view::npos;
++}
++
++} // namespace oxrsys
+diff --git a/runtime/src/VideoEncoder.h b/runtime/src/VideoEncoder.h
+index ebbe117..bc1f351 100644
+--- a/runtime/src/VideoEncoder.h
++++ b/runtime/src/VideoEncoder.h
+@@ -228,6 +228,9 @@ class VideoEncoder
+     bool tenBit_ = false;
+     bool forceSoftwareForTesting_ = false;
+     bool inProcessSessionHardware_ = false;
++    // True only for a session that writes video range from the BGRA surface unaided
++    // (the classic ave hardware encoder); otherwise frames are converted first.
++    bool inProcessSessionKeepsVideoRange_ = false;
+ 
+     // Which process encodes, and why — decided once in Initialize() from an
+     // actual VideoToolbox hardware-encoder query plus the encoder_helper
+diff --git a/runtime/src/VideoEncoder.mm b/runtime/src/VideoEncoder.mm
+index d24c0e5..dc912bc 100644
+--- a/runtime/src/VideoEncoder.mm
++++ b/runtime/src/VideoEncoder.mm
+@@ -17,6 +17,8 @@
+ 
+ #import <spdlog/spdlog.h>
+ 
++#include "EncoderSessionKind.h"
++
+ #include <algorithm>
+ #include <chrono>
+ #include <cmath>
+@@ -1144,21 +1146,47 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+     // RequireHardware=NO meant a Rosetta host ran the software HEVC encoder with
+     // nothing in the log to say so; a line here makes that impossible.
+     {
+-        bool sessionUsesHardware = false;
+         CFBooleanRef hardwareRef = nullptr;
+-        if (VTSessionCopyProperty(compressionSession,
+-                                  kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+-                                  kCFAllocatorDefault, &hardwareRef) == noErr &&
+-            hardwareRef != nullptr)
++        const OSStatus hardwareQuery = VTSessionCopyProperty(compressionSession,
++            kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
++            kCFAllocatorDefault, &hardwareRef);
++        const bool hardwareQueryAnswered = hardwareQuery == noErr && hardwareRef != nullptr;
++        bool hardwareQueryValue = false;
++        if (hardwareRef != nullptr)
+         {
+-            sessionUsesHardware = CFBooleanGetValue(hardwareRef);
++            hardwareQueryValue = CFBooleanGetValue(hardwareRef);
+             CFRelease(hardwareRef);
+         }
++        std::string encoderId;
++        CFStringRef encoderIdRef = nullptr;
++        if (VTSessionCopyProperty(compressionSession, kVTCompressionPropertyKey_EncoderID,
++                                  kCFAllocatorDefault, &encoderIdRef) == noErr &&
++            encoderIdRef != nullptr)
++        {
++            if (const char* utf8 = [(__bridge NSString*)encoderIdRef UTF8String])
++            {
++                encoderId = utf8;
++            }
++            CFRelease(encoderIdRef);
++        }
++        // The low-latency (rtvc) hardware session answers the hardware query with
++        // kVTPropertyNotSupportedErr; the encoder id settles it (EncoderSessionKind.h).
++        const oxrsys::EncoderSessionKind sessionKind =
++            oxrsys::ClassifyEncoderSession(hardwareQueryAnswered, hardwareQueryValue, encoderId);
++        const bool sessionUsesHardware = sessionKind == oxrsys::EncoderSessionKind::Hardware;
++        inProcessSessionKeepsVideoRange_ =
++            oxrsys::SessionWritesVideoRangeFromBGRA(sessionKind, encoderId);
++        if (!hardwareQueryAnswered)
++        {
++            spdlog::info("VideoEncoder: hardware query unsupported on this session (status {}), "
++                         "classified from encoder id '{}'",
++                         hardwareQuery, encoderId.empty() ? "?" : encoderId);
++        }
+         inProcessSessionHardware_ = sessionUsesHardware;
+         if (sessionUsesHardware)
+         {
+-            spdlog::info("VideoEncoder: in-process {} session is hardware-accelerated",
+-                         VideoCodecName(codec_));
++            spdlog::info("VideoEncoder: in-process {} session is hardware-accelerated ({})",
++                         VideoCodecName(codec_), encoderId.empty() ? "?" : encoderId);
+         }
+         else if (encodePath_.useHelper)
+         {
+@@ -1180,7 +1208,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+     // and this session takes over mid-stream. Hand it an explicitly video-range
+     // 4:2:0 conversion of each frame instead; see EncoderSessionColor.h. Set up
+     // now, not on helper death, so the fallback never allocates on the frame path.
+-    if (!inProcessSessionHardware_ && !CreateVideoRangeConversion(width, height))
++    if (!inProcessSessionKeepsVideoRange_ && !CreateVideoRangeConversion(width, height))
+     {
+         spdlog::warn("VideoEncoder: could not set up the video-range conversion for the software "
+                      "{} session - its stream may signal full range",
+@@ -1235,8 +1263,9 @@ bool VideoEncoder::CreateVideoRangeConversion(uint32_t width, uint32_t height)
+     }
+     videoToolbox_.videoRangeTransfer = transfer;
+     videoToolbox_.videoRangePool = pool;
+-    spdlog::info("VideoEncoder: software {} session is fed a BT.709 video-range 4:2:0 conversion "
+-                 "of each frame, keeping the stream limited-range",
++    spdlog::info("VideoEncoder: {} {} session is fed a BT.709 video-range 4:2:0 conversion "
++                 "of each frame, keeping the stream limited-range (about 1 ms of submit per frame)",
++                 inProcessSessionHardware_ ? "low-latency hardware" : "software",
+                  VideoCodecName(codec_));
+     return true;
+ }
+diff --git a/tests/TestEncoderSessionKind.cpp b/tests/TestEncoderSessionKind.cpp
+new file mode 100644
+index 0000000..803da50
+--- /dev/null
++++ b/tests/TestEncoderSessionKind.cpp
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include <catch2/catch_test_macros.hpp>
++
++#include "EncoderSessionKind.h"
++
++using oxrsys::ClassifyEncoderSession;
++using oxrsys::EncoderSessionKind;
++using oxrsys::SessionWritesVideoRangeFromBGRA;
++
++TEST_CASE("Encoder session kind: the hardware property wins when it answers", "[encoder-session]")
++{
++    CHECK(ClassifyEncoderSession(true, true, "com.apple.videotoolbox.videoencoder.ave.hevc") ==
++          EncoderSessionKind::Hardware);
++    CHECK(ClassifyEncoderSession(true, false, "com.apple.videotoolbox.videoencoder.hevc") ==
++          EncoderSessionKind::Software);
++    // Even an id that looks like hardware does not override an explicit "no".
++    CHECK(ClassifyEncoderSession(true, false, "com.apple.videotoolbox.videoencoder.ave.hevc") ==
++          EncoderSessionKind::Software);
++}
++
++TEST_CASE("Encoder session kind: low-latency rtvc session is hardware although the property fails",
++          "[encoder-session]")
++{
++    // Measured 2026-10-17: EnableLowLatencyRateControl -> encoder id hevc.rtvc, and the
++    // UsingHardwareAcceleratedVideoEncoder query returns kVTPropertyNotSupportedErr.
++    CHECK(ClassifyEncoderSession(false, false, "com.apple.videotoolbox.videoencoder.hevc.rtvc") ==
++          EncoderSessionKind::Hardware);
++    CHECK(ClassifyEncoderSession(false, false, "com.apple.videotoolbox.videoencoder.ave.avc") ==
++          EncoderSessionKind::Hardware);
++}
++
++TEST_CASE("Encoder session kind: no answer and a software id is software; no id at all is unknown",
++          "[encoder-session]")
++{
++    CHECK(ClassifyEncoderSession(false, false, "com.apple.videotoolbox.videoencoder.h264.gva") ==
++          EncoderSessionKind::Software);
++    CHECK(ClassifyEncoderSession(false, false, "") == EncoderSessionKind::Unknown);
++}
++
++TEST_CASE("Encoder session kind: only the classic ave hardware encoder keeps video range from BGRA",
++          "[encoder-session]")
++{
++    CHECK(SessionWritesVideoRangeFromBGRA(EncoderSessionKind::Hardware,
++                                          "com.apple.videotoolbox.videoencoder.ave.hevc"));
++    CHECK(SessionWritesVideoRangeFromBGRA(EncoderSessionKind::Hardware,
++                                          "com.apple.videotoolbox.videoencoder.ave.avc"));
++    // The low-latency rtvc session is hardware but writes full range for BGRA: convert.
++    CHECK_FALSE(SessionWritesVideoRangeFromBGRA(EncoderSessionKind::Hardware,
++                                                "com.apple.videotoolbox.videoencoder.hevc.rtvc"));
++    CHECK_FALSE(SessionWritesVideoRangeFromBGRA(EncoderSessionKind::Software,
++                                                "com.apple.videotoolbox.videoencoder.hevc"));
++    CHECK_FALSE(SessionWritesVideoRangeFromBGRA(EncoderSessionKind::Unknown, ""));
++}
+-- 
+2.43.0
+

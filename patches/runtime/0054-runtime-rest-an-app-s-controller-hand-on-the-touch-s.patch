@@ -1,0 +1,250 @@
+From 90fdf4781879541eec7ae9c197e9ef272d837fe5 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:36:52 +0000
+Subject: [PATCH 54/54] runtime: rest an app's controller hand on the touch
+ sensors; quit the app when the headset leaves
+
+A hand holding a tracked controller no longer reports articulated joints:
+the client sends joint positions only, so every bone rotation was
+invented, and a skeleton built from them (OpenComposite) lost the thumb
+and index finger. The app falls back to its controller hand.
+
+That hand is posed from touch: under profiles without the Frame's own
+inputs, trigger/touch, thumbstick/touch, thumbrest/touch and the face
+buttons' touch now read the client's touch sensors, and a finger resting
+on the grip sensor reads as a 0.3 curl on squeeze/value, below the 0.5
+click.
+
+exit_app_after_client_gone_s (default 0, off): with no headset client
+for that long the session goes LOSS_PENDING, which asks the app to
+quit. Quitting a streamed game from the headset menu ended only the
+client, and the game played on.
+---
+ runtime/src/Config.cpp       |  8 +++++++
+ runtime/src/Config.h         |  6 ++++++
+ runtime/src/HandTracker.cpp  |  6 +++++-
+ runtime/src/InputManager.cpp | 29 +++++++++++++++++++------
+ runtime/src/Session.cpp      | 17 +++++++++++++++
+ runtime/src/Session.h        |  4 ++++
+ tests/TestInputManager.cpp   | 41 ++++++++++++++++++++++++++++++++++++
+ 7 files changed, 104 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index 2e8ea4a..4058d30 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -393,6 +393,14 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+                     values.renderDevice = value;
+                 }
+             }
++            else if (key == "exit_app_after_client_gone_s")
++            {
++                float val = std::stof(value);
++                if (val >= 0.0f && val <= 3600.0f)
++                {
++                    values.exitAppAfterClientGoneS = val;
++                }
++            }
+             else if (key == "stage_height_offset_m")
+             {
+                 float val = std::stof(value);
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index d74246b..4ed78c3 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -160,6 +160,12 @@ struct ConfigValues
+     // is miscalibrated so a standing player stands at the wrong height in-game.
+     float stageHeightOffsetM = 0.0f;
+ 
++    // Seconds after the headset client leaves (and none comes back) before the session is lost, which tells the app to
++    // quit (XR_SESSION_STATE_LOSS_PENDING; OpenComposite turns it into VREvent_Quit). Quitting a streamed game from the
++    // headset's own menu ends only the client, so without this the game played on, heard but not seen. 0 = off: the
++    // app waits for a headset for ever (an engine editor, a test harness).
++    float exitAppAfterClientGoneS = 0.0f;
++
+     bool fileLogging = true;        // Write logs to oxrsys-runtime.log
+     bool questLogcat = false;       // Capture Quest logcat to oxrsys-headset.log
+ };
+diff --git a/runtime/src/HandTracker.cpp b/runtime/src/HandTracker.cpp
+index f9da02a..d7d1c21 100644
+--- a/runtime/src/HandTracker.cpp
++++ b/runtime/src/HandTracker.cpp
+@@ -102,7 +102,11 @@ XrResult HandTracker::LocateHandJoints(XrSpace baseSpace, XrTime /*time*/,
+                                   ? InputManager::Hand::Left
+                                   : InputManager::Hand::Right;
+ 
+-    if (!inputManager.IsHandTrackingActive(hand))
++    // A hand holding a tracked controller is not reported as articulated joints. The client sends joint positions
++    // only, so the runtime would have to invent every bone's rotation, and a skeleton built from those (OpenComposite's
++    // XrHandJointsToSkeleton) lost the thumb and index finger in Half-Life: Alyx. Reported inactive, the app falls
++    // back to its controller hand, posed from the trigger and thumb touch sensors.
++    if (!inputManager.IsHandTrackingActive(hand) || inputManager.IsControllerTrackingActive(hand))
+     {
+         locations->isActive = XR_FALSE;
+         ClearJointLocations(locations);
+diff --git a/runtime/src/InputManager.cpp b/runtime/src/InputManager.cpp
+index f34edb0..8d44fa0 100644
+--- a/runtime/src/InputManager.cpp
++++ b/runtime/src/InputManager.cpp
+@@ -813,9 +813,13 @@ bool InputManager::GetButtonClick(Hand hand, const std::string& componentPath) c
+     {
+         return GetTriggerValue(hand) > 0.5f;
+     }
++    // The touch sensors, where the client reports them (the Steam Frame client does, in touchState): an app's
++    // controller hand rests the finger or thumb from these, so a value threshold alone left both lifted.
++    const bool left = hand == Hand::Left;
+     if (componentPath == "trigger/touch")
+     {
+-        return GetTriggerValue(hand) > 0.01f;
++        const uint32_t bit = left ? oxr::protocol::BUTTON_LEFT_TRIGGER : oxr::protocol::BUTTON_RIGHT_TRIGGER;
++        return (touchState_ & bit) != 0 || GetTriggerValue(hand) > 0.01f;
+     }
+     if (componentPath == "squeeze/click")
+     {
+@@ -854,24 +858,27 @@ bool InputManager::GetButtonClick(Hand hand, const std::string& componentPath) c
+     }
+     if (componentPath == "thumbstick/touch" || componentPath == "thumbrest/touch")
+     {
++        const uint32_t bit = left ? oxr::protocol::BUTTON_LEFT_THUMBSTICK : oxr::protocol::BUTTON_RIGHT_THUMBSTICK;
+         XrVector2f thumbstick = GetThumbstickValue(hand);
+-        return std::fabs(thumbstick.x) > 0.01f || std::fabs(thumbstick.y) > 0.01f;
++        return (touchState_ & bit) != 0 || std::fabs(thumbstick.x) > 0.01f || std::fabs(thumbstick.y) > 0.01f;
+     }
++    const bool touch = componentPath.ends_with("/touch");
++    const uint32_t faceBits = buttonState_ | (touch ? touchState_ : 0u);
+     if (componentPath == "a/click" || componentPath == "a/touch")
+     {
+-        return hand == Hand::Right && (buttonState_ & oxr::protocol::BUTTON_A) != 0;
++        return hand == Hand::Right && (faceBits & oxr::protocol::BUTTON_A) != 0;
+     }
+     if (componentPath == "b/click" || componentPath == "b/touch")
+     {
+-        return hand == Hand::Right && (buttonState_ & oxr::protocol::BUTTON_B) != 0;
++        return hand == Hand::Right && (faceBits & oxr::protocol::BUTTON_B) != 0;
+     }
+     if (componentPath == "x/click" || componentPath == "x/touch")
+     {
+-        return hand == Hand::Left && (buttonState_ & oxr::protocol::BUTTON_X) != 0;
++        return hand == Hand::Left && (faceBits & oxr::protocol::BUTTON_X) != 0;
+     }
+     if (componentPath == "y/click" || componentPath == "y/touch")
+     {
+-        return hand == Hand::Left && (buttonState_ & oxr::protocol::BUTTON_Y) != 0;
++        return hand == Hand::Left && (faceBits & oxr::protocol::BUTTON_Y) != 0;
+     }
+     if (componentPath == "pinch_ext/ready_ext" || componentPath == "grasp_ext/ready_ext" ||
+         componentPath == "aim_activate_ext/ready_ext")
+@@ -1000,6 +1007,16 @@ float InputManager::GetFloatComponentForProfile(Hand hand, const std::string& co
+     }
+     if (componentPath == "squeeze/value")
+     {
++        // Fingers resting on the grip's contact sensor (the Steam Frame client reports it in touchState) and not
++        // squeezing: profiles without squeeze/touch (Touch) see a resting curl, which an app's controller hand
++        // (OpenComposite's estimated skeleton) bends the middle, ring and little fingers by. Below every 0.5
++        // click threshold, so a rest never grabs.
++        constexpr float kGripRestCurl = 0.3f;
++        const uint32_t gripBit = hand == Hand::Left ? oxr::protocol::BUTTON_LEFT_GRIP : oxr::protocol::BUTTON_RIGHT_GRIP;
++        if (profilePath != kValveFrameProfile && (touchState_ & gripBit) != 0)
++        {
++            return std::max(GetGrabValue(hand), kGripRestCurl);
++        }
+         return GetGrabValue(hand);
+     }
+     if (componentPath == "thumbstick/x")
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index fc368a9..82502a6 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -1968,5 +1968,22 @@ void Session::CheckStreamingConnection()
+     {
+         inputManager_->SetTrackingReceiver(nullptr);
+         spdlog::info("OXRSys: Client disconnected");
++        clientGone_ = true;
++        clientGoneSince_ = std::chrono::steady_clock::now();
++    }
++    if (streamingServer_->IsClientConnected())
++    {
++        clientGone_ = false;
++    }
++
++    const float goneLimitS = Config::Get().GetValues().exitAppAfterClientGoneS;
++    if (clientGone_ && !lossAnnounced_ && goneLimitS > 0.0f &&
++        std::chrono::steady_clock::now() - clientGoneSince_ >
++            std::chrono::duration<float>(goneLimitS))
++    {
++        spdlog::info("OXRSys: no headset client for {:.0f} s (exit_app_after_client_gone_s); session LOSS_PENDING, the app is asked to quit",
++                     goneLimitS);
++        lossAnnounced_ = true;
++        TransitionState(XR_SESSION_STATE_LOSS_PENDING);
+     }
+ }
+diff --git a/runtime/src/Session.h b/runtime/src/Session.h
+index 8a84eff..856235f 100644
+--- a/runtime/src/Session.h
++++ b/runtime/src/Session.h
+@@ -140,6 +140,10 @@ class Session
+     XrSessionState state_ = XR_SESSION_STATE_IDLE;
+     bool running_ = false;
+     bool exitRequested_ = false;
++    // exit_app_after_client_gone_s: when the streaming client left, and whether the loss has been announced.
++    std::chrono::steady_clock::time_point clientGoneSince_{};
++    bool clientGone_ = false;
++    bool lossAnnounced_ = false;
+     bool frameBegun_ = false;
+     uint32_t waitedFrameCount_ = 0;
+     mutable std::mutex frameStateMutex_;
+diff --git a/tests/TestInputManager.cpp b/tests/TestInputManager.cpp
+index bb455c5..c0d469c 100644
+--- a/tests/TestInputManager.cpp
++++ b/tests/TestInputManager.cpp
+@@ -487,6 +487,47 @@ TEST_CASE("InputManager — a Steam Frame client's controllers report the Frame
+     CHECK(im.GetBooleanComponentForProfile(R, "b/click", kTouch));
+     CHECK(im.GetBooleanComponentForProfile(L, "y/click", kTouch));
+     CHECK_FALSE(im.GetBooleanComponentForProfile(L, "x/click", kTouch));
++    // ... and the Frame's touch sensors: A touched (not pressed) is Touch a/touch, not a/click.
++    CHECK(im.GetBooleanComponentForProfile(R, "a/touch", kTouch));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(R, "a/click", kTouch));
++}
++
++TEST_CASE("InputManager — Touch bindings rest the finger and thumb from the Frame's touch sensors", "[input]")
++{
++    // An app's controller hand (OpenComposite's estimated skeleton in Half-Life: Alyx) lowers the index finger on
++    // trigger/touch and the thumb on thumbstick/touch. A finger resting on an unpulled trigger and a thumb resting on
++    // a centred stick must read as touching, which the trigger value and the stick position alone cannot tell.
++    using namespace oxr::protocol;
++    constexpr const char* kTouch = "/interaction_profiles/oculus/touch_controller";
++    InputManager im;
++    TrackingReceiver receiver;
++    im.SetTrackingReceiver(&receiver);
++    im.SetStreamingClientName("FrameClient");
++    TrackingPacket packet = {};
++    packet.timestampNs = 1'000'000'000;
++    packet.headOrientation[3] = 1.0f;
++    packet.leftControllerRot[3] = 1.0f;
++    packet.rightControllerRot[3] = 1.0f;
++    packet.controllerProfile = CONTROLLER_PROFILE_VALVE_FRAME;
++    packet.trackingFlags = TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE | TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE;
++    packet.touchState = BUTTON_LEFT_TRIGGER | BUTTON_RIGHT_THUMBSTICK | BUTTON_RIGHT_GRIP;
++    receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
++    im.Update(0.0f);
++
++    const auto L = InputManager::Hand::Left;
++    const auto R = InputManager::Hand::Right;
++    CHECK(im.GetBooleanComponentForProfile(L, "trigger/touch", kTouch));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(R, "trigger/touch", kTouch));
++    CHECK(im.GetBooleanComponentForProfile(R, "thumbstick/touch", kTouch));
++    CHECK(im.GetBooleanComponentForProfile(R, "thumbrest/touch", kTouch));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(L, "thumbstick/touch", kTouch));
++    // A hand resting on the grip sensor curls under Touch, below the 0.5 click: it never grabs.
++    CHECK_THAT(im.GetFloatComponentForProfile(R, "squeeze/value", kTouch), WithinAbs(0.3f, 0.001f));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(R, "squeeze/value", kTouch));
++    CHECK_THAT(im.GetFloatComponentForProfile(L, "squeeze/value", kTouch), WithinAbs(0.0f, 0.001f));
++    // A touch is not a press.
++    CHECK_FALSE(im.GetBooleanComponentForProfile(L, "trigger/value", kTouch));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(R, "thumbstick/click", kTouch));
+ }
+ 
+ TEST_CASE("InputManager — OXRSYS_FRAME_XBOX puts each Frame letter on the same Xbox letter under Touch", "[input]")
+-- 
+2.50.1 (Apple Git-155)
+

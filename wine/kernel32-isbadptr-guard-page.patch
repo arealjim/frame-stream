@@ -1,0 +1,12 @@
+--- a/dlls/kernel32/virtual.c
++++ b/dlls/kernel32/virtual.c
+@@ -45,6 +45,9 @@ static LONG WINAPI badptr_handler( EXCEPTION_POINTERS *eptr )
+     EXCEPTION_RECORD *rec = eptr->ExceptionRecord;
+ 
+     if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION) return EXCEPTION_EXECUTE_HANDLER;
++    /* frame-lab (uevr): Windows' IsBad*Ptr report a guard page as bad (the access clears the guard); without this
++     * the fault escapes to the app's unhandled-exception filter. UEVR's offset probes hit one and died (2026-10-25). */
++    if (rec->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) return EXCEPTION_EXECUTE_HANDLER;
+     if (rec->ExceptionCode == STATUS_STACK_OVERFLOW)
+     {
+         /* restore stack guard page */

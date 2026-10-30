@@ -1,0 +1,64 @@
+From 4ec3c3c845a2709ddebe4a2d4074701626ed7332 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 08:56:30 +0000
+Subject: [PATCH] runtime: shared swapchain textures for Wine/DXMT clients,
+ and retry the fallback encoder without low-latency rate control
+
+Under Rosetta the in-process fallback session asked a software HEVC encoder for low-latency rate control, VideoToolbox refused it (-12902), and the native helper never started.
+
+The shared swapchain textures (newSharedTextureWithDescriptor, and a PixelFormatView for the sRGB view) are taken
+from anoshmisiosdev's OXRSys fork (github.com/anoshmisiosdev/oxrsys, branch integration/main), commit 9f468bb, MPL-2.0 like the files it changes.
+---
+ runtime/src/SwapchainMetal.mm | 8 +++++---
+ runtime/src/VideoEncoder.mm   | 2 +-
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/src/SwapchainMetal.mm b/runtime/src/SwapchainMetal.mm
+index e47b3cb..db1b4ac 100644
+--- a/runtime/src/SwapchainMetal.mm
++++ b/runtime/src/SwapchainMetal.mm
+@@ -176,7 +176,7 @@ void Swapchain::InitMetal(void* metalDevice, const XrSwapchainCreateInfo* create
+                                                                                     width:width_
+                                                                                    height:height_
+                                                                                 mipmapped:NO];
+-    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
++    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+     if ((createInfo->usageFlags & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) != 0)
+     {
+         // Lets the application create texture views with a compatible pixel format, such as
+@@ -196,7 +196,9 @@ void Swapchain::InitMetal(void* metalDevice, const XrSwapchainCreateInfo* create
+     bool textureCreationFailed = false;
+     for (uint32_t i = 0; i < imageCount_; i++)
+     {
+-        id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
++        // shared (IOSurface-backed) so a D3D11-over-Metal layer under Wine can adopt it (upstream integration 9f468bb)
++        id<MTLTexture> tex = [device newSharedTextureWithDescriptor:desc];
++        if (tex == nil) tex = [device newTextureWithDescriptor:desc];
+         if (tex == nil)
+         {
+             textureCreationFailed = true;
+@@ -236,7 +238,7 @@ void Swapchain::InitMetalStaging(void* metalDevice)
+                                                                                     width:width_
+                                                                                    height:height_
+                                                                                 mipmapped:NO];
+-    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
++    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+     desc.storageMode = MTLStorageModePrivate;
+     if (arraySize_ > 1)
+     {
+diff --git a/runtime/src/VideoEncoder.mm b/runtime/src/VideoEncoder.mm
+index 18933a5..7c50ea7 100644
+--- a/runtime/src/VideoEncoder.mm
++++ b/runtime/src/VideoEncoder.mm
+@@ -1080,7 +1080,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+         CompressionOutputCallback,
+         nullptr,
+         &compressionSession);
+-    if (status != noErr && hardwareInProcess)
++    if (status != noErr && (hardwareInProcess || lowLatencyRequested))
+     {
+         // The query promised a hardware encoder and the create still refused it.
+         // Retry without the requirement rather than failing the session: a slow
+-- 
+2.50.1 (Apple Git-155)
+

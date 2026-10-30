@@ -1,0 +1,133 @@
+From 25f91a6d949b7db296297f14e7c865465461269f Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 18:41:19 +0000
+Subject: [PATCH 52/52] runtime: tag a frame with the pose its projection layer
+ was rendered for
+
+CyberpunkVRPort submits 90 frames a second but draws only ~48 new poses: the
+rest give back an image drawn for an earlier xrLocateViews under a newer
+displayTime. Tagged by displayTime, those frames were warped on the headset
+as if drawn ~12 ms later, so on every head turn the picture stepped back and
+forth (ghosting) while it looked right with the head still.
+
+The pose an image was rendered for is the projection layer's submitted view
+pose. Each located pose now keeps the left-eye view pose handed to the app.
+At xrEndFrame the head pose for the tag is that locate's head pose, moved by
+the change from the handed-out eye pose to the submitted one (in the layer's
+space, made STAGE-absolute). A frame drawn for its own displayTime is tagged
+as before; a VIEW-space layer is left alone. The log reports how many frames
+the submitted pose left unmoved and the mean and max change.
+
+Worn on the Steam Frame: head-turn ghosting in CyberpunkVRPort is gone. While
+turning, the tag moved by a mean of 1.2-2.7 degrees; with the head still
+about 60 % of frames are unmoved.
+---
+ runtime/src/Session.cpp | 43 ++++++++++++++++++++++++++++++++++++-----
+ runtime/src/Session.h   |  7 +++++--
+ 2 files changed, 43 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index 9e3727e..fc368a9 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -914,12 +914,42 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
+                 std::lock_guard<std::mutex> lock(locatedPoseMutex_);
+                 bool found = false;
+                 XrTime newestLocated = 0;
++                const LocatedPose* own = nullptr;
+                 for (const auto& lp : locatedPoses_)
+                 {
+-                    if (lp.displayTime == frameEndInfo->displayTime) { tagPose = lp.pose; found = true; }
++                    if (lp.displayTime == frameEndInfo->displayTime) { tagPose = lp.pose; found = true; own = &lp; }
+                     if (lp.displayTime > newestLocated) newestLocated = lp.displayTime;
+                 }
+                 if (found) tagExact_++; else tagFallback_++;
++                // The pixels were rendered for the eye pose the app submitted, not necessarily for the locate
++                // that shares the frame's displayTime: an app that re-submits an image drawn earlier
++                // (CyberpunkVRPort draws ~48 new poses for 90 submits) submits that earlier pose. Carry the
++                // submitted left-eye pose onto the head through the eye-in-head offset of this frame's locate:
++                // head' = eye' * eye^-1 * head, all STAGE-absolute.
++                if (own && projectionLayerIndex != UINT32_MAX)
++                {
++                    const auto& projection = *reinterpret_cast<const XrCompositionLayerProjection*>(
++                        frameEndInfo->layers[projectionLayerIndex]);
++                    auto* layerSpace = Runtime::Get().FromHandle<Space>(reinterpret_cast<uint64_t>(projection.space));
++                    // a VIEW-space layer moves with the head now, not as it was when the frame was drawn
++                    if (layerSpace != nullptr && !(layerSpace->GetType() == Space::Type::Reference &&
++                                                   layerSpace->GetReferenceSpaceType() == XR_REFERENCE_SPACE_TYPE_VIEW))
++                    {
++                        const XrPosef layerWorld = ReferenceSpaceWorldPose(layerSpace, *inputManager_);
++                        const glm::quat lq = ToGlmQuat(layerWorld.orientation);
++                        const glm::quat sq = lq * ToGlmQuat(projection.views[0].pose.orientation);
++                        const glm::vec3 sp = ToGlmVec(layerWorld.position) + lq * ToGlmVec(projection.views[0].pose.position);
++                        const glm::quat delta = sq * glm::inverse(ToGlmQuat(own->eye0.orientation));
++                        const glm::quat hq = glm::normalize(delta * ToGlmQuat(own->pose.orientation));
++                        const glm::vec3 hp = sp + delta * (ToGlmVec(own->pose.position) - ToGlmVec(own->eye0.position));
++                        const float dot = std::min(1.0f, std::fabs(glm::dot(hq, ToGlmQuat(own->pose.orientation))));
++                        const double deg = glm::degrees(2.0f * std::acos(dot));
++                        tagSubmittedDegSum_ += deg; tagSubmittedDegMax_ = std::max(tagSubmittedDegMax_, deg); tagSubmitted_++;
++                        if (deg < 0.01) tagSubmittedStill_++;
++                        tagPose.orientation = ToXrQuat(hq);
++                        tagPose.position = ToXrVec(hp);
++                    }
++                }
+                 if (newestLocated > frameEndInfo->displayTime)
+                 {
+                     tagLastWasNewer_++;
+@@ -928,10 +958,12 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
+                 const auto now = std::chrono::steady_clock::now();
+                 if (now - tagStatsLogged_ >= std::chrono::seconds(5))
+                 {
+-                    spdlog::info("OXRSys: render-pose tag: {} frames tagged by their own displayTime, {} fell back to the last locate; the last locate was NEWER than the submitted frame on {} (mean {:.1f} ms)",
++                    spdlog::info("OXRSys: render-pose tag: {} frames tagged by their own displayTime, {} fell back to the last locate; the last locate was NEWER than the submitted frame on {} (mean {:.1f} ms); {} tagged from the submitted eye pose ({} of them unmoved, under 0.01 deg), which moved the head pose by mean {:.3f} deg, max {:.3f} deg",
+                                  tagExact_, tagFallback_, tagLastWasNewer_,
+-                                 tagLastWasNewer_ ? tagLastNewerMsSum_ / tagLastWasNewer_ : 0.0);
+-                    tagExact_ = tagFallback_ = tagLastWasNewer_ = 0; tagLastNewerMsSum_ = 0.0; tagStatsLogged_ = now;
++                                 tagLastWasNewer_ ? tagLastNewerMsSum_ / tagLastWasNewer_ : 0.0, tagSubmitted_, tagSubmittedStill_,
++                                 tagSubmitted_ ? tagSubmittedDegSum_ / tagSubmitted_ : 0.0, tagSubmittedDegMax_);
++                    tagExact_ = tagFallback_ = tagLastWasNewer_ = tagSubmitted_ = tagSubmittedStill_ = 0; tagLastNewerMsSum_ = 0.0;
++                    tagSubmittedDegSum_ = tagSubmittedDegMax_ = 0.0; tagStatsLogged_ = now;
+                 }
+             }
+             const float renderHeadOrientation[4] = {
+@@ -1645,6 +1677,7 @@ XrResult Session::LocateViews(const XrViewLocateInfo* viewLocateInfo, XrViewStat
+     // offset never reached the rendered image. For a STAGE base with the default
+     // zero offset the transform is identity, so STAGE behaviour is unchanged.
+     inputManager_->GetEyeViews(views, 2);
++    const XrPosef worldEye0 = views[0].pose;
+ 
+     // Express the STAGE-absolute eye poses relative to the requested base space
+     // (identity for a STAGE base at the default zero offset).
+@@ -1665,7 +1698,7 @@ XrResult Session::LocateViews(const XrViewLocateInfo* viewLocateInfo, XrViewStat
+     lastRenderHasPose_ = true;
+     {
+         std::lock_guard<std::mutex> lock(locatedPoseMutex_);
+-        locatedPoses_[locatedPoseNext_] = {viewLocateInfo->displayTime, lastRenderHeadPose_};
++        locatedPoses_[locatedPoseNext_] = {viewLocateInfo->displayTime, lastRenderHeadPose_, worldEye0};
+         locatedPoseNext_ = (locatedPoseNext_ + 1) % locatedPoses_.size();
+     }
+ 
+diff --git a/runtime/src/Session.h b/runtime/src/Session.h
+index 279ad70..8a84eff 100644
+--- a/runtime/src/Session.h
++++ b/runtime/src/Session.h
+@@ -160,14 +160,17 @@ class Session
+     // consistent 13.5 ms rotational lag of the layer behind the overlays, r -0.80). Each located pose is
+     // kept with its displayTime and EndFrame picks the one for ITS displayTime; the stats say how often
+     // the old rule would have been wrong and by how much.
+-    struct LocatedPose { XrTime displayTime = 0; XrPosef pose = {{0, 0, 0, 1}, {0, 0, 0}}; };
++    // eye0 is the left eye's STAGE-absolute pose from the same locate (2026-10-29): with it, the eye pose an
++    // app submits carries over to the head pose the frame is tagged with (see EndFrame).
++    struct LocatedPose { XrTime displayTime = 0; XrPosef pose = {{0, 0, 0, 1}, {0, 0, 0}}; XrPosef eye0 = {{0, 0, 0, 1}, {0, 0, 0}}; };
+     // 64 entries (16 before 2026-10-21): an app that locates several times a frame, or runs
+     // ahead by more than a few frames, evicted the pose for a frame still to be submitted.
+     std::array<LocatedPose, 64> locatedPoses_ = {};
+     size_t locatedPoseNext_ = 0;
+     std::mutex locatedPoseMutex_;
+     uint32_t tagExact_ = 0, tagFallback_ = 0, tagLastWasNewer_ = 0;
+-    double tagLastNewerMsSum_ = 0.0;
++    double tagLastNewerMsSum_ = 0.0, tagSubmittedDegSum_ = 0.0, tagSubmittedDegMax_ = 0.0;
++    uint32_t tagSubmitted_ = 0, tagSubmittedStill_ = 0;
+     std::chrono::steady_clock::time_point tagStatsLogged_ = std::chrono::steady_clock::now();
+     std::vector<std::unique_ptr<Swapchain>> swapchains_;
+     mutable std::mutex swapchainsMutex_;

@@ -1,0 +1,210 @@
+From 84310a1653c1481d0e618bed78bfdfd717b71d4b Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 23:33:29 +0000
+Subject: [PATCH] steam-frame client: keep asking for a keyframe until one
+ lands - lost requests froze the stream 1-2 s
+
+The keyframe request was rate-limited to one per 500 ms, and the flag was taken from the receiver
+before the limit was checked, so a frame abandoned inside that window (typically the IDR that the
+last request produced, damaged on the same lossy patch) was never asked for again. The assembler then
+discards everything until a keyframe, and the only one coming was the periodic IDR (2 s): the
+1.0-2.0 s freezes in a 2026-10-24 Unity wear, where packets kept arriving for 1.4 s with nothing
+shown (23:15:04.6-06.0).
+
+Now: the need stays pending across the limit; NetworkReceiver tracks "awaiting a keyframe" from an
+abandon until a keyframe's picture slice is delivered (not its VPS/SPS/PPS), and the client re-asks
+every FRAME_CLIENT_KEYFRAME_RETRY_MS (default 120) while it holds. The hidden loop asks too, so an
+unworn stream is fresh when the headset goes on.
+
+Off-head, same lossy link, Unity unity-room on the Mac, 8 s windows: old binary 5 of 8 windows at
+67-77 % would-be repaints; new binary worst windows 15-18 %, request -> keyframe delivered 22-64 ms.
+---
+ clients/steam-frame/src/NetworkReceiver.cpp   | 20 +++++++
+ clients/steam-frame/src/NetworkReceiver.h     |  5 ++
+ clients/steam-frame/src/main.cpp              | 59 +++++++++++++------
+ clients/steam-frame/src/stream_connection.cpp |  5 ++
+ clients/steam-frame/src/stream_connection.h   |  1 +
+ 5 files changed, 73 insertions(+), 17 deletions(-)
+
+diff --git a/clients/steam-frame/src/NetworkReceiver.cpp b/clients/steam-frame/src/NetworkReceiver.cpp
+index dd50bc4..44d650b 100644
+--- a/clients/steam-frame/src/NetworkReceiver.cpp
++++ b/clients/steam-frame/src/NetworkReceiver.cpp
+@@ -283,12 +283,31 @@ bool NetworkReceiver::StartReceiving(const char* serverIp, uint16_t videoPort,
+     return true;
+ }
+ 
++// A keyframe is VPS/SPS/PPS NALs then the IDR slice, all flagged VIDEO_FLAG_KEYFRAME; only the slice
++// ends the wait for one (its parameter sets can arrive while the slice itself is lost). AV1 and
++// anything unparsable count as a picture.
++static bool IsPictureNal(const uint8_t* data, size_t size, uint8_t codec)
++{
++    size_t i = 0;
++    while (i + 3 < size && data[i] == 0) i++;
++    if (i < 2 || i + 1 >= size || data[i] != 1) return true;
++    const uint8_t b = data[i + 1];
++    if (codec == static_cast<uint8_t>(protocol::VideoCodec::H265)) return ((b >> 1) & 0x3f) < 32;
++    if (codec == static_cast<uint8_t>(protocol::VideoCodec::H264)) { const int t = b & 0x1f; return t >= 1 && t <= 5; }
++    return true;
++}
++
+ void NetworkReceiver::WireAssemblerCallbacks()
+ {
+     assembler_.SetOnFrame([this](const streaming::VideoFrameAssembler::Frame& frame) {
+         uint32_t delivered = framesDelivered_.fetch_add(1) + 1;
+         int64_t receiveTimeNs = SteadyClockNowNs();
+         lastCompletedFrameReceiveTimeNs_.store(receiveTimeNs);
++        if ((frame.flags & protocol::VIDEO_FLAG_KEYFRAME) && IsPictureNal(frame.data, frame.size, frame.codec) &&
++            awaitingKeyframe_.exchange(false))
++        {
++            LOGI("Frame %u: keyframe delivered, discard over", frame.frameIndex);
++        }
+         if (delivered <= 5 || delivered % 300 == 0)
+         {
+             LOGI("Frame %u complete: %u packets, %zu bytes total",
+@@ -319,6 +338,7 @@ void NetworkReceiver::WireAssemblerCallbacks()
+         [this](const streaming::VideoFrameAssembler::AbandonedFrame& frame) {
+             // The retransmit wait ran out (or three newer frames arrived): keyframe.
+             needKeyframe_.store(true);
++            awaitingKeyframe_.store(true);
+             uint32_t dropped = framesDropped_.fetch_add(1) + 1;
+             if (dropped <= 5 || dropped % 100 == 0)
+             {
+diff --git a/clients/steam-frame/src/NetworkReceiver.h b/clients/steam-frame/src/NetworkReceiver.h
+index 9524661..ccd1e6b 100644
+--- a/clients/steam-frame/src/NetworkReceiver.h
++++ b/clients/steam-frame/src/NetworkReceiver.h
+@@ -76,6 +76,10 @@ class NetworkReceiver
+     // Set when a frame is abandoned (packets lost past FEC); the caller asks the server for an
+     // IDR so the GOP does not stay corrupted until the next scheduled keyframe.
+     bool TakeNeedKeyframe() { return needKeyframe_.exchange(false); }
++    // True from an abandon until a keyframe NAL is delivered: the assembler is discarding, so
++    // nothing new reaches the screen. A keyframe lost whole raises no second abandon, so the
++    // caller re-asks while this holds (2026-10-24: 1-2 s freezes waiting for the periodic IDR).
++    bool AwaitingKeyframe() const { return awaitingKeyframe_.load(); }
+     uint32_t GetFecRecoveries() const { return fecRecoveries_.load(); }
+ 
+     // Render pose from the server (set when VIDEO_FLAG_RENDER_POSE packets arrive)
+@@ -149,6 +153,7 @@ class NetworkReceiver
+     std::atomic<uint32_t> framesDelivered_{0};
+     std::atomic<uint32_t> framesDropped_{0};
+     std::atomic<bool> needKeyframe_{false};
++    std::atomic<bool> awaitingKeyframe_{false};
+     std::atomic<uint32_t> fecRecoveries_{0};
+     std::atomic<uint32_t> nacksSent_{0};
+     std::atomic<int64_t> lastCompletedFrameReceiveTimeNs_{0};
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index c6654ae..0e07edd 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -892,6 +892,46 @@ struct HiddenStats {
+     std::chrono::steady_clock::time_point t0{};
+ };
+ static HiddenStats g_hidden;
++// On a decode error or a lost frame, ask for a keyframe. Called from the render path and the hidden
++// loop alike (2026-10-24: the hidden loop never asked, so an unworn stream sat frozen until the
++// periodic IDR and a wearer put it on to a stale picture).
++static void RequestKeyframeIfNeeded()
++{
++    // On a decode error or a lost frame, ask for a keyframe, at most one per
++    // FRAME_CLIENT_KEYFRAME_RETRY_MS (default 120: rtt ~5 + encode ~12 + send, with
++    // margin, so a healthy IDR lands before the next ask). A need that meets the limit
++    // stays pending; until 2026-10-24 the flag was taken and dropped there, and while the
++    // assembler discards (AwaitingKeyframe) we ask again each interval: a damaged or
++    // whole-lost IDR used to leave the screen frozen until the periodic one, 1-2 s.
++    static bool pendingDecoderKeyframe = false;
++    static bool pendingNetworkKeyframe = false;
++    static const int keyframeRetryMs = [] {
++        const char* e = getenv("FRAME_CLIENT_KEYFRAME_RETRY_MS");
++        const int v = e ? atoi(e) : 120;
++        return v > 0 ? v : 120;
++    }();
++    pendingDecoderKeyframe |= g_decoder.TakeNeedKeyframe();
++    pendingNetworkKeyframe |= g_stream.TakeNetworkNeedKeyframe();
++    const bool awaitingKeyframe = g_stream.NetworkAwaitingKeyframe();
++    if (pendingDecoderKeyframe || pendingNetworkKeyframe || awaitingKeyframe) {
++        static auto lastReq = std::chrono::steady_clock::time_point{};
++        auto now = std::chrono::steady_clock::now();
++        if (now - lastReq >= std::chrono::milliseconds(keyframeRetryMs)) {
++            const bool network = pendingNetworkKeyframe || awaitingKeyframe;
++            g_stream.SendKeyframeRequest(
++                network ? oxr::protocol::KEYFRAME_REASON_FRAME_LOSS
++                        : oxr::protocol::KEYFRAME_REASON_DECODE_STALL,
++                network ? g_stream.FramesDropped() : 0);
++            lastReq = now;
++            LOG_INFO("%s — requested keyframe", pendingNetworkKeyframe ? "frame lost"
++                                               : awaitingKeyframe ? "still discarding"
++                                               : "decode error");
++            pendingDecoderKeyframe = false;
++            pendingNetworkKeyframe = false;
++        }
++    }
++}
++
+ // Receive time of the frame the hidden loop currently holds (survives the 10 s stats reset).
+ static std::chrono::steady_clock::time_point g_hiddenHeldReceivedAt{};
+ static std::vector<uint8_t> g_hiddenTakeBuf;
+@@ -1629,6 +1669,7 @@ static void RenderFrame(App& app)
+                 havePrev = true;
+                 g_stream.SendTrackingPacket(pkt);
+             }
++            if (g_streamMode) RequestKeyframeIfNeeded();
+             static bool said = false;
+             if (!said) {
+                 LOG_INFO("session hidden by the runtime; sending tracking as keepalive (valid poses only)");
+@@ -1753,23 +1794,7 @@ static void RenderFrame(App& app)
+                 g_xrInput.Update(fs.predictedDisplayTime, pkt);
+                 g_stream.SendTrackingPacket(pkt);
+ 
+-                // On a decode error (lost reference frame), ask for a keyframe —
+-                // rate-limited to at most ~2/s so an error burst doesn't flood
+-                // the server before the fresh IDR arrives.
+-                const bool decoderNeedsKeyframe = g_decoder.TakeNeedKeyframe();
+-                const bool networkNeedsKeyframe = g_stream.TakeNetworkNeedKeyframe();
+-                if (decoderNeedsKeyframe || networkNeedsKeyframe) {
+-                    static auto lastReq = std::chrono::steady_clock::time_point{};
+-                    auto now = std::chrono::steady_clock::now();
+-                    if (now - lastReq >= std::chrono::milliseconds(500)) {
+-                        g_stream.SendKeyframeRequest(
+-                            networkNeedsKeyframe ? oxr::protocol::KEYFRAME_REASON_FRAME_LOSS
+-                                                 : oxr::protocol::KEYFRAME_REASON_DECODE_STALL,
+-                            networkNeedsKeyframe ? g_stream.FramesDropped() : 0);
+-                        lastReq = now;
+-                        LOG_INFO("%s — requested keyframe", networkNeedsKeyframe ? "frame lost" : "decode error");
+-                    }
+-                }
++                RequestKeyframeIfNeeded();
+ 
+                 static int ic = 0;
+                 if (ic++ % 120 == 0) {
+diff --git a/clients/steam-frame/src/stream_connection.cpp b/clients/steam-frame/src/stream_connection.cpp
+index 91b8d55..13f1a3b 100644
+--- a/clients/steam-frame/src/stream_connection.cpp
++++ b/clients/steam-frame/src/stream_connection.cpp
+@@ -320,6 +320,11 @@ bool StreamConnection::TakeNetworkNeedKeyframe()
+     return connected_ && net_ && net_->TakeNeedKeyframe();
+ }
+ 
++bool StreamConnection::NetworkAwaitingKeyframe() const
++{
++    return connected_ && net_ && net_->AwaitingKeyframe();
++}
++
+ uint32_t StreamConnection::FramesDropped() const
+ {
+     return net_ ? net_->GetFramesDropped() : 0;
+diff --git a/clients/steam-frame/src/stream_connection.h b/clients/steam-frame/src/stream_connection.h
+index 7aa5f38..7a92503 100644
+--- a/clients/steam-frame/src/stream_connection.h
++++ b/clients/steam-frame/src/stream_connection.h
+@@ -80,6 +80,7 @@ class StreamConnection {
+     void SendKeyframeRequest(uint32_t reasonFlags, uint32_t detail);
+     // True once after the receiver abandoned a frame (lost packets); request an IDR.
+     bool TakeNetworkNeedKeyframe();
++    bool NetworkAwaitingKeyframe() const;
+     uint32_t FramesDropped() const;
+ 
+     bool Connected() const { return connected_; }
+-- 
+2.44.0
+

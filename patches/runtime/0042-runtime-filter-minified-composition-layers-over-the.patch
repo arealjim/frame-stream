@@ -1,0 +1,329 @@
+From 352a706d7d234eda2a2a17ee01081b4833799514 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:32:57 +0000
+Subject: [PATCH] runtime: filter minified composition layers over the pixel
+ footprint
+
+A quad or cylinder layer drawn smaller than its image took one bilinear tap
+per pixel, so it skipped texels: small text broke into fragments and
+shimmered as the head moved. The overlay fragment shader now averages a grid
+of bilinear taps over the pixel's footprint in the image (a box filter, what
+a mip chain approximates, with no mips to build for each new swapchain
+snapshot). Magnified and 1:1 pixels still take one tap. Taps are clamped to
+the layer's sub-image, so a layer cut from an atlas no longer bleeds its
+neighbour at the edge.
+
+OXRSYS_OVERLAY_MINIFY_TAPS caps the taps per axis (default 8, 1 = the
+previous single tap).
+
+Tests: a 1-texel checker minified 3.66x comes out mid grey (worst 1/255 off;
+the single tap was 120 off), and a one-texel sub-image of a 2-texel atlas
+stays pure at its edge (the single tap took g=124 of the neighbour). Both
+fail with OXRSYS_OVERLAY_MINIFY_TAPS=1. Hidden cases: [.overlay-bench] for
+GPU time, [.overlay-dump] to write an eye for a look.
+---
+ runtime/src/OverlayCompositor.mm |  45 +++++++-
+ tests/TestOverlayCompositor.mm   | 191 +++++++++++++++++++++++++++++++
+ 2 files changed, 235 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/OverlayCompositor.mm b/runtime/src/OverlayCompositor.mm
+index 32a2b91..628bd37 100644
+--- a/runtime/src/OverlayCompositor.mm
++++ b/runtime/src/OverlayCompositor.mm
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ 
+ namespace oxrsys::video
+@@ -26,7 +27,10 @@ struct OverlayUniforms
+     uint32_t columns;     // tessellation across s
+     uint32_t colorMode;   // 0 none, 1 decode sRGB -> linear, 2 encode linear -> sRGB
+     uint32_t alphaMode;   // 0 opaque, 1 premultiplied, 2 unpremultiplied
++    uint32_t minifyTaps;  // most bilinear taps per screen axis over a minified pixel's footprint; 1 = one tap
++    uint32_t pad[3];      // the shader's struct rounds up to 16 bytes
+ };
++static_assert(sizeof(OverlayUniforms) == 128, "OverlayUniforms must match the shader's layout");
+ 
+ const char* kOverlayShaderSource = R"METAL(
+ #include <metal_stdlib>
+@@ -41,6 +45,7 @@ struct OverlayUniforms
+     uint columns;
+     uint colorMode;
+     uint alphaMode;
++    uint minifyTaps;
+ };
+ 
+ struct OverlayVertexOut
+@@ -95,7 +100,29 @@ fragment float4 overlay_fragment(OverlayVertexOut in [[stage_in]],
+                                  sampler imageSampler [[sampler(0)]],
+                                  constant OverlayUniforms& u [[buffer(0)]])
+ {
+-    float4 c = image.sample(imageSampler, in.uv);
++    // A panel drawn smaller than its image skips texels with one bilinear tap per pixel, so its text shimmers
++    // as the head moves. Average a grid of taps over the pixel's footprint in the image instead (a box filter,
++    // what a mip chain approximates, without building mips for every new swapchain snapshot). Magnified and
++    // 1:1 pixels take one tap, as before. Taps stay inside the layer's sub-image so an atlas does not bleed.
++    const float2 texels = float2(image.get_width(), image.get_height());
++    const float2 du = dfdx(in.uv);
++    const float2 dv = dfdy(in.uv);
++    const float maxTaps = float(max(u.minifyTaps, 1u));
++    const uint nx = uint(clamp(ceil(length(du * texels) - 0.001), 1.0, maxTaps));
++    const uint ny = uint(clamp(ceil(length(dv * texels) - 0.001), 1.0, maxTaps));
++    const float2 lo = u.uvRect.xy + 0.5 / texels;
++    const float2 hi = max(lo, u.uvRect.xy + u.uvRect.zw - 0.5 / texels);
++    float4 c = float4(0.0);
++    for (uint j = 0; j < ny; ++j)
++    {
++        for (uint i = 0; i < nx; ++i)
++        {
++            const float2 offset = du * ((float(i) + 0.5) / float(nx) - 0.5) +
++                                  dv * ((float(j) + 0.5) / float(ny) - 0.5);
++            c += image.sample(imageSampler, clamp(in.uv + offset, lo, hi));
++        }
++    }
++    c /= float(nx * ny);
+     if (u.alphaMode == 0)
+     {
+         c.a = 1.0;
+@@ -140,6 +167,21 @@ bool SamplesAsLinear(MTLPixelFormat format)
+     }
+ }
+ 
++// OXRSYS_OVERLAY_MINIFY_TAPS=<1..16> caps the minification filter's taps per axis; 1 turns it off
++// (one bilinear tap, the 0031 behaviour). Default 8: up to 8x minification is fully filtered.
++uint32_t MinifyTaps()
++{
++    static const uint32_t taps = [] {
++        const char* value = std::getenv("OXRSYS_OVERLAY_MINIFY_TAPS");
++        const int parsed = value != nullptr ? std::atoi(value) : 8;
++        const uint32_t clamped = static_cast<uint32_t>(std::clamp(parsed, 1, 16));
++        spdlog::info("OverlayCompositor: minified layers average up to {}x{} taps per pixel{}", clamped, clamped,
++                     value != nullptr ? " (OXRSYS_OVERLAY_MINIFY_TAPS)" : "");
++        return clamped;
++    }();
++    return taps;
++}
++
+ uint32_t CylinderColumns(float centralAngle)
+ {
+     // About 2.8 degrees per column: under a pixel of sagitta for any radius we draw.
+@@ -348,6 +390,7 @@ int OverlayCompositor::Draw(void* commandBufferHandle, void* targetHandle, uint3
+         const bool imageIsLinear = SamplesAsLinear(image.pixelFormat);
+         u.colorMode = imageIsLinear == targetIsLinear ? 0u : (targetIsLinear ? 1u : 2u);
+         u.alphaMode = !overlay.sourceAlpha ? 0u : (overlay.unpremultipliedAlpha ? 2u : 1u);
++        u.minifyTaps = MinifyTaps();
+ 
+         [encoder setVertexBytes:&u length:sizeof(u) atIndex:0];
+         [encoder setFragmentBytes:&u length:sizeof(u) atIndex:0];
+diff --git a/tests/TestOverlayCompositor.mm b/tests/TestOverlayCompositor.mm
+index 003a212..a71e2bb 100644
+--- a/tests/TestOverlayCompositor.mm
++++ b/tests/TestOverlayCompositor.mm
+@@ -7,6 +7,7 @@
+ 
+ #import <Metal/Metal.h>
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <cstring>
+ #include <vector>
+@@ -243,3 +244,193 @@ TEST_CASE("A cylinder spans its central angle around the viewer", "[overlay][met
+         [queue release];
+     }
+ }
++
++TEST_CASE("A minified panel averages its texels instead of skipping them", "[overlay][metal]")
++{
++    @autoreleasepool
++    {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        OverlayCompositor compositor;
++        const XrFovf fov = {-kPi / 4, kPi / 4, kPi / 4, -kPi / 4};
++        id<MTLTexture> eye = MakeTexture(device, MTLPixelFormatBGRA8Unorm, kEye, kEye,
++                                         std::vector<Bgra>(kEye * kEye, Bgra{0, 0, 0, 255}));
++
++        // A 256 x 256 checkerboard of single black and white texels: the finest detail an image can hold,
++        // what small text is made of. Box-filtered over any footprint of a few texels it is mid grey.
++        constexpr uint32_t kChecker = 256;
++        std::vector<Bgra> checker(kChecker * kChecker);
++        for (uint32_t y = 0; y < kChecker; ++y)
++        {
++            for (uint32_t x = 0; x < kChecker; ++x)
++            {
++                const uint8_t v = ((x + y) & 1) != 0 ? 255 : 0;
++                checker[y * kChecker + x] = Bgra{v, v, v, 255};
++            }
++        }
++        id<MTLTexture> image = MakeTexture(device, MTLPixelFormatBGRA8Unorm, kChecker, kChecker, checker);
++
++        // 1.4 m at 2 m under a 45 degree half-fov spans NDC +-0.35: 70 pixels for 256 texels, 3.66x
++        // minified, so one tap per pixel lands at a different phase of the checker in each pixel.
++        FrameOverlayLayer quad = Overlay(image, fov, At(0, 0, -2));
++        quad.width = quad.height = 1.4f;
++        Draw(queue, compositor, eye, {quad}, 1);
++
++        int worst = 0;
++        long sum = 0;
++        int count = 0;
++        for (uint32_t y = 70; y <= 130; ++y)
++        {
++            for (uint32_t x = 70; x <= 130; ++x)
++            {
++                const int g = ReadPixel(eye, x, y).g;
++                worst = std::max(worst, std::abs(g - 128));
++                sum += g;
++                ++count;
++            }
++        }
++        INFO("worst deviation from mid grey " << worst << ", mean " << double(sum) / count);
++        CHECK(worst <= 20);
++        CHECK(std::abs(double(sum) / count - 127.5) <= 6.0);
++
++        [eye release];
++        [image release];
++        [queue release];
++    }
++}
++
++TEST_CASE("A layer's sub-image does not bleed its neighbour in the atlas", "[overlay][metal]")
++{
++    @autoreleasepool
++    {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        OverlayCompositor compositor;
++        const XrFovf fov = {-kPi / 4, kPi / 4, kPi / 4, -kPi / 4};
++        id<MTLTexture> eye = MakeTexture(device, MTLPixelFormatBGRA8Unorm, kEye, kEye,
++                                         std::vector<Bgra>(kEye * kEye, Bgra{0, 0, 0, 255}));
++        // 2 x 1 atlas: red | green. The layer shows only the red texel.
++        id<MTLTexture> atlas = MakeTexture(device, MTLPixelFormatBGRA8Unorm, 2, 1,
++                                           {Bgra{0, 0, 255, 255}, Bgra{0, 255, 0, 255}});
++        FrameOverlayLayer quad = Overlay(atlas, fov, At(0, 0, -2));
++        quad.width = quad.height = 2.0f;
++        quad.image.sourceX = 0;
++        quad.image.sourceY = 0;
++        quad.image.sourceWidth = 1;
++        quad.image.sourceHeight = 1;
++        Draw(queue, compositor, eye, {quad}, 1);
++
++        // Near the quad's right edge (pixels 50..150) the sample sits at the red texel's edge; a bilinear
++        // tap there would take about half of the green neighbour.
++        for (uint32_t x : {100u, 140u, 148u})
++        {
++            const Bgra p = ReadPixel(eye, x, 100);
++            INFO("x " << x << ": r " << int(p.r) << " g " << int(p.g));
++            CHECK(p.r > 245);
++            CHECK(p.g < 10);
++        }
++
++        [eye release];
++        [atlas release];
++        [queue release];
++    }
++}
++
++// GPU cost of the overlay pass on a Frame-sized eye, not run by default:
++//   oxrsys_videotoolbox_encoder_tests "[.overlay-bench]" -s
++// with OXRSYS_OVERLAY_MINIFY_TAPS=1 for the one-tap baseline.
++TEST_CASE("Overlay pass GPU time on a Frame-sized eye", "[.overlay-bench]")
++{
++    @autoreleasepool
++    {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        OverlayCompositor compositor;
++        constexpr uint32_t kFrameEye = 2048;
++        const XrFovf fov = {-kPi / 4, kPi / 4, kPi / 4, -kPi / 4};
++        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
++                                                                                     width:kFrameEye
++                                                                                    height:kFrameEye
++                                                                                 mipmapped:NO];
++        d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
++        d.storageMode = MTLStorageModePrivate;
++        id<MTLTexture> eye = [device newTextureWithDescriptor:d];
++        d.width = 2048;
++        d.height = 1024;
++        id<MTLTexture> panel = [device newTextureWithDescriptor:d];
++
++        // Width at 2 m, and the minification it gives a 2048-texel image on this 2048-pixel eye (NDC 2 m per 4 m):
++        // 3.6 m -> 0.9 of the eye, 1.1x; 1.0 m -> 512 px, 4x; 0.25 m -> 128 px, 16x (capped).
++        for (float width : {3.6f, 1.0f, 0.25f})
++        {
++            FrameOverlayLayer quad = Overlay(panel, fov, At(0, 0, -2));
++            quad.width = width;
++            quad.height = width / 2.0f;
++            quad.sourceAlpha = true;
++            std::vector<double> ms;
++            for (int i = 0; i < 300; ++i)
++            {
++                id<MTLCommandBuffer> cb = [queue commandBuffer];
++                compositor.Draw((void*)cb, (void*)eye, 0, {quad});
++                [cb commit];
++                [cb waitUntilCompleted];
++                if (i >= 20)
++                {
++                    ms.push_back((cb.GPUEndTime - cb.GPUStartTime) * 1000.0);
++                }
++            }
++            std::sort(ms.begin(), ms.end());
++            printf("overlay bench: quad %.2f m (%.0f px wide), GPU p50 %.3f ms p95 %.3f ms\n", width,
++                   width / 4.0f * kFrameEye, ms[ms.size() / 2], ms[ms.size() * 95 / 100]);
++        }
++        [eye release];
++        [panel release];
++        [queue release];
++    }
++}
++
++// Writes one eye with a text panel for a by-eye look at minification, not run by default:
++//   OVERLAY_DUMP_IMAGE=<2048x1024 BGRA raw> OVERLAY_DUMP_OUT=<file> OVERLAY_DUMP_SHIFT_PX=<sub-pixel shift>
++//   oxrsys_videotoolbox_encoder_tests "[.overlay-dump]"
++TEST_CASE("Dump a minified text panel", "[.overlay-dump]")
++{
++    @autoreleasepool
++    {
++        const char* in = std::getenv("OVERLAY_DUMP_IMAGE");
++        const char* out = std::getenv("OVERLAY_DUMP_OUT");
++        REQUIRE(in != nullptr);
++        REQUIRE(out != nullptr);
++        const float shiftPx = std::getenv("OVERLAY_DUMP_SHIFT_PX") ? std::atof(std::getenv("OVERLAY_DUMP_SHIFT_PX")) : 0.0f;
++        constexpr uint32_t kW = 2048, kH = 1024, kDumpEye = 1024;
++        std::vector<Bgra> pixels(kW * kH);
++        FILE* f = std::fopen(in, "rb");
++        REQUIRE(f != nullptr);
++        REQUIRE(std::fread(pixels.data(), 4, pixels.size(), f) == pixels.size());
++        std::fclose(f);
++
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        OverlayCompositor compositor;
++        const XrFovf fov = {-kPi / 4, kPi / 4, kPi / 4, -kPi / 4};
++        id<MTLTexture> eye = MakeTexture(device, MTLPixelFormatBGRA8Unorm, kDumpEye, kDumpEye,
++                                         std::vector<Bgra>(kDumpEye * kDumpEye, Bgra{40, 90, 40, 255}));
++        id<MTLTexture> image = MakeTexture(device, MTLPixelFormatBGRA8Unorm, kW, kH, pixels);
++        // 1.4 m at 2 m: 358 px for 2048 texels, 5.7x minified; shifted right by shiftPx eye pixels.
++        const float metresPerPixel = 4.0f / kDumpEye;
++        FrameOverlayLayer quad = Overlay(image, fov, At(shiftPx * metresPerPixel, 0, -2));
++        quad.width = 1.4f;
++        quad.height = 0.7f;
++        quad.sourceAlpha = true;
++        quad.unpremultipliedAlpha = true;
++        Draw(queue, compositor, eye, {quad}, 1);
++        std::vector<Bgra> result(kDumpEye * kDumpEye);
++        [eye getBytes:result.data() bytesPerRow:kDumpEye * 4 fromRegion:MTLRegionMake2D(0, 0, kDumpEye, kDumpEye) mipmapLevel:0];
++        f = std::fopen(out, "wb");
++        REQUIRE(f != nullptr);
++        std::fwrite(result.data(), 4, result.size(), f);
++        std::fclose(f);
++        [eye release];
++        [image release];
++        [queue release];
++    }
++}
+-- 
+2.43.0
+

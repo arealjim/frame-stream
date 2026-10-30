@@ -1,0 +1,82 @@
+From 134b473d10e24ce6ed4e19cc28c314a69ba4e4ff Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:30:03 +0000
+Subject: [PATCH 02/23] runtime: reset tracking history per client so the
+ reorder guard does not drop a new client behind the last one
+
+---
+ runtime/src/StreamingServer.cpp  | 11 +++++++++++
+ runtime/src/TrackingReceiver.cpp | 11 +++++++++++
+ runtime/src/TrackingReceiver.h   |  5 +++++
+ 3 files changed, 27 insertions(+)
+
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index 69659df..e6fcb5c 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -1636,6 +1636,13 @@ void StreamingServer::EncodeThread()
+ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& clientConnect,
+                                           const sockaddr_in& clientAddr)
+ {
++    // A new client brings a new clock; drop the previous client's tracking history so its
++    // last timestamp cannot shadow every packet of this one (see TrackingReceiver::ResetHistory).
++    if (trackingReceiver_)
++    {
++        trackingReceiver_->ResetHistory();
++    }
++
+     char ipStr[INET_ADDRSTRLEN];
+     inet_ntop(AF_INET, &clientAddr.sin_addr, ipStr, sizeof(ipStr));
+     std::string clientName(clientConnect.deviceName,
+@@ -2187,6 +2194,10 @@ void StreamingServer::HandleClientDisconnect()
+     }
+ 
+     RuntimeStatus::SetIdle();
++    if (trackingReceiver_)
++    {
++        trackingReceiver_->ResetHistory();
++    }
+     spdlog::info("StreamingServer: Client disconnected, resuming broadcast");
+ }
+ 
+diff --git a/runtime/src/TrackingReceiver.cpp b/runtime/src/TrackingReceiver.cpp
+index 7c3ee26..d464b53 100644
+--- a/runtime/src/TrackingReceiver.cpp
++++ b/runtime/src/TrackingReceiver.cpp
+@@ -410,6 +410,17 @@ void TrackingReceiver::SetPredictionHorizonMs(float predictionHorizonMs)
+     predictionHorizonMs_.store(std::max(predictionHorizonMs, 0.0f));
+ }
+ 
++void TrackingReceiver::ResetHistory()
++{
++    {
++        std::lock_guard<std::mutex> lock(poseMutex_);
++        history_.clear();
++        latestPacket_ = {};
++    }
++    hasData_.store(false);
++    spdlog::info("TrackingReceiver: history reset for a new client");
++}
++
+ void TrackingReceiver::StorePacket(const oxr::protocol::TrackingPacket& packet, int64_t receiveTimeNs)
+ {
+     oxr::protocol::TrackingPacket normalizedPacket = packet;
+diff --git a/runtime/src/TrackingReceiver.h b/runtime/src/TrackingReceiver.h
+index 5486ea7..bbf35cf 100644
+--- a/runtime/src/TrackingReceiver.h
++++ b/runtime/src/TrackingReceiver.h
+@@ -49,6 +49,11 @@ class TrackingReceiver
+ 
+     // Stats
+     uint64_t GetPacketCount() const { return packetCount_.load(); }
++
++    // Forget the previous client's samples. The reorder guard in StorePacket compares client
++    // timestamps, and clients do not share a clock: a headset whose XrTime is seconds of uptime
++    // would have every packet dropped as "reordered" behind a simulator that ran for days.
++    void ResetHistory();
+     uint64_t GetReorderedDropCount() const { return reorderedDropCount_.load(); }
+ 
+ private:
+-- 
+2.43.0
+

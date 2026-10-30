@@ -1,0 +1,61 @@
+From 1322cfcd0b0a6d0cb6b3a2fb36e14161f34ee53f Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:26:35 +0000
+Subject: [PATCH] steam-frame client: FRAME_CLIENT_PREDICT_POS_MS extrapolates
+ the position by a low-passed velocity (FRAME_CLIENT_PREDICT_POS_TAU_MS,
+ default 100 ms) - continuous so no smear, near zero at rest so no velocity
+ noise reaches the eye; per-second log of the mean extrapolation and filtered
+ speed
+
+---
+ clients/steam-frame/src/main.cpp | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index d0ad2fe..c67ca54 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -1285,10 +1285,39 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+         static bool predictPosLogged = false;
+         if (!predictPosLogged) { predictPosLogged = true; LOG_INFO("prediction applies to: %s (FRAME_CLIENT_PREDICT_POS)", kPredictPos ? "orientation and position" : "orientation only, position sampled now"); }
+         if (!kPredictPos && tLocate != t) {
+-            XrSpaceLocation hlNow = {XR_TYPE_SPACE_LOCATION};
++            XrSpaceVelocity hvNow = {XR_TYPE_SPACE_VELOCITY};
++            XrSpaceLocation hlNow = {XR_TYPE_SPACE_LOCATION, &hvNow};
+             if (XR_SUCCEEDED(xrLocateSpace(app.viewSpace, app.stageSpace, t, &hlNow)) &&
+                 (hlNow.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+                 head.position = hlNow.pose.position;
++                // FRAME_CLIENT_PREDICT_POS_MS (2026-10-20, patch 0014): extrapolate the position ourselves by a
++                // LOW-PASSED velocity (one-pole, FRAME_CLIENT_PREDICT_POS_TAU_MS, default 100): continuous, so no
++                // smear; near zero at rest, so the tracker's velocity noise does not reach the eye the way the
++                // runtime's predicted position did (patches 0008/0012). Tether wear: the cube lagged the keyboard
++                // on movement by the position's ~39 ms sample-to-display path. 0 = off (position at now).
++                static float kPosMs = getenv("FRAME_CLIENT_PREDICT_POS_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_POS_MS")) : 0.0f;
++                static float kPosTau = getenv("FRAME_CLIENT_PREDICT_POS_TAU_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_POS_TAU_MS")) : 100.0f;
++                static bool posMsLogged = false;
++                if (!posMsLogged) { posMsLogged = true; LOG_INFO("position extrapolation: %.1f ms by a %.0f ms low-passed velocity (FRAME_CLIENT_PREDICT_POS_MS/_TAU_MS)", kPosMs, kPosTau); }
++                if (kPosMs > 0 && (hvNow.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT)) {
++                    static XrVector3f vf = {0, 0, 0};
++                    static XrTime tPrev = 0;
++                    const float dt = tPrev ? (float)(t - tPrev) * 1e-6f : 11.1f;   // ms
++                    tPrev = t;
++                    const float a = kPosTau > 0 ? (dt / (kPosTau + dt)) : 1.0f;
++                    vf.x += a * (hvNow.linearVelocity.x - vf.x);
++                    vf.y += a * (hvNow.linearVelocity.y - vf.y);
++                    vf.z += a * (hvNow.linearVelocity.z - vf.z);
++                    const float h = kPosMs * 1e-3f;
++                    head.position.x += vf.x * h; head.position.y += vf.y * h; head.position.z += vf.z * h;
++                    static double extSum = 0, vSum = 0; static uint32_t extN = 0;
++                    const float vmag = sqrtf(vf.x * vf.x + vf.y * vf.y + vf.z * vf.z);
++                    extSum += vmag * h * 1000.0; vSum += vmag; extN++;
++                    if (extN >= 90) {
++                        LOG_INFO("position extrapolation: mean %.1f mm ahead, filtered speed %.3f m/s", extSum / extN, vSum / extN);
++                        extSum = 0; vSum = 0; extN = 0;
++                    }
++                }
+             }
+         }
+         if (kPredictMs > 0) { hv.velocityFlags = 0; }   // the runtime predicted; nothing left for the server to add
+-- 
+2.44.0
+

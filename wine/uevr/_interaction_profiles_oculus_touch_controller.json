@@ -1,0 +1,125 @@
+{
+ "bindings": [
+  {
+   "action": "pose",
+   "path": "/user/hand/left/input/aim/pose"
+  },
+  {
+   "action": "grippose",
+   "path": "/user/hand/left/input/grip/pose"
+  },
+  {
+   "action": "trigger",
+   "path": "/user/hand/left/input/trigger/value"
+  },
+  {
+   "action": "grip",
+   "path": "/user/hand/left/input/squeeze/value"
+  },
+  {
+   "action": "joystick",
+   "path": "/user/hand/left/input/thumbstick"
+  },
+  {
+   "action": "joystickclick",
+   "path": "/user/hand/left/input/thumbstick/click"
+  },
+  {
+   "action": "thumbresttouchleft",
+   "path": "/user/hand/left/input/thumbrest/touch"
+  },
+  {
+   "action": "haptic",
+   "path": "/user/hand/left/output/haptic"
+  },
+  {
+   "action": "pose",
+   "path": "/user/hand/right/input/aim/pose"
+  },
+  {
+   "action": "grippose",
+   "path": "/user/hand/right/input/grip/pose"
+  },
+  {
+   "action": "trigger",
+   "path": "/user/hand/right/input/trigger/value"
+  },
+  {
+   "action": "grip",
+   "path": "/user/hand/right/input/squeeze/value"
+  },
+  {
+   "action": "joystick",
+   "path": "/user/hand/right/input/thumbstick"
+  },
+  {
+   "action": "joystickclick",
+   "path": "/user/hand/right/input/thumbstick/click"
+  },
+  {
+   "action": "thumbresttouchright",
+   "path": "/user/hand/right/input/thumbrest/touch"
+  },
+  {
+   "action": "haptic",
+   "path": "/user/hand/right/output/haptic"
+  },
+  {
+   "action": "abuttonleft",
+   "path": "/user/hand/left/input/x/click"
+  },
+  {
+   "action": "abuttontouchleft",
+   "path": "/user/hand/left/input/x/touch"
+  },
+  {
+   "action": "bbuttonleft",
+   "path": "/user/hand/left/input/y/click"
+  },
+  {
+   "action": "bbuttontouchleft",
+   "path": "/user/hand/left/input/y/touch"
+  },
+  {
+   "action": "abuttonright",
+   "path": "/user/hand/right/input/a/click"
+  },
+  {
+   "action": "abuttontouchright",
+   "path": "/user/hand/right/input/a/touch"
+  },
+  {
+   "action": "bbuttonright",
+   "path": "/user/hand/right/input/b/click"
+  },
+  {
+   "action": "bbuttontouchright",
+   "path": "/user/hand/right/input/b/touch"
+  },
+  {
+   "action": "systembutton",
+   "path": "/user/hand/left/input/menu/click"
+  },
+  {
+   "action": "systembutton",
+   "path": "/user/hand/right/input/system/click"
+  },
+  {
+   "action": "dpad_up",
+   "path": "/user/hand/left/input/dpad_up/click"
+  },
+  {
+   "action": "dpad_down",
+   "path": "/user/hand/left/input/dpad_down/click"
+  },
+  {
+   "action": "dpad_left",
+   "path": "/user/hand/left/input/dpad_left/click"
+  },
+  {
+   "action": "dpad_right",
+   "path": "/user/hand/left/input/dpad_right/click"
+  }
+ ],
+ "vector2_associations": []
+}

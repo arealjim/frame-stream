@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 06:40:06 +0000
+Subject: [PATCH] runtime: wait for a slow application's frame instead of
+ dropping it, and log every drop before encode
+
+EncodeInternal waited for a Vulkan/MoltenVK snapshot for at most
+min(frame period, 16.7 ms), 11.1 ms at 90 Hz. The snapshot copy is
+submitted behind the application's own rendering, so its fence signals
+only when the application's GPU frame is done. An application whose GPU
+frame took longer than one panel period therefore never had a frame
+encoded: every wait timed out, the drop was not logged, and the headset
+showed a black stream. Measured on the stand 2026-10-27 with xr-bench:
+6.5 ms GPU frame clean, 11.6 ms degraded, 19.5 ms (50 fps) and 35.8 ms
+(27 fps) black. The cliff is GPU time against the panel period, not a
+frame rate, so a 60 fps game with a 14 ms GPU frame was black too.
+
+The wait is now max(frame period, 100 ms). The short wait was there so
+that a stalled GPU would not pile up latency, and a longer one does
+not:
+
+- frameQueue_ is latest-only (StreamingFrameQueue::PushLatest). While
+  the worker waits, newer frames replace one another in its one pending
+  slot, and the next frame encoded is the newest. No backlog forms.
+- A frame that is already done returns at once, so an application that
+  keeps up pays nothing.
+- The Vulkan snapshot pool has two slots beyond the swapchain's, and
+  its TryAcquire never blocks, so the application is never held up by
+  the frame the encoder is waiting on.
+- The wait stays bounded. A hung GPU, or a swapchain being torn down,
+  still lets the worker go within 100 ms, inside the 500 ms encoder and
+  snapshot-pool drains. Below about 10 fps the frame is dropped.
+
+Each drop before encode (the snapshot wait, which image and how long
+it waited, and AcquireSlot) now goes through the existing rate-limited
+warning: the first, then every 450th. A frame encoded late, after
+waiting longer than a panel period, is logged the same way, so a slow
+application shows in the log and not only in the drop counters.
+
+Metal shared-event sources are unchanged: their wait is encoded on the
+GPU, not on the host.
+---
+ runtime/src/VideoEncoder.h  |  1 +
+ runtime/src/VideoEncoder.mm | 89 ++++++++++++++++++++++++++++++-------
+ 2 files changed, 74 insertions(+), 16 deletions(-)
+
+diff --git a/runtime/src/VideoEncoder.h b/runtime/src/VideoEncoder.h
+index dafa886..c855c3f 100644
+--- a/runtime/src/VideoEncoder.h
++++ b/runtime/src/VideoEncoder.h
+@@ -274,6 +274,7 @@ class VideoEncoder
+     std::atomic<bool> forceKeyframe_{false};
+     std::atomic<bool> shuttingDown_{false};
+     std::atomic<uint64_t> preEncodeDropCount_{0};
++    std::atomic<uint64_t> lateSnapshotCount_{0};
+     std::atomic<bool> foveationScaleLogged_{false};
+     std::atomic<bool> videoRangeConversionWarningLogged_{false};
+     std::atomic<uint32_t> droppedFrameCount_{0};
+diff --git a/runtime/src/VideoEncoder.mm b/runtime/src/VideoEncoder.mm
+index f2dfaee..1eb71bd 100644
+--- a/runtime/src/VideoEncoder.mm
++++ b/runtime/src/VideoEncoder.mm
+@@ -879,6 +879,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+     videoToolbox_.metalDevice = graphicsContext.metalDevice;
+     shuttingDown_.store(false);
+     preEncodeDropCount_.store(0);
++    lateSnapshotCount_.store(0);
+     foveationScaleLogged_.store(false);
+     droppedFrameCount_.store(0);
+     inFlightFrameCount_.store(0);
+@@ -1827,21 +1828,70 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
+     }
+ 
+ 
++    // Every drop before encode is counted; the first and then every 450th (about 5 s at 90 Hz) is logged with its
++    // reason, so a stream that drops every frame keeps saying so instead of going quiet.
++    auto logPreEncodeDrop = [&](const char* reason, double waitedMs) {
++        const uint64_t drops = preEncodeDropCount_.fetch_add(1) + 1;
++        if (reason != nullptr && (drops == 1 || drops % 450 == 0))
++        {
++            if (waitedMs > 0.0)
++            {
++                spdlog::warn("VideoEncoder: dropping frame before encode: {} after {:.1f} ms "
++                             "({} dropped before encode so far)", reason, waitedMs, drops);
++            }
++            else
++            {
++                spdlog::warn("VideoEncoder: dropping frame before encode: {} ({} dropped before encode so far)",
++                             reason, drops);
++            }
++        }
++    };
++
+     // Vulkan/MoltenVK snapshots are submitted from xrReleaseSwapchainImage on
+-    // the application's queue. Wait for those copies only on this encoder
+-    // worker, never from Session::EndFrame(). A stalled GPU drops the streaming
+-    // frame instead of accumulating latency.
++    // the application's queue, behind the application's own rendering, so the
++    // fence signals only when the application's GPU frame is done. Wait for
++    // those copies only on this encoder worker, never from Session::EndFrame().
++    //
++    // The wait used to be min(frame period, 16.7 ms), so that a stalled GPU
++    // drops the frame instead of accumulating latency. But then an application
++    // whose GPU frame takes longer than one panel period (11.1 ms at 90 Hz)
++    // never had a single frame encoded: every snapshot timed out, silently, and
++    // the headset got a black stream (a 27 fps scene with a 35.8 ms GPU frame,
++    // 2026-10-27). A slow application now degrades to a slow picture instead.
++    //
++    // A longer wait cannot pile up latency: frameQueue_ is latest-only
++    // (StreamingFrameQueue::PushLatest), so while this worker waits, newer
++    // frames replace one another in its single pending slot and the next one
++    // encoded is the newest. A frame that is already done returns at once, so
++    // an application that keeps up pays nothing. The snapshot pool has two
++    // slots beyond the swapchain's, and its acquire never blocks, so the
++    // application is not held up by the frame waited on here. The wait is
++    // still bounded, so a GPU that hangs or a swapchain being torn down lets
++    // the worker go: below about 10 fps the frame is dropped, and logged.
+     const uint64_t framePeriodNs = 1'000'000'000ull / std::max(fps_, 1u);
+-    const uint64_t snapshotWaitNs = std::min<uint64_t>(framePeriodNs, 16'666'667ull);
+-    bool overlaysReady = true;
++    const uint64_t snapshotWaitNs = std::max<uint64_t>(framePeriodNs, 100'000'000ull);
++    const auto snapshotWaitStart = Clock::now();
++    const char* notReady = nullptr;
+     for (const auto& overlay : frameSource.overlays)
+     {
+-        overlaysReady = overlaysReady && WaitForHostFrameImage(overlay.image, snapshotWaitNs);
++        if (notReady == nullptr && !WaitForHostFrameImage(overlay.image, snapshotWaitNs))
++        {
++            notReady = "overlay snapshot not ready";
++        }
+     }
+-    if (!overlaysReady ||
+-        !WaitForHostFrameImage(frameSource.left, snapshotWaitNs) ||
+-        (stereo && !WaitForHostFrameImage(frameSource.right, snapshotWaitNs)))
++    if (notReady == nullptr && !WaitForHostFrameImage(frameSource.left, snapshotWaitNs))
+     {
++        notReady = "left eye snapshot not ready";
++    }
++    if (notReady == nullptr && stereo && !WaitForHostFrameImage(frameSource.right, snapshotWaitNs))
++    {
++        notReady = "right eye snapshot not ready";
++    }
++    const double snapshotWaitedMs =
++        std::chrono::duration<double, std::milli>(Clock::now() - snapshotWaitStart).count();
++    if (notReady != nullptr)
++    {
++        logPreEncodeDrop(notReady, snapshotWaitedMs);
+         droppedFrameCount_.fetch_add(1);
+         if (frameCallback)
+         {
+@@ -1853,10 +1903,23 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
+         }
+         return false;
+     }
++    if (snapshotWaitedMs * 1.0e6 > (double)framePeriodNs)
++    {
++        // Encoded, but late: the application's GPU frame outlasted a panel period. Logged like a drop so a slow
++        // application is visible in the log, which the drop counters alone would not show.
++        const uint64_t late = lateSnapshotCount_.fetch_add(1) + 1;
++        if (late == 1 || late % 450 == 0)
++        {
++            spdlog::warn("VideoEncoder: waited {:.1f} ms for the application's frame, over the {:.1f} ms panel "
++                         "period; encoding it late ({} late so far)",
++                         snapshotWaitedMs, (double)framePeriodNs / 1.0e6, late);
++        }
++    }
+ 
+     size_t slotIndex = 0;
+     if (!AcquireSlot(slotIndex))
+     {
++        logPreEncodeDrop("no free encoder slot", 0.0);
+         FrameMetrics metrics = {};
+         metrics.frameNumber = frameNumberCounter_.fetch_add(1);
+         metrics.timestampNs = timestampNs;
+@@ -1881,13 +1944,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
+     id<MTLTexture> leftTex = (__bridge id<MTLTexture>)frameSource.left.GetImage();
+     id<MTLTexture> rightTex = stereo ? (__bridge id<MTLTexture>)frameSource.right.GetImage() : nil;
+     auto dropAcquiredSlot = [&](const char* reason) {
+-        // Every drop is counted; the first and then every 450th (about 5 s at 90 Hz) is logged with its reason, so a
+-        // stream that drops every frame keeps saying so instead of going quiet after one line.
+-        const uint64_t drops = preEncodeDropCount_.fetch_add(1) + 1;
+-        if (reason != nullptr && (drops == 1 || drops % 450 == 0))
+-        {
+-            spdlog::warn("VideoEncoder: dropping frame before encode: {} ({} dropped before encode so far)", reason, drops);
+-        }
++        logPreEncodeDrop(reason, 0.0);
+         droppedFrameCount_.fetch_add(1);
+         ReleaseSlot(slotIndex);
+         if (frameCallback)
+-- 
+2.50.1 (Apple Git-155)
+

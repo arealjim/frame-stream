@@ -1,0 +1,1202 @@
+From 71c9daa8ec11401459f8fb6fbd3e4acd8ad88cc0 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 14:16:50 +0000
+Subject: [PATCH 16/23] runtime: pace each frame's UDP packets over
+ send_pacing_ms
+
+A frame handed to the socket at once leaves as a line-rate burst of 10-200
+datagrams; an access point queue under contention drops the tail, and the
+XOR FEC (one parity per 10) cannot repair consecutive losses. PacketPacer
+spreads a frame's data and parity datagrams evenly over a window
+(send_pacing_ms, keyframes send_pacing_keyframe_ms or twice that), capped at
+0.8 of the frame period, and sends the rest at once when a newer frame is
+queued. Waits spin below 1 ms, so the only latency added is the window.
+Default 0 keeps the old burst. Config is re-read every 90 frames, so a toml
+reload switches it live.
+
+sendto failures were silent; they are now counted (udpSendFail) with the
+pacing state, flushes and wake lateness at the end of the encode-queue line.
+
+oxrsys_pacing_probe sends a synthetic 90 fps, 50 Mbps stream packetised like
+SendNalUnit to 127.0.0.1 only and reports burst span, packet gaps, peak 1 ms
+rate and added latency. Measured on the M5 Pro, Debug, loopback, 5 s:
+burst: P span p50 0.95 ms, peak 1 ms rate p99 684 Mbps, max 843
+4/8 ms: P span p50 3.88 ms, peak 1 ms rate p99 342 Mbps, max 444,
+wake lateness p99 0.25 ms, CPU user 0.41 -> 1.74 s per 5 s.
+
+---
+ CHANGES.md                      |   9 +
+ CMakeLists.txt                  |  15 ++
+ runtime/CMakeLists.txt          |   1 +
+ runtime/src/Config.cpp          |   8 +
+ runtime/src/Config.h            |   8 +
+ runtime/src/PacketPacer.cpp     | 108 ++++++++
+ runtime/src/PacketPacer.h       |  99 +++++++
+ runtime/src/StreamingServer.cpp | 103 ++++++--
+ runtime/src/StreamingServer.h   |  19 +-
+ tests/TestConfig.cpp            |  22 ++
+ tests/TestPacketPacer.cpp       | 113 ++++++++
+ tools/PacingProbe.cpp           | 442 ++++++++++++++++++++++++++++++++
+ 12 files changed, 929 insertions(+), 18 deletions(-)
+ create mode 100644 runtime/src/PacketPacer.cpp
+ create mode 100644 runtime/src/PacketPacer.h
+ create mode 100644 tests/TestPacketPacer.cpp
+ create mode 100644 tools/PacingProbe.cpp
+
+diff --git a/CHANGES.md b/CHANGES.md
+index af0d96f..cc392cd 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -10,6 +10,15 @@ ### Added
+   and light (2752x1216 encoded for 2160x2160 eyes, against 2560x1120 and 3456x1536). It is
+   announced as Medium with its own centre/edge parameters, which clients already read. The
+   encoder bench takes --fov centerX,centerY,edgeX,edgeY to try other layouts.
++- Added config send_pacing_ms (default 0 = burst, as before) and send_pacing_keyframe_ms (0 = twice
++  send_pacing_ms): the UDP datagrams of each encoded frame (data and FEC parity) are spread evenly
++  over that window instead of reaching the socket as one burst, which an access point queue under
++  contention drops from the tail. Capped at 0.8 of the frame period, and the rest of a frame goes
++  at once when a newer frame is waiting; waits spin below 1 ms, so the pacing adds no latency
++  beyond the window. The encode-queue log line gains pacing, pacedFlush, udpSendFail (sendto
++  failures, which were previously silent) and pacingLateMax. New tool oxrsys_pacing_probe measures
++  a synthetic 90 fps stream on 127.0.0.1 (loopback, 50 Mbps, 4/8 ms windows: peak 1 ms rate p99
++  684 -> 342 Mbps, about 27% of one core for the spin).
+ - Added config encoder_min_qp (default 0 = VideoToolbox's own floor): the minimum frame QP of the
+   in-process encoder session. The low-latency (rtvc) session floors QP at 16 and stops spending
+   bits there whatever the bitrate; 12 lets it reach the target (bench, 2560x1120 at 50 Mbps:
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7f2fed5..c9da380 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -181,6 +181,7 @@ add_executable(oxrsys_runtime_tests
+     tests/TestRuntimePlatform.cpp
+     tests/TestStreamingAbr.cpp
+     tests/TestStreamingFrameQueue.cpp
++    tests/TestPacketPacer.cpp
+     tests/TestStreamingReconfigure.cpp
+     tests/TestSnapshotLeasePool.cpp
+     tests/TestSwapchainCreateValidation.cpp
+@@ -199,6 +200,7 @@ add_executable(oxrsys_runtime_tests
+     runtime/src/RuntimePlatform.cpp
+     runtime/src/RuntimeSockets.cpp
+     runtime/src/StreamingFrameQueue.cpp
++    runtime/src/PacketPacer.cpp
+     runtime/src/VideoCodecSelection.cpp
+     runtime/src/EncoderPathPolicy.cpp
+     runtime/src/VulkanDispatch.cpp
+@@ -390,6 +392,19 @@ target_compile_definitions(oxrsys_encoder_bench PRIVATE
+     OXRSYS_VERSION_PATCH=${OXRSYS_VERSION_PATCH}
+ )
+ 
++# Packet pacing probe (not a test): a synthetic 90 fps stream packetised like
++# StreamingServer::SendNalUnit, paced by PacketPacer, sent to a receiver on
++# 127.0.0.1 only. Prints burst length, packet spacing, peak 1 ms rate and the
++# latency the pacing adds. See tools/PacingProbe.cpp.
++add_executable(oxrsys_pacing_probe
++    tools/PacingProbe.cpp
++    runtime/src/PacketPacer.cpp
++)
++target_include_directories(oxrsys_pacing_probe PRIVATE
++    runtime/src
++    common/protocol/include
++)
++
+ add_dependencies(oxrsys_runtime_sync_compile_commands
+     ${OXRSYS_RUNTIME_TEST_TARGETS}
+ )
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 781e2d4..02310e6 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -21,6 +21,7 @@ add_library(oxrsys_runtime SHARED
+     src/HandTracker.cpp
+     src/StreamingServer.cpp
+     src/RttProbe.cpp
++    src/PacketPacer.cpp
+     src/TrackingReceiver.cpp
+     src/VulkanDispatch.cpp
+     src/SwapchainCommon.cpp
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index 6f5cd0c..83795a5 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -429,6 +429,14 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             {
+                 values.encoderMinQp = static_cast<uint32_t>(std::max(0, std::min(51, std::stoi(value))));
+             }
++            else if (key == "send_pacing_ms")
++            {
++                values.sendPacingMs = std::max(0.0f, std::min(10.0f, std::stof(value)));
++            }
++            else if (key == "send_pacing_keyframe_ms")
++            {
++                values.sendPacingKeyframeMs = std::max(0.0f, std::min(20.0f, std::stof(value)));
++            }
+             else if (key == "encoder_full_range")
+             {
+                 values.encoderFullRange = ParseBool(value);
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index 5da5b8d..9941a53 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -35,6 +35,14 @@ struct ConfigValues
+     // scenes. Measured 2026-10-18, M5 Pro, 2560x1120 HEVC, bench "smooth" scene at 50 Mbps:
+     // 38.2 -> 49.8 Mbps actual, callback p50 9.6 -> 10.1 ms.
+     uint32_t encoderMinQp = 0;
++    // send_pacing_ms: spread each encoded frame's UDP packets evenly over this many ms instead
++    // of handing them to the socket as one burst (an AP queue under contention drops a burst's
++    // tail, and the XOR FEC cannot repair consecutive losses). Capped at 0.8 of the frame period;
++    // the rest of a frame goes at once if a newer frame is waiting. 0 = burst (the old behaviour).
++    float sendPacingMs = 0.0f;
++    // send_pacing_keyframe_ms: the window for frames that carry a keyframe (up to ~300 kB).
++    // 0 = twice send_pacing_ms. Same cap.
++    float sendPacingKeyframeMs = 0.0f;
+     // pacing_spin_ms: WaitFrame sleeps until (deadline - this) and spins the rest. 0 = sleep to the deadline.
+     float pacingSpinMs = 0.0f;
+     // pacing_thread: "default" | "qos" (USER_INTERACTIVE QoS on the app thread that calls WaitFrame)
+diff --git a/runtime/src/PacketPacer.cpp b/runtime/src/PacketPacer.cpp
+new file mode 100644
+index 0000000..07dd3fd
+--- /dev/null
++++ b/runtime/src/PacketPacer.cpp
+@@ -0,0 +1,108 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include "PacketPacer.h"
++
++#include <algorithm>
++#include <chrono>
++#include <thread>
++
++#if defined(__aarch64__) || defined(__arm64__)
++#define OXRSYS_PACER_CPU_RELAX() __asm__ __volatile__("yield")
++#elif defined(__x86_64__) || defined(_M_X64)
++#include <immintrin.h>
++#define OXRSYS_PACER_CPU_RELAX() _mm_pause()
++#else
++#define OXRSYS_PACER_CPU_RELAX() ((void)0)
++#endif
++
++namespace oxrsys::streaming
++{
++
++    int64_t PacingWindowNs(const PacketPacingConfig& config, bool keyframe, uint32_t refreshRateHz)
++    {
++        if (config.windowMs <= 0.0f)
++        {
++            return 0;
++        }
++        double windowMs = config.windowMs;
++        if (keyframe)
++        {
++            windowMs = config.keyframeWindowMs > 0.0f ? config.keyframeWindowMs : 2.0 * config.windowMs;
++        }
++        int64_t windowNs = static_cast<int64_t>(windowMs * 1'000'000.0);
++        if (refreshRateHz > 0)
++        {
++            const int64_t capNs = static_cast<int64_t>(kMaxPacingFrameFraction * 1'000'000'000.0 / refreshRateHz);
++            windowNs = std::min(windowNs, capNs);
++        }
++        return std::max<int64_t>(0, windowNs);
++    }
++
++    PacketPacer::PacketPacer(int64_t startNs, int64_t windowNs, uint32_t totalPackets)
++        : startNs_(startNs), windowNs_(std::max<int64_t>(0, windowNs)), totalPackets_(totalPackets)
++    {
++    }
++
++    int64_t PacketPacer::DeadlineNs(uint32_t packetIndex) const
++    {
++        if (windowNs_ <= 0 || totalPackets_ <= 1)
++        {
++            return startNs_;
++        }
++        const uint32_t index = std::min(packetIndex, totalPackets_ - 1);
++        // 128-bit-safe for any realistic window: window < 1e9, index < 65536.
++        return startNs_ + (windowNs_ * static_cast<int64_t>(index)) / totalPackets_;
++    }
++
++    int64_t PacketPacer::SpacingNs() const
++    {
++        return (windowNs_ > 0 && totalPackets_ > 1) ? windowNs_ / totalPackets_ : 0;
++    }
++
++    void PacketPacer::WaitForNextPacket(const std::function<bool()>& shouldFlush)
++    {
++        const uint32_t index = nextPacket_++;
++        if (!Enabled() || index == 0 || index >= totalPackets_)
++        {
++            return;
++        }
++        const int64_t deadline = DeadlineNs(index);
++        if (!WaitUntilNs(deadline, shouldFlush))
++        {
++            flushed_ = true;
++            return;
++        }
++        maxLatenessNs_ = std::max(maxLatenessNs_, PacingNowNs() - deadline);
++    }
++
++    int64_t PacingNowNs()
++    {
++        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++            .count();
++    }
++
++    bool WaitUntilNs(int64_t deadlineNs, const std::function<bool()>& shouldFlush)
++    {
++        for (;;)
++        {
++            if (shouldFlush && shouldFlush())
++            {
++                return false;
++            }
++            const int64_t remaining = deadlineNs - PacingNowNs();
++            if (remaining <= 0)
++            {
++                return true;
++            }
++            if (remaining > kPacingSpinThresholdNs)
++            {
++                // Sleep in slices so a flush request is still seen promptly.
++                const int64_t sleepNs = std::min<int64_t>(remaining - kPacingSpinThresholdNs, 1'000'000);
++                std::this_thread::sleep_for(std::chrono::nanoseconds(sleepNs));
++                continue;
++            }
++            OXRSYS_PACER_CPU_RELAX();
++        }
++    }
++
++} // namespace oxrsys::streaming
+diff --git a/runtime/src/PacketPacer.h b/runtime/src/PacketPacer.h
+new file mode 100644
+index 0000000..1997423
+--- /dev/null
++++ b/runtime/src/PacketPacer.h
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: MPL-2.0
++#pragma once
++
++// Sender-side packet pacing for one encoded video frame.
++//
++// A frame handed to the socket at once leaves the Mac as a line-rate burst of
++// 10-200 datagrams; an access point queue under contention drops the tail of
++// such a burst, and the XOR FEC (one parity per FEC_GROUP_SIZE packets) cannot
++// repair consecutive losses. Spreading the frame's packets evenly over a few
++// milliseconds keeps the instantaneous rate near the stream's average rate.
++//
++// The schedule is pure arithmetic (PacingWindowNs, PacketPacer::DeadlineNs) so
++// it can be unit tested; WaitUntilNs is the only part that touches the clock.
++
++#include <cstdint>
++#include <functional>
++
++namespace oxrsys::streaming
++{
++
++    struct PacketPacingConfig
++    {
++        // send_pacing_ms: spread a frame's packets over this window. 0 = burst (no pacing).
++        float windowMs = 0.0f;
++        // send_pacing_keyframe_ms: window for frames carrying a keyframe NAL. 0 = 2 x windowMs.
++        float keyframeWindowMs = 0.0f;
++    };
++
++    // Never pace a frame over more than this fraction of the frame period, so the
++    // last packet leaves before the next frame is normally ready to send.
++    constexpr double kMaxPacingFrameFraction = 0.8;
++
++    // Waits shorter than this are spun; longer ones sleep until this far from the
++    // deadline and spin the rest (sleep overshoots by 50-500 us on macOS).
++    constexpr int64_t kPacingSpinThresholdNs = 1'000'000;
++
++    // The window (ns) one frame's packets are spread over: the configured window
++    // (keyframe window for keyframes), capped at kMaxPacingFrameFraction of the
++    // frame period. 0 means send as one burst.
++    int64_t PacingWindowNs(const PacketPacingConfig& config, bool keyframe, uint32_t refreshRateHz);
++
++    class PacketPacer
++    {
++      public:
++        // A pacer for totalPackets packets starting at startNs, spread over windowNs.
++        // Packet i is due at startNs + windowNs * i / totalPackets, so packet 0 goes
++        // at once and the last one is due one spacing before the window closes.
++        PacketPacer(int64_t startNs, int64_t windowNs, uint32_t totalPackets);
++
++        int64_t DeadlineNs(uint32_t packetIndex) const;
++        int64_t SpacingNs() const;
++        bool Enabled() const
++        {
++            return windowNs_ > 0 && totalPackets_ > 1 && !flushed_;
++        }
++
++        // Wait until the next packet is due, then count it as sent. Returns at once
++        // when pacing is off, when flushed, or once more packets were sent than
++        // planned. shouldFlush is polled while waiting; when it returns true the
++        // remaining packets go as a burst (a newer frame is waiting to be sent).
++        void WaitForNextPacket(const std::function<bool()>& shouldFlush = {});
++
++        // Send everything that is left without further waits.
++        void Flush()
++        {
++            flushed_ = true;
++        }
++        bool Flushed() const
++        {
++            return flushed_;
++        }
++        uint32_t PacketsSent() const
++        {
++            return nextPacket_;
++        }
++        // Largest (send time - deadline) seen so far, ns: how late the waits woke.
++        int64_t MaxLatenessNs() const
++        {
++            return maxLatenessNs_;
++        }
++
++      private:
++        int64_t startNs_;
++        int64_t windowNs_;
++        uint32_t totalPackets_;
++        uint32_t nextPacket_ = 0;
++        bool flushed_ = false;
++        int64_t maxLatenessNs_ = 0;
++    };
++
++    // Monotonic clock in ns (same base as std::chrono::steady_clock).
++    int64_t PacingNowNs();
++
++    // Block until PacingNowNs() >= deadlineNs: sleep while more than
++    // kPacingSpinThresholdNs remains, spin the rest. Returns false (early) if
++    // shouldFlush becomes true while waiting.
++    bool WaitUntilNs(int64_t deadlineNs, const std::function<bool()>& shouldFlush = {});
++
++} // namespace oxrsys::streaming
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index 0c3593d..152036d 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -1554,6 +1554,9 @@ void StreamingServer::EncodeThread()
+                     const uint32_t videoSendDepthMax = server->videoSendQueueDepthMax_.exchange(0);
+                     const uint32_t videoSendDrops = server->videoSendDroppedFrames_.exchange(0);
+                     const uint32_t videoTcpFailures = server->videoTcpSendFailures_.exchange(0);
++                    const uint32_t pacedFlushes = server->videoPacedFlushes_.exchange(0);
++                    const uint32_t udpSendFailures = server->videoUdpSendFailures_.exchange(0);
++                    const uint32_t pacingLateUs = server->videoPacingMaxLatenessUs_.exchange(0);
+                     const uint32_t udpRetransmits =
+                         server->videoUdpRetransmittedPackets_.exchange(0);
+                     std::string abrModeName;
+@@ -1672,7 +1675,8 @@ void StreamingServer::EncodeThread()
+                         "submit({:.3f}/{:.3f}) callback({:.2f}/{:.2f}) total({:.2f}/{:.2f}) "
+                         "replaced={} encDrops={} keyframeReq={} depthMax={} sendDepth={} sendDrops={} "
+                         "tcpFail={} udpRetrans={} abr={}/{} profile={} displayedAge={:.2f}ms reproj={} stale={} poseFallbacks={} "
+-                        "frameBytes(min/med/max)={}/{}/{} small={}/{}",
++                        "frameBytes(min/med/max)={}/{}/{} small={}/{} "
++                        "pacing={:.1f}/{:.1f}ms pacedFlush={} udpSendFail={} pacingLateMax={}us",
+                         queueSummary.average, queueSummary.p95,
+                         gpuSummary.average, gpuSummary.p95,
+                         submitSummary.average, submitSummary.p95,
+@@ -1694,7 +1698,10 @@ void StreamingServer::EncodeThread()
+                         server->clientStaleFrameReusesDelta_.load(),
+                         server->clientRenderPoseFallbacksDelta_.load(),
+                         bytesSummary.min, bytesSummary.median, bytesSummary.max,
+-                        bytesSummary.small, bytesSummary.count);
++                        bytesSummary.small, bytesSummary.count,
++                        server->videoPacingWindowMsForLog_.load(),
++                        server->videoPacingKeyframeWindowMsForLog_.load(),
++                        pacedFlushes, udpSendFailures, pacingLateUs);
+ 
+                     telemetry->lastLogTime = now;
+                 }
+@@ -2982,6 +2989,7 @@ void StreamingServer::QueueEncodedVideoFrame(EncodedVideoFrame frame)
+             videoSendDroppedFramesTotalForAbr_.fetch_add(1);
+         }
+         videoSendQueue_.push_back(std::move(frame));
++        videoSendNewerFrameQueued_.store(true);
+         videoSendQueueDepthMax_.store(std::max(
+             videoSendQueueDepthMax_.load(),
+             static_cast<uint32_t>(videoSendQueue_.size())));
+@@ -2993,6 +3001,7 @@ void StreamingServer::ClearVideoSendQueue()
+ {
+     std::lock_guard<std::mutex> lock(videoSendMutex_);
+     videoSendQueue_.clear();
++    videoSendNewerFrameQueued_.store(false);
+ }
+ 
+ void StreamingServer::VideoSendThread()
+@@ -3022,6 +3031,7 @@ void StreamingServer::VideoSendThread()
+             videoSendQueue_.pop_front();
+ 
+             const bool newerFrameQueued = !videoSendQueue_.empty();
++            videoSendNewerFrameQueued_.store(newerFrameQueued);
+             const bool hasKeyframeNal = std::any_of(
+                 frame.nals.begin(), frame.nals.end(),
+                 [](const EncodedNalUnit& nal) { return nal.isKeyframe; });
+@@ -3050,6 +3060,42 @@ void StreamingServer::SendEncodedVideoFrame(const EncodedVideoFrame& frame)
+         SendRenderPosePacket(frame);
+     }
+ 
++    // Packet pacing: the frame's datagrams (data + FEC parity, over all its NALs)
++    // spread evenly over send_pacing_ms. Config is re-read about once a second so
++    // a toml reload takes effect without a restart.
++    if (videoPacingConfigAge_++ % 90 == 0)
++    {
++        const ConfigValues config = Config::Get().GetValues();
++        videoPacingConfig_.windowMs = config.sendPacingMs;
++        videoPacingConfig_.keyframeWindowMs = config.sendPacingKeyframeMs;
++        videoPacingWindowMsForLog_.store(config.sendPacingMs);
++        videoPacingKeyframeWindowMsForLog_.store(config.sendPacingKeyframeMs);
++    }
++    bool frameHasKeyframe = false;
++    uint32_t frameDatagrams = 0;
++    for (const EncodedNalUnit& nal : frame.nals)
++    {
++        if (nal.tcpPayload.size() <= sizeof(oxr::protocol::TcpVideoNalHeader))
++        {
++            continue;
++        }
++        const auto* nalHeader =
++            reinterpret_cast<const oxr::protocol::TcpVideoNalHeader*>(nal.tcpPayload.data());
++        const size_t nalSize = std::min<size_t>(
++            nalHeader->payloadSize,
++            nal.tcpPayload.size() - sizeof(oxr::protocol::TcpVideoNalHeader));
++        const uint32_t dataPackets = static_cast<uint32_t>(
++            (nalSize + oxr::protocol::MAX_PACKET_PAYLOAD - 1) / oxr::protocol::MAX_PACKET_PAYLOAD);
++        frameDatagrams += dataPackets +
++            (dataPackets + oxr::protocol::FEC_GROUP_SIZE - 1) / oxr::protocol::FEC_GROUP_SIZE;
++        frameHasKeyframe = frameHasKeyframe || nal.isKeyframe;
++    }
++    oxrsys::streaming::PacketPacer pacer(
++        oxrsys::streaming::PacingNowNs(),
++        oxrsys::streaming::PacingWindowNs(
++            videoPacingConfig_, frameHasKeyframe, targetRefreshRateHz_.load()),
++        frameDatagrams);
++
+     for (const EncodedNalUnit& nal : frame.nals)
+     {
+         if (nal.tcpPayload.size() <= sizeof(oxr::protocol::TcpVideoNalHeader))
+@@ -3065,7 +3111,36 @@ void StreamingServer::SendEncodedVideoFrame(const EncodedVideoFrame& frame)
+             nalHeader->payloadSize,
+             nal.tcpPayload.size() - sizeof(oxr::protocol::TcpVideoNalHeader));
+         SendNalUnit(packetDispatchState_, frame.frameIndex, nalData, nalSize,
+-                    nal.isKeyframe, frame.alphaBlend, frame.timestampNs, frame.codec);
++                    nal.isKeyframe, frame.alphaBlend, frame.timestampNs, frame.codec, &pacer);
++    }
++
++    if (pacer.Flushed())
++    {
++        videoPacedFlushes_.fetch_add(1);
++    }
++    const uint32_t latenessUs = static_cast<uint32_t>(pacer.MaxLatenessNs() / 1000);
++    if (latenessUs > videoPacingMaxLatenessUs_.load())
++    {
++        videoPacingMaxLatenessUs_.store(latenessUs);
++    }
++}
++
++void StreamingServer::SendPacedVideoDatagram(SocketHandle socket, const uint8_t* data, size_t size,
++                                             const sockaddr_in& destAddr,
++                                             oxrsys::streaming::PacketPacer* pacer)
++{
++    if (pacer)
++    {
++        pacer->WaitForNextPacket([this] { return videoSendNewerFrameQueued_.load(); });
++    }
++    if (oxrsys::runtime_socket::SendTo(socket,
++                                       data,
++                                       size,
++                                       kBestEffortSendFlags,
++                                       (const sockaddr*)&destAddr,
++                                       sizeof(destAddr)) < 0)
++    {
++        videoUdpSendFailures_.fetch_add(1);
+     }
+ 
+     // SendFrame -> last packet handed to the socket: encode queue + encode + send (and pacing).
+@@ -3155,7 +3230,8 @@ void StreamingServer::SendRenderPosePacket(const EncodedVideoFrame& frame)
+ void StreamingServer::SendNalUnit(const std::shared_ptr<PacketDispatchState>& dispatchState,
+                                   uint32_t frameIndex, const uint8_t* data, size_t size,
+                                   bool isKeyframe, bool alphaBlend, int64_t timestampNs,
+-                                  oxr::protocol::VideoCodec codec)
++                                  oxr::protocol::VideoCodec codec,
++                                  oxrsys::streaming::PacketPacer* pacer)
+ {
+     std::string clientIp;
+     SocketHandle videoSocket = oxrsys::runtime_socket::InvalidSocket;
+@@ -3284,12 +3360,7 @@ void StreamingServer::SendNalUnit(const std::shared_ptr<PacketDispatchState>& di
+         size_t packetSize = sizeof(header) + payloadSize;
+         memcpy(packetBuffer, &header, sizeof(header));
+         memcpy(packetBuffer + sizeof(header), data + offset, payloadSize);
+-        oxrsys::runtime_socket::SendTo(videoSocket,
+-                                       packetBuffer,
+-                                       packetSize,
+-                                       kBestEffortSendFlags,
+-                                       (sockaddr*)&destAddr,
+-                                       sizeof(destAddr));
++        SendPacedVideoDatagram(videoSocket, packetBuffer, packetSize, destAddr, pacer);
+ 
+         // Cache for NACK retransmission. The frame is advertised to NACK only
+         // once all packets have been copied.
+@@ -3341,13 +3412,11 @@ void StreamingServer::SendNalUnit(const std::shared_ptr<PacketDispatchState>& di
+ 
+             memcpy(packetBuffer, &fecHeader, sizeof(fecHeader));
+             memcpy(packetBuffer + sizeof(fecHeader), fecPayload, oxr::protocol::MAX_PACKET_PAYLOAD);
+-            oxrsys::runtime_socket::SendTo(
+-                videoSocket,
+-                packetBuffer,
+-                sizeof(fecHeader) + oxr::protocol::MAX_PACKET_PAYLOAD,
+-                kBestEffortSendFlags,
+-                (sockaddr*)&destAddr,
+-                sizeof(destAddr));
++            SendPacedVideoDatagram(videoSocket,
++                                   packetBuffer,
++                                   sizeof(fecHeader) + oxr::protocol::MAX_PACKET_PAYLOAD,
++                                   destAddr,
++                                   pacer);
+         }
+     }
+ 
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index 41924ae..c54b604 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -17,6 +17,7 @@
+ #include <thread>
+ #include <vector>
+ 
++#include "PacketPacer.h"
+ #include "RuntimeSockets.h"
+ #include "RttProbe.h"
+ #include "GraphicsTypes.h"
+@@ -332,6 +333,16 @@ class StreamingServer
+     std::atomic<uint32_t> videoSendDroppedFramesTotalForAbr_{0};
+     std::atomic<uint32_t> videoTcpSendFailures_{0};
+     std::atomic<uint32_t> videoUdpRetransmittedPackets_{0};
++    // Packet pacing (send_pacing_ms): true while a frame newer than the one being
++    // sent is queued, so the pacer sends the rest of the current frame at once.
++    std::atomic<bool> videoSendNewerFrameQueued_{false};
++    std::atomic<uint32_t> videoPacedFlushes_{0};
++    std::atomic<uint32_t> videoUdpSendFailures_{0};
++    std::atomic<uint32_t> videoPacingMaxLatenessUs_{0};
++    oxrsys::streaming::PacketPacingConfig videoPacingConfig_; // video send thread only
++    std::atomic<float> videoPacingWindowMsForLog_{0.0f};
++    std::atomic<float> videoPacingKeyframeWindowMsForLog_{0.0f};
++    uint32_t videoPacingConfigAge_ = 0;
+     std::mutex videoSendMutex_;
+     std::condition_variable videoSendCv_;
+     std::deque<EncodedVideoFrame> videoSendQueue_;
+@@ -341,7 +352,13 @@ class StreamingServer
+     void SendNalUnit(const std::shared_ptr<PacketDispatchState>& dispatchState,
+                      uint32_t frameIndex, const uint8_t* data, size_t size,
+                      bool isKeyframe, bool alphaBlend, int64_t timestampNs,
+-                     oxr::protocol::VideoCodec codec);
++                     oxr::protocol::VideoCodec codec,
++                     oxrsys::streaming::PacketPacer* pacer = nullptr);
++    // Sends one UDP datagram of the video stream after the pacer says it is due,
++    // and counts a failed send (EAGAIN/ENOBUFS drops the packet before the radio).
++    void SendPacedVideoDatagram(SocketHandle socket, const uint8_t* data, size_t size,
++                                const sockaddr_in& destAddr,
++                                oxrsys::streaming::PacketPacer* pacer);
+     static bool SendTcpRecord(SocketHandle socket, oxr::protocol::TcpRecordType type,
+                               const void* payload, size_t payloadSize);
+     static bool SendTcpRecordParts(SocketHandle socket, oxr::protocol::TcpRecordType type,
+diff --git a/tests/TestConfig.cpp b/tests/TestConfig.cpp
+index f3dbfae..e518d4a 100644
+--- a/tests/TestConfig.cpp
++++ b/tests/TestConfig.cpp
+@@ -306,3 +306,25 @@ TEST_CASE("Config singleton initializes with bounded Quest logcat clear", "[conf
+ 
+     Config::Get().Shutdown();
+ }
++
++TEST_CASE("Config parser reads send pacing windows and clamps them", "[config][pacing]")
++{
++    {
++        std::istringstream input("[streaming]\nsend_pacing_ms = 3.5\nsend_pacing_keyframe_ms = 8\n");
++        const ConfigValues values = ParseConfigToml(input);
++        CHECK(values.sendPacingMs == 3.5f);
++        CHECK(values.sendPacingKeyframeMs == 8.0f);
++    }
++    {
++        std::istringstream input("[streaming]\nsend_pacing_ms = 99\nsend_pacing_keyframe_ms = -4\n");
++        const ConfigValues values = ParseConfigToml(input);
++        CHECK(values.sendPacingMs == 10.0f);
++        CHECK(values.sendPacingKeyframeMs == 0.0f);
++    }
++    {
++        std::istringstream input("[streaming]\nbitrate_mbps = 50\n");
++        const ConfigValues values = ParseConfigToml(input);
++        CHECK(values.sendPacingMs == 0.0f); // default: burst, as before
++        CHECK(values.sendPacingKeyframeMs == 0.0f);
++    }
++}
+diff --git a/tests/TestPacketPacer.cpp b/tests/TestPacketPacer.cpp
+new file mode 100644
+index 0000000..f0ed067
+--- /dev/null
++++ b/tests/TestPacketPacer.cpp
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include <catch2/catch_test_macros.hpp>
++
++#include "PacketPacer.h"
++
++#include <cstdint>
++#include <vector>
++
++using oxrsys::streaming::PacingNowNs;
++using oxrsys::streaming::PacingWindowNs;
++using oxrsys::streaming::PacketPacer;
++using oxrsys::streaming::PacketPacingConfig;
++
++TEST_CASE("Packet pacing is off by default and for a zero window", "[pacing]")
++{
++    PacketPacingConfig config;
++    CHECK(PacingWindowNs(config, false, 90) == 0);
++    CHECK(PacingWindowNs(config, true, 90) == 0);
++
++    PacketPacer pacer(1'000, 0, 50);
++    CHECK_FALSE(pacer.Enabled());
++    for (uint32_t i = 0; i < 50; ++i)
++    {
++        CHECK(pacer.DeadlineNs(i) == 1'000);
++    }
++}
++
++TEST_CASE("Packet pacing window uses the keyframe window and caps at the frame period", "[pacing]")
++{
++    PacketPacingConfig config;
++    config.windowMs = 3.0f;
++    CHECK(PacingWindowNs(config, false, 90) == 3'000'000);
++    // Keyframe window defaults to twice the frame window.
++    CHECK(PacingWindowNs(config, true, 90) == 6'000'000);
++
++    config.keyframeWindowMs = 7.5f;
++    CHECK(PacingWindowNs(config, true, 90) == 7'500'000);
++
++    // 0.8 of a 90 Hz period is 8.888 ms; 72 Hz is 11.111 ms.
++    config.keyframeWindowMs = 20.0f;
++    CHECK(PacingWindowNs(config, true, 90) == 8'888'888);
++    CHECK(PacingWindowNs(config, true, 72) == 11'111'111);
++    config.windowMs = 50.0f;
++    CHECK(PacingWindowNs(config, false, 90) == 8'888'888);
++}
++
++TEST_CASE("Packet pacer spreads packets evenly and never past the window", "[pacing]")
++{
++    // A 70 kB frame: 50 data + 5 FEC packets over 4 ms.
++    const int64_t start = 10'000'000;
++    const int64_t window = 4'000'000;
++    const uint32_t packets = 55;
++    PacketPacer pacer(start, window, packets);
++    REQUIRE(pacer.Enabled());
++    CHECK(pacer.SpacingNs() == window / packets);
++
++    CHECK(pacer.DeadlineNs(0) == start);
++    int64_t previous = pacer.DeadlineNs(0);
++    for (uint32_t i = 1; i < packets; ++i)
++    {
++        const int64_t deadline = pacer.DeadlineNs(i);
++        const int64_t gap = deadline - previous;
++        // Even: every gap is the spacing, give or take the integer remainder.
++        CHECK(gap >= window / packets);
++        CHECK(gap <= window / packets + 1);
++        previous = deadline;
++    }
++    // The last packet is due one spacing before the window closes, never after.
++    CHECK(pacer.DeadlineNs(packets - 1) < start + window);
++    CHECK(pacer.DeadlineNs(packets - 1) >= start + window - window / packets - 1);
++    // Indices past the plan clamp to the last deadline.
++    CHECK(pacer.DeadlineNs(packets + 10) == pacer.DeadlineNs(packets - 1));
++}
++
++TEST_CASE("Packet pacer waits are never early and add no more than the window", "[pacing]")
++{
++    const int64_t window = 2'000'000;
++    const uint32_t packets = 40;
++    const int64_t start = PacingNowNs();
++    PacketPacer pacer(start, window, packets);
++    std::vector<int64_t> sendTimes;
++    for (uint32_t i = 0; i < packets; ++i)
++    {
++        pacer.WaitForNextPacket();
++        sendTimes.push_back(PacingNowNs());
++    }
++    for (uint32_t i = 0; i < packets; ++i)
++    {
++        CHECK(sendTimes[i] >= pacer.DeadlineNs(i));
++    }
++    // Loose bound for a loaded test machine: the frame finishes within the
++    // window plus 2 ms of scheduling slack.
++    CHECK(sendTimes.back() - start < window + 2'000'000);
++    CHECK(pacer.PacketsSent() == packets);
++}
++
++TEST_CASE("Packet pacer flushes the rest as a burst when a newer frame is waiting", "[pacing]")
++{
++    const int64_t window = 50'000'000; // long, so an unflushed run would take 50 ms
++    const uint32_t packets = 100;
++    const int64_t start = PacingNowNs();
++    PacketPacer pacer(start, window, packets);
++    auto newerFrameAfterTenPackets = [&] { return pacer.PacketsSent() > 10; };
++    for (uint32_t i = 0; i < packets; ++i)
++    {
++        pacer.WaitForNextPacket(newerFrameAfterTenPackets);
++    }
++    CHECK(pacer.Flushed());
++    CHECK_FALSE(pacer.Enabled());
++    // Ten packets were paced at 0.5 ms spacing; the other ninety went at once.
++    CHECK(PacingNowNs() - start < 20'000'000);
++}
+diff --git a/tools/PacingProbe.cpp b/tools/PacingProbe.cpp
+new file mode 100644
+index 0000000..84b972e
+--- /dev/null
++++ b/tools/PacingProbe.cpp
+@@ -0,0 +1,442 @@
++// SPDX-License-Identifier: MPL-2.0
++//
++// oxrsys_pacing_probe: loopback measurement of the video sender's packet pacing.
++//
++// Sends a synthetic stream (default 90 fps, 50 Mbps, P frames 20-115 kB, one
++// 300 kB keyframe per second) packetised exactly like StreamingServer::SendNalUnit
++// (VideoPacketHeader + 1400 B payload, one parity packet per FEC_GROUP_SIZE) to a
++// receiver socket on 127.0.0.1 in the same process, paced by PacketPacer, and
++// reports burst length, inter-packet spacing, peak 1 ms rate and added latency.
++// Loopback only by design: it never sends to another host.
++//
++//   oxrsys_pacing_probe --window-ms 0            # today's burst
++//   oxrsys_pacing_probe --window-ms 4 --keyframe-ms 8 --csv out.csv
++
++#include "PacketPacer.h"
++
++#include <oxrsys/protocol/Protocol.h>
++
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <pthread.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <random>
++#include <string>
++#include <thread>
++#include <vector>
++
++using namespace oxrsys::streaming;
++namespace proto = oxr::protocol;
++
++namespace
++{
++
++    struct Options
++    {
++        float windowMs = 0.0f;
++        float keyframeMs = 0.0f;
++        double seconds = 5.0;
++        uint32_t fps = 90;
++        double mbps = 50.0;
++        uint32_t seed = 1;
++        std::string csv;
++        // AP queue model (not a measurement): drain rate and queue depth.
++        double modelDrainMbps = 150.0;
++        uint32_t modelQueuePackets = 48;
++    };
++
++    struct SendRecord
++    {
++        uint32_t frame;
++        uint16_t index;
++        uint8_t flags;
++        bool failed;
++        int64_t sendNs;
++        uint32_t bytes;
++    };
++
++    struct RecvRecord
++    {
++        uint32_t frame;
++        uint16_t index;
++        uint8_t flags;
++        int64_t kernelUs;
++        int64_t userNs;
++    };
++
++    struct FrameInfo
++    {
++        int64_t startNs = 0;
++        int64_t lastSendNs = 0;
++        uint32_t packets = 0;
++        bool keyframe = false;
++        bool flushed = false;
++        int64_t maxLatenessNs = 0;
++    };
++
++    double Percentile(std::vector<double> v, double p)
++    {
++        if (v.empty())
++        {
++            return 0.0;
++        }
++        std::sort(v.begin(), v.end());
++        const size_t i = std::min(v.size() - 1, static_cast<size_t>(std::llround(p * (v.size() - 1))));
++        return v[i];
++    }
++
++    void Usage()
++    {
++        std::fprintf(stderr, "usage: oxrsys_pacing_probe [--window-ms W] [--keyframe-ms K] [--seconds S]\n"
++                             "       [--fps F] [--mbps M] [--seed N] [--csv path]\n"
++                             "       [--model-drain-mbps R] [--model-queue-packets Q]\n");
++    }
++
++} // namespace
++
++int main(int argc, char** argv)
++{
++    Options opt;
++    for (int i = 1; i < argc; ++i)
++    {
++        const std::string a = argv[i];
++        auto next = [&]() -> const char*
++        {
++            if (i + 1 >= argc)
++            {
++                Usage();
++                std::exit(2);
++            }
++            return argv[++i];
++        };
++        if (a == "--window-ms")
++            opt.windowMs = std::stof(next());
++        else if (a == "--keyframe-ms")
++            opt.keyframeMs = std::stof(next());
++        else if (a == "--seconds")
++            opt.seconds = std::stod(next());
++        else if (a == "--fps")
++            opt.fps = static_cast<uint32_t>(std::stoul(next()));
++        else if (a == "--mbps")
++            opt.mbps = std::stod(next());
++        else if (a == "--seed")
++            opt.seed = static_cast<uint32_t>(std::stoul(next()));
++        else if (a == "--csv")
++            opt.csv = next();
++        else if (a == "--model-drain-mbps")
++            opt.modelDrainMbps = std::stod(next());
++        else if (a == "--model-queue-packets")
++            opt.modelQueuePackets = static_cast<uint32_t>(std::stoul(next()));
++        else
++        {
++            Usage();
++            return 2;
++        }
++    }
++
++    // ── Receiver on loopback ────────────────────────────────────────────────
++    const int rx = socket(AF_INET, SOCK_DGRAM, 0);
++    const int tx = socket(AF_INET, SOCK_DGRAM, 0);
++    if (rx < 0 || tx < 0)
++    {
++        std::perror("socket");
++        return 1;
++    }
++    int rcvbuf = 0;
++    for (int want = 8 * 1024 * 1024; want >= 256 * 1024; want /= 2)
++    {
++        if (setsockopt(rx, SOL_SOCKET, SO_RCVBUF, &want, sizeof(want)) == 0)
++        {
++            rcvbuf = want;
++            break;
++        }
++    }
++    int sndbuf = 4 * 1024 * 1024; // as StreamingServer sets on the video socket
++    setsockopt(tx, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
++    int one = 1;
++    setsockopt(rx, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof(one));
++    timeval rcvTimeout{0, 200'000};
++    setsockopt(rx, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, sizeof(rcvTimeout));
++
++    sockaddr_in addr{};
++    addr.sin_family = AF_INET;
++    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    addr.sin_port = 0;
++    if (bind(rx, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
++    {
++        std::perror("bind");
++        return 1;
++    }
++    socklen_t addrLen = sizeof(addr);
++    getsockname(rx, reinterpret_cast<sockaddr*>(&addr), &addrLen);
++    if (addr.sin_addr.s_addr != htonl(INADDR_LOOPBACK))
++    {
++        std::fprintf(stderr, "refusing: destination is not loopback\n");
++        return 1;
++    }
++
++    std::vector<RecvRecord> received;
++    received.reserve(1 << 20);
++    std::atomic<bool> stop{false};
++    std::thread receiver(
++        [&]
++        {
++            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++            uint8_t buf[proto::VIDEO_PACKET_SIZE + 64];
++            alignas(cmsghdr) uint8_t control[256];
++            while (!stop.load())
++            {
++                iovec iov{buf, sizeof(buf)};
++                msghdr msg{};
++                msg.msg_iov = &iov;
++                msg.msg_iovlen = 1;
++                msg.msg_control = control;
++                msg.msg_controllen = sizeof(control);
++                const ssize_t n = recvmsg(rx, &msg, 0);
++                const int64_t userNs = PacingNowNs();
++                if (n < static_cast<ssize_t>(sizeof(proto::VideoPacketHeader)))
++                {
++                    continue;
++                }
++                int64_t kernelUs = 0;
++                for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c))
++                {
++                    if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMP)
++                    {
++                        timeval tv{};
++                        std::memcpy(&tv, CMSG_DATA(c), sizeof(tv));
++                        kernelUs = static_cast<int64_t>(tv.tv_sec) * 1'000'000 + tv.tv_usec;
++                    }
++                }
++                proto::VideoPacketHeader h{};
++                std::memcpy(&h, buf, sizeof(h));
++                received.push_back({h.frameIndex, h.packetIndex, h.flags, kernelUs, userNs});
++            }
++        });
++
++    // ── Sender: synthetic 90 fps stream, packetised like SendNalUnit ────────
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++    PacketPacingConfig pacing;
++    pacing.windowMs = opt.windowMs;
++    pacing.keyframeWindowMs = opt.keyframeMs;
++
++    const int64_t periodNs = 1'000'000'000LL / opt.fps;
++    const uint32_t frames = static_cast<uint32_t>(opt.seconds * opt.fps);
++    // P frames uniform in [lo, hi]; one 300 kB keyframe per second. Scale P so
++    // the mean hits the target bitrate.
++    const double keyBytes = 300'000.0;
++    const double meanBytes = opt.mbps * 1e6 / 8.0 / opt.fps;
++    const double pMean = (meanBytes * opt.fps - keyBytes) / (opt.fps - 1);
++    const double pLo = std::max(15'000.0, pMean - 47'500.0);
++    const double pHi = pMean + (pMean - pLo);
++    std::mt19937 rng(opt.seed);
++    std::uniform_real_distribution<double> pSize(pLo, pHi);
++
++    std::vector<uint8_t> payload(400'000);
++    for (size_t i = 0; i < payload.size(); ++i)
++    {
++        payload[i] = static_cast<uint8_t>(rng());
++    }
++
++    std::vector<SendRecord> sent;
++    sent.reserve(1 << 20);
++    std::vector<FrameInfo> frameInfo(frames);
++    uint8_t packet[proto::VIDEO_PACKET_SIZE];
++    uint64_t totalBytes = 0;
++
++    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // receiver up
++    const int64_t t0 = PacingNowNs() + 10'000'000;
++    for (uint32_t f = 0; f < frames; ++f)
++    {
++        const int64_t frameDue = t0 + static_cast<int64_t>(f) * periodNs;
++        WaitUntilNs(frameDue);
++
++        const bool keyframe = (f % opt.fps) == 0;
++        const size_t size = keyframe ? static_cast<size_t>(keyBytes) : static_cast<size_t>(pSize(rng));
++        const uint32_t dataPackets =
++            static_cast<uint32_t>((size + proto::MAX_PACKET_PAYLOAD - 1) / proto::MAX_PACKET_PAYLOAD);
++        const uint32_t fecPackets = (dataPackets + proto::FEC_GROUP_SIZE - 1) / proto::FEC_GROUP_SIZE;
++
++        FrameInfo& info = frameInfo[f];
++        info.startNs = PacingNowNs();
++        info.keyframe = keyframe;
++        info.packets = dataPackets + fecPackets;
++        PacketPacer pacer(info.startNs, PacingWindowNs(pacing, keyframe, opt.fps), info.packets);
++        // A newer frame is ready once the next frame's slot has begun.
++        const int64_t nextDue = frameDue + periodNs;
++        auto newerFrameWaiting = [&] { return PacingNowNs() >= nextDue; };
++
++        auto sendOne = [&](uint16_t index, uint8_t flags, size_t bytes, const uint8_t* src)
++        {
++            pacer.WaitForNextPacket(newerFrameWaiting);
++            proto::VideoPacketHeader h{};
++            h.frameIndex = f;
++            h.packetIndex = index;
++            h.totalPackets = static_cast<uint16_t>(dataPackets);
++            h.payloadSize = static_cast<uint16_t>(bytes);
++            h.flags = flags;
++            h.presentationTimeNs = info.startNs;
++            std::memcpy(packet, &h, sizeof(h));
++            std::memcpy(packet + sizeof(h), src, bytes);
++            const int64_t now = PacingNowNs();
++            const ssize_t r =
++                sendto(tx, packet, sizeof(h) + bytes, MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
++            sent.push_back({f, index, flags, r < 0, now, static_cast<uint32_t>(sizeof(h) + bytes)});
++            totalBytes += sizeof(h) + bytes;
++            info.lastSendNs = now;
++        };
++
++        size_t offset = 0;
++        for (uint32_t i = 0; i < dataPackets; ++i)
++        {
++            const size_t bytes = std::min(size - offset, proto::MAX_PACKET_PAYLOAD);
++            uint8_t flags = proto::VIDEO_FLAG_STEREO | (keyframe ? proto::VIDEO_FLAG_KEYFRAME : 0);
++            if (i + 1 == dataPackets)
++            {
++                flags |= proto::VIDEO_FLAG_END_OF_FRAME;
++            }
++            sendOne(static_cast<uint16_t>(i), flags, bytes, payload.data() + offset);
++            offset += bytes;
++            if ((i + 1) % proto::FEC_GROUP_SIZE == 0 || i + 1 == dataPackets)
++            {
++                sendOne(static_cast<uint16_t>(i / proto::FEC_GROUP_SIZE),
++                        proto::VIDEO_FLAG_FEC | proto::VIDEO_FLAG_STEREO, proto::MAX_PACKET_PAYLOAD, payload.data());
++            }
++        }
++        info.flushed = pacer.Flushed();
++        info.maxLatenessNs = pacer.MaxLatenessNs();
++    }
++    const int64_t tEnd = PacingNowNs();
++    std::this_thread::sleep_for(std::chrono::milliseconds(300));
++    stop.store(true);
++    receiver.join();
++
++    // ── Analysis ────────────────────────────────────────────────────────────
++    size_t sendFailures = 0;
++    for (const SendRecord& s : sent)
++    {
++        sendFailures += s.failed ? 1 : 0;
++    }
++
++    // Per-frame arrival spans and gaps, from kernel receive timestamps (us).
++    std::map<uint32_t, std::vector<int64_t>> arrivals;
++    for (const RecvRecord& r : received)
++    {
++        arrivals[r.frame].push_back(r.kernelUs);
++    }
++    std::vector<double> spanP, spanK, gaps, addedP, addedK, lateness;
++    size_t flushedFrames = 0;
++    for (auto& [frame, ts] : arrivals)
++    {
++        std::sort(ts.begin(), ts.end());
++        const double span = static_cast<double>(ts.back() - ts.front());
++        (frameInfo[frame].keyframe ? spanK : spanP).push_back(span);
++        for (size_t i = 1; i < ts.size(); ++i)
++        {
++            gaps.push_back(static_cast<double>(ts[i] - ts[i - 1]));
++        }
++    }
++    for (const FrameInfo& fi : frameInfo)
++    {
++        const double added = (fi.lastSendNs - fi.startNs) / 1e6;
++        (fi.keyframe ? addedK : addedP).push_back(added);
++        lateness.push_back(fi.maxLatenessNs / 1e3);
++        flushedFrames += fi.flushed ? 1 : 0;
++    }
++
++    // Peak rate in 1 ms bins (sender timestamps, ns) - what a queue downstream sees.
++    std::map<int64_t, uint64_t> bins;
++    for (const SendRecord& s : sent)
++    {
++        bins[(s.sendNs - t0) / 1'000'000] += s.bytes;
++    }
++    std::vector<double> binMbps;
++    for (const auto& [bin, bytes] : bins)
++    {
++        binMbps.push_back(bytes * 8.0 / 1e3); // bytes per 1 ms -> Mbps
++    }
++
++    // AP queue model (NOT a measurement): FIFO of Q packets drained at R Mbps,
++    // fed with the measured send times; tail drop when full.
++    const double drainNsPerByte = 8.0 * 1e3 / opt.modelDrainMbps; // ns per byte
++    std::vector<int64_t> departures;                              // departure times of packets in queue
++    size_t head = 0;
++    int64_t lastDepart = 0;
++    size_t modelDrops = 0;
++    std::map<uint32_t, uint32_t> modelDropsPerFrame;
++    for (const SendRecord& s : sent)
++    {
++        while (head < departures.size() && departures[head] <= s.sendNs)
++        {
++            ++head;
++        }
++        if (departures.size() - head >= opt.modelQueuePackets)
++        {
++            ++modelDrops;
++            modelDropsPerFrame[s.frame]++;
++            continue;
++        }
++        const int64_t begin = std::max(lastDepart, s.sendNs);
++        lastDepart = begin + static_cast<int64_t>(s.bytes * drainNsPerByte);
++        departures.push_back(lastDepart);
++    }
++    // A frame is unrecoverable when some FEC group lost 2+ packets; approximate
++    // with "2+ drops in the frame" (the drops of a tail burst are consecutive).
++    size_t modelLostFrames = 0;
++    for (const auto& [frame, n] : modelDropsPerFrame)
++    {
++        modelLostFrames += n >= 2 ? 1 : 0;
++    }
++
++    const double secs = (tEnd - t0) / 1e9;
++    std::printf(
++        "pacing window=%.2fms keyframe=%.2fms (effective P %.2f / key %.2f ms) fps=%u target=%.0fMbps rcvbuf=%d\n",
++        opt.windowMs, opt.keyframeMs, PacingWindowNs(pacing, false, opt.fps) / 1e6,
++        PacingWindowNs(pacing, true, opt.fps) / 1e6, opt.fps, opt.mbps, rcvbuf);
++    std::printf(
++        "  sent: frames=%u packets=%zu actual=%.1fMbps sendFailures=%zu received=%zu lost=%zu flushedFrames=%zu\n",
++        frames, sent.size(), totalBytes * 8.0 / secs / 1e6, sendFailures, received.size(),
++        sent.size() - received.size(), flushedFrames);
++    std::printf("  burst span (first->last arrival, us): P p50=%.0f p95=%.0f max=%.0f | key p50=%.0f max=%.0f\n",
++                Percentile(spanP, 0.5), Percentile(spanP, 0.95), Percentile(spanP, 1.0), Percentile(spanK, 0.5),
++                Percentile(spanK, 1.0));
++    std::printf("  intra-frame packet gap (us): p5=%.0f p50=%.0f p95=%.0f\n", Percentile(gaps, 0.05),
++                Percentile(gaps, 0.5), Percentile(gaps, 0.95));
++    std::printf("  peak rate in 1 ms bins (Mbps): p50=%.0f p99=%.0f max=%.0f\n", Percentile(binMbps, 0.5),
++                Percentile(binMbps, 0.99), Percentile(binMbps, 1.0));
++    std::printf("  added latency (frame start->last packet sent, ms): P p50=%.2f p99=%.2f | key max=%.2f\n",
++                Percentile(addedP, 0.5), Percentile(addedP, 0.99), Percentile(addedK, 1.0));
++    std::printf("  pacer wake lateness per frame (us): p50=%.1f p99=%.1f max=%.1f\n", Percentile(lateness, 0.5),
++                Percentile(lateness, 0.99), Percentile(lateness, 1.0));
++    std::printf("  MODEL (not measured) AP FIFO %u pkts @ %.0f Mbps: drops=%zu frames with 2+ drops=%zu/%u\n",
++                opt.modelQueuePackets, opt.modelDrainMbps, modelDrops, modelLostFrames, frames);
++
++    if (!opt.csv.empty())
++    {
++        FILE* out = std::fopen(opt.csv.c_str(), "w");
++        if (out)
++        {
++            std::fprintf(out, "frame,index,flags,recv_kernel_us,recv_user_ns\n");
++            for (const RecvRecord& r : received)
++            {
++                std::fprintf(out, "%u,%u,%u,%lld,%lld\n", r.frame, r.index, r.flags, static_cast<long long>(r.kernelUs),
++                             static_cast<long long>(r.userNs));
++            }
++            std::fclose(out);
++        }
++    }
++    close(rx);
++    close(tx);
++    return 0;
++}
+-- 
+2.43.0
+

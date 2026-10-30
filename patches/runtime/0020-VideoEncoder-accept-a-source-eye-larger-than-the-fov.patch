@@ -1,0 +1,59 @@
+From f5e7e22a6bfacdd56efac2c505ff1639a5d018a2 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 09:58:58 +0000
+Subject: [PATCH 20/23] VideoEncoder: accept a source eye larger than the
+ foveation target (same aspect)
+
+foveation_kernel samples the source by normalized uv through a linear sampler, so a
+supersampled render (Godot render_target_size_multiplier 1.333 = 2879x2879 for a 2160
+target) downsamples into the same encoded layout at no encode cost; the validator
+used to drop every such frame ("invalid foveated texture, dimensions, usage, or
+settings") and the client reconnected until the encoder replacement timed out.
+Smaller sources and other aspects are still refused. Measured 2026-10-19: the test
+card's 3.5 and 5.3 px bands went from 0.83/0.89 to 0.89/1.00 of their large-period
+modulation, encode total 9.5 ms at 90 Hz unchanged.
+
+---
+ runtime/src/VideoEncoder.mm | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/VideoEncoder.mm b/runtime/src/VideoEncoder.mm
+index 726edd7..f7806d6 100644
+--- a/runtime/src/VideoEncoder.mm
++++ b/runtime/src/VideoEncoder.mm
+@@ -533,13 +533,30 @@ bool IsFiniteNormalized(float value)
+     return std::isfinite(value) && value >= 0.0f && value <= 1.0f;
+ }
+ 
++// A source eye LARGER than the announced target is accepted: foveation_kernel samples the source by normalized uv
++// through a linear sampler, so a supersampled render (Godot render_target_size_multiplier 1.333 gives 2879x2879
++// for a 2160 target) is downsampled into the same encoded layout at no encode cost. A smaller source would be an
++// upsample the layout never asked for and is still refused, as is a different aspect. (2026-10-19, sharpness work)
++bool SourceCoversFoveationTarget(const VideoEncoder::FoveationSettings& settings,
++                                 uint32_t sourceEyeWidth,
++                                 uint32_t sourceEyeHeight)
++{
++    if (settings.targetEyeWidth == 0 || settings.targetEyeHeight == 0 ||
++        sourceEyeWidth < settings.targetEyeWidth || sourceEyeHeight < settings.targetEyeHeight)
++    {
++        return false;
++    }
++    const double targetAspect = (double)settings.targetEyeWidth / (double)settings.targetEyeHeight;
++    const double sourceAspect = (double)sourceEyeWidth / (double)sourceEyeHeight;
++    return std::fabs(sourceAspect - targetAspect) <= 0.01 * targetAspect;
++}
++
+ bool IsFoveationSettingsValid(const VideoEncoder::FoveationSettings& settings,
+                               uint32_t sourceEyeWidth,
+                               uint32_t sourceEyeHeight)
+ {
+     return settings.enabled &&
+-           settings.targetEyeWidth == sourceEyeWidth &&
+-           settings.targetEyeHeight == sourceEyeHeight &&
++           SourceCoversFoveationTarget(settings, sourceEyeWidth, sourceEyeHeight) &&
+            IsFiniteRatio(settings.eyeWidthRatio) &&
+            IsFiniteRatio(settings.eyeHeightRatio) &&
+            IsFiniteNormalized(settings.centerSizeX) &&
+-- 
+2.43.0
+

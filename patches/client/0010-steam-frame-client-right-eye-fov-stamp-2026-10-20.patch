@@ -1,0 +1,56 @@
+From 472e47bcb1cca61c6a6bc0f16ae96bc173a4a484 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 09:13:01 +0000
+Subject: [PATCH] steam-frame client: stamp the right eye with the fov the
+ server rendered (mirror of the left), not the real right fov
+
+The tracking packet carries only the left eye fov and the server mirrors it for the right eye; the Frame right eye is not a mirror of its left (0.042/0.030 rad off, measured 2026-10-20 08:58), so the real-fov stamp showed the right eye pixels about 6 deg from where they were rendered and the stream doubled while the overlays did not. FRAME_CLIENT_FOV_REAL=1 restores the old stamp. Logs the mismatch in degrees.
+---
+ clients/steam-frame/src/main.cpp | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 76b58ea..ed17f3b 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -1773,7 +1773,36 @@ static void RenderFrame(App& app)
+                     RenderEye(app, eye, idx[eye]);
+ 
+                     projViews[eye].pose = layerPose[eye];
+-                    projViews[eye].fov = views[eye].fov;
++                    // Per-eye FOV (2026-10-20, first can wear: double vision with the can, but not with the
++                    // keyboard). TrackingPacket.eyeFov carries only the LEFT eye's fov and the server renders the
++                    // right eye with its mirror (InputManager::GetEyeViews). The Frame's right eye is not the mirror of
++                    // its left: measured 08:58:08, L=-1.013/0.903, R=-0.861/1.043, mirror of L=-0.903/1.013, off by
++                    // 0.042/0.030 rad. A layer stamped with the REAL right fov shows the right eye's pixels about 6 deg
++                    // from where they were rendered, and only the stream doubles (the overlays are drawn by SteamVR).
++                    // Stamp the fov the server rendered with, so the compositor places the pixels where the render put
++                    // them; the cost is the sliver of lens the two fovs do not share. FRAME_CLIENT_FOV_REAL=1 restores
++                    // the old stamp for an A/B. The real fix is a per-eye fov in the packet (upstream note).
++                    static const bool kFovReal = getenv("FRAME_CLIENT_FOV_REAL") && atoi(getenv("FRAME_CLIENT_FOV_REAL")) != 0;
++                    XrFovf stampFov = views[eye].fov;
++                    if (eye == 1 && !kFovReal) {
++                        stampFov.angleLeft  = -views[0].fov.angleRight;
++                        stampFov.angleRight = -views[0].fov.angleLeft;
++                        stampFov.angleUp    = views[0].fov.angleUp;
++                        stampFov.angleDown  = views[0].fov.angleDown;
++                        // the measurement: where the real right fov would have shown the render's optical axis
++                        const float tl = tanf(stampFov.angleLeft), tr = tanf(stampFov.angleRight);
++                        const float frac = -tl / (tr - tl);
++                        const float rl = tanf(views[1].fov.angleLeft), rr = tanf(views[1].fov.angleRight);
++                        const float shiftDeg = atanf(rl + frac * (rr - rl)) * 57.2958f;
++                        static float lastShift = 1e9f; static int shiftLogs = 0;
++                        if (fabsf(shiftDeg - lastShift) > 0.25f && shiftLogs < 40) {
++                            lastShift = shiftDeg; shiftLogs++;
++                            LOG_INFO("right-eye fov: real L=%.3f R=%.3f, rendered (mirror of left) L=%.3f R=%.3f; the real fov would show the render axis %.2f deg to the %s; stamping the rendered fov",
++                                     views[1].fov.angleLeft, views[1].fov.angleRight, stampFov.angleLeft, stampFov.angleRight,
++                                     fabsf(shiftDeg), shiftDeg > 0 ? "right" : "left");
++                        }
++                    }
++                    projViews[eye].fov = stampFov;
+                     projViews[eye].subImage.swapchain = sc.handle;
+                     projViews[eye].subImage.imageRect.offset = {0, 0};
+                     projViews[eye].subImage.imageRect.extent = {(int32_t)sc.width, (int32_t)sc.height};
+-- 
+2.44.0
+

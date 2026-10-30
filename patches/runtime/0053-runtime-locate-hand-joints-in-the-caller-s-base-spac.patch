@@ -1,0 +1,262 @@
+From db6be419aef4cde6f39c700c17c8e53e186e192d Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:16:27 +0000
+Subject: [PATCH 53/54] runtime: locate hand joints in the caller's base space
+
+xrLocateHandJointsEXT ignored XrHandJointsLocateInfoEXT::baseSpace and
+returned joint poses in the runtime's world space. A caller that asks for
+the joints relative to a controller's grip space (OpenComposite does, to
+build the OpenVR skeleton) then received world coordinates as a
+grip-relative offset, and the skeletal hand was drawn meters away from
+the controller.
+
+Locate the base space in world and express every joint in it. An unknown
+or foreign base space is XR_ERROR_HANDLE_INVALID; a base space that cannot
+be located reports the hand inactive.
+---
+ CMakeLists.txt               |  1 +
+ runtime/src/HandJointSpace.h | 39 +++++++++++++++++++++++++
+ runtime/src/HandTracker.cpp  | 31 +++++++++++++++++++-
+ runtime/src/HandTracker.h    |  1 +
+ runtime/src/Space.cpp        | 10 +++++++
+ runtime/src/Space.h          |  3 ++
+ tests/TestHandJointSpace.cpp | 55 ++++++++++++++++++++++++++++++++++++
+ 7 files changed, 139 insertions(+), 1 deletion(-)
+ create mode 100644 runtime/src/HandJointSpace.h
+ create mode 100644 tests/TestHandJointSpace.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a746f8a..5133ac2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -180,6 +180,7 @@ add_executable(oxrsys_runtime_tests
+     tests/TestEncoderHelperIpc.cpp
+     tests/TestEncoderPathPolicy.cpp
+     tests/TestEncoderSessionKind.cpp
++    tests/TestHandJointSpace.cpp
+     tests/TestInputManager.cpp
+     tests/TestLatencyReportCheck.cpp
+     tests/TestRuntimePlatform.cpp
+diff --git a/runtime/src/HandJointSpace.h b/runtime/src/HandJointSpace.h
+new file mode 100644
+index 0000000..32a1cb5
+--- /dev/null
++++ b/runtime/src/HandJointSpace.h
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: MPL-2.0
++#pragma once
++
++#include <openxr/openxr.h>
++#include <glm/glm.hpp>
++#include <glm/gtc/quaternion.hpp>
++#include <cstdint>
++
++namespace oxr
++{
++
++// Hand joints arrive from the client in the runtime's world space (the client's base space). An app locates
++// them in a base space of its choosing (XrHandJointsLocateInfoEXT::baseSpace), often a controller's grip
++// space: OpenComposite does, to build the OpenVR skeleton relative to the controller. Returning world poses to
++// such a caller puts the hand meters away from the controller, so express every joint in the base space.
++// baseInWorld is the base space's pose in world space, as Space::LocateInWorld gives it.
++inline void ExpressHandJointsInSpace(const XrPosef& baseInWorld, XrHandJointLocationEXT* joints, uint32_t jointCount)
++{
++    if (joints == nullptr)
++    {
++        return;
++    }
++
++    const glm::quat baseRotInv = glm::inverse(glm::quat(baseInWorld.orientation.w, baseInWorld.orientation.x,
++                                                        baseInWorld.orientation.y, baseInWorld.orientation.z));
++    const glm::vec3 basePos(baseInWorld.position.x, baseInWorld.position.y, baseInWorld.position.z);
++
++    for (uint32_t i = 0; i < jointCount; ++i)
++    {
++        XrPosef& pose = joints[i].pose;
++        const glm::vec3 pos = baseRotInv * (glm::vec3(pose.position.x, pose.position.y, pose.position.z) - basePos);
++        const glm::quat rot = baseRotInv * glm::quat(pose.orientation.w, pose.orientation.x,
++                                                     pose.orientation.y, pose.orientation.z);
++        pose.position = {pos.x, pos.y, pos.z};
++        pose.orientation = {rot.x, rot.y, rot.z, rot.w};
++    }
++}
++
++} // namespace oxr
+diff --git a/runtime/src/HandTracker.cpp b/runtime/src/HandTracker.cpp
+index a2a83d9..f9da02a 100644
+--- a/runtime/src/HandTracker.cpp
++++ b/runtime/src/HandTracker.cpp
+@@ -1,9 +1,13 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ #include "HandTracker.h"
++#include "HandJointSpace.h"
+ #include "Session.h"
+ #include "Runtime.h"
+ #include "InputManager.h"
++#include "Space.h"
++
++#include <spdlog/spdlog.h>
+ 
+ namespace
+ {
+@@ -67,7 +71,7 @@ HandTracker::~HandTracker()
+     Runtime::Get().RemoveHandle(handle_);
+ }
+ 
+-XrResult HandTracker::LocateHandJoints(XrSpace /*baseSpace*/, XrTime /*time*/,
++XrResult HandTracker::LocateHandJoints(XrSpace baseSpace, XrTime /*time*/,
+                                         XrHandJointLocationsEXT* locations)
+ {
+     if (locations == nullptr)
+@@ -86,6 +90,12 @@ XrResult HandTracker::LocateHandJoints(XrSpace /*baseSpace*/, XrTime /*time*/,
+         return XR_ERROR_VALIDATION_FAILURE;
+     }
+ 
++    auto* base = Runtime::Get().FromHandle<Space>(reinterpret_cast<uint64_t>(baseSpace));
++    if (base == nullptr || base->GetSession() != session_)
++    {
++        return XR_ERROR_HANDLE_INVALID;
++    }
++
+     const InputManager& inputManager = session_->GetInputManager();
+ 
+     InputManager::Hand hand = (hand_ == XR_HAND_LEFT_EXT)
+@@ -100,9 +110,28 @@ XrResult HandTracker::LocateHandJoints(XrSpace /*baseSpace*/, XrTime /*time*/,
+         return XR_SUCCESS;
+     }
+ 
++    XrPosef baseInWorld{};
++    if (!base->LocateInWorld(&baseInWorld))
++    {
++        // The joints cannot be expressed in an untracked space (a controller that is asleep).
++        locations->isActive = XR_FALSE;
++        ClearJointLocations(locations);
++        ClearJointVelocities(velocities);
++        return XR_SUCCESS;
++    }
++
+     locations->isActive = XR_TRUE;
+     inputManager.GetHandJointLocations(hand, locations->jointLocations, locations->jointCount);
++    oxr::ExpressHandJointsInSpace(baseInWorld, locations->jointLocations, locations->jointCount);
+     ClearJointVelocities(velocities);
+ 
++    // One line every ~5 s per hand: the wrist in the caller's base space. Next to a grip space it is a few cm.
++    if (++locateLogCounter_ % 450 == 1)
++    {
++        const XrVector3f& wrist = locations->jointLocations[XR_HAND_JOINT_WRIST_EXT].pose.position;
++        spdlog::info("HandTracker: {} wrist in base space ({:.3f}, {:.3f}, {:.3f})",
++                     hand_ == XR_HAND_LEFT_EXT ? "left" : "right", wrist.x, wrist.y, wrist.z);
++    }
++
+     return XR_SUCCESS;
+ }
+diff --git a/runtime/src/HandTracker.h b/runtime/src/HandTracker.h
+index add67a3..bc99e44 100644
+--- a/runtime/src/HandTracker.h
++++ b/runtime/src/HandTracker.h
+@@ -34,4 +34,5 @@ class HandTracker
+     uint64_t handle_ = 0;
+     Session* session_;
+     XrHandEXT hand_;
++    uint32_t locateLogCounter_ = 0;
+ };
+diff --git a/runtime/src/Space.cpp b/runtime/src/Space.cpp
+index 9f4b6b5..a192ffc 100644
+--- a/runtime/src/Space.cpp
++++ b/runtime/src/Space.cpp
+@@ -174,6 +174,16 @@ static LocatedWorldPose GetWorldPose(Space* space, const InputManager& inputMana
+     return result;
+ }
+ 
++bool Space::LocateInWorld(XrPosef* pose)
++{
++    LocatedWorldPose located = GetWorldPose(this, session_->GetInputManager());
++    if (pose != nullptr)
++    {
++        *pose = located.pose;
++    }
++    return located.active;
++}
++
+ XrResult Space::LocateSpace(Space* baseSpace, XrTime time, XrSpaceLocation* location)
+ {
+     if (location == nullptr || baseSpace == nullptr)
+diff --git a/runtime/src/Space.h b/runtime/src/Space.h
+index be15268..a0e8a3c 100644
+--- a/runtime/src/Space.h
++++ b/runtime/src/Space.h
+@@ -61,6 +61,9 @@ class Space
+ 
+     XrResult LocateSpace(Space* baseSpace, XrTime time, XrSpaceLocation* location);
+ 
++    // This space's pose in the runtime's world space; false while the space is not tracked.
++    bool LocateInWorld(XrPosef* pose);
++
+ private:
+     uint64_t handle_ = 0;
+     Session* session_;
+diff --git a/tests/TestHandJointSpace.cpp b/tests/TestHandJointSpace.cpp
+new file mode 100644
+index 0000000..717e3e0
+--- /dev/null
++++ b/tests/TestHandJointSpace.cpp
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include <catch2/catch_test_macros.hpp>
++#include <catch2/matchers/catch_matchers_floating_point.hpp>
++
++#include "HandJointSpace.h"
++
++#include <cmath>
++
++using Catch::Matchers::WithinAbs;
++
++TEST_CASE("Hand joints are expressed in the caller's base space", "[hand]")
++{
++    XrHandJointLocationEXT joints[2] = {};
++    // A wrist 1 m in front of the world origin at hand height, and a fingertip 10 cm further.
++    joints[0].pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 1.2f, -1.0f}};
++    joints[1].pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 1.2f, -1.1f}};
++
++    SECTION("an identity base space leaves world poses as they are")
++    {
++        XrPosef world = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
++        oxr::ExpressHandJointsInSpace(world, joints, 2);
++        CHECK_THAT(joints[0].pose.position.y, WithinAbs(1.2f, 1e-5));
++        CHECK_THAT(joints[0].pose.position.z, WithinAbs(-1.0f, 1e-5));
++    }
++
++    SECTION("a grip space at the wrist puts the wrist at its origin, not at the world position")
++    {
++        XrPosef grip = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 1.2f, -1.0f}};
++        oxr::ExpressHandJointsInSpace(grip, joints, 2);
++        CHECK_THAT(joints[0].pose.position.x, WithinAbs(0.0f, 1e-5));
++        CHECK_THAT(joints[0].pose.position.y, WithinAbs(0.0f, 1e-5));
++        CHECK_THAT(joints[0].pose.position.z, WithinAbs(0.0f, 1e-5));
++        CHECK_THAT(joints[1].pose.position.z, WithinAbs(-0.1f, 1e-5));
++    }
++
++    SECTION("a base space turned 180 degrees about +Y sees the fingertip behind it")
++    {
++        // q = (x 0, y 1, z 0, w 0): a half turn about +Y maps (0, 0, -0.1) to (0, 0, +0.1).
++        XrPosef turned = {{0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 1.2f, -1.0f}};
++        oxr::ExpressHandJointsInSpace(turned, joints, 2);
++        CHECK_THAT(joints[1].pose.position.x, WithinAbs(0.0f, 1e-5));
++        CHECK_THAT(joints[1].pose.position.z, WithinAbs(0.1f, 1e-5));
++        // The joint's own orientation, identity in world, is the inverse half turn in the base: still about Y.
++        CHECK_THAT(std::abs(joints[1].pose.orientation.y), WithinAbs(1.0f, 1e-5));
++        CHECK_THAT(joints[1].pose.orientation.w, WithinAbs(0.0f, 1e-5));
++    }
++
++    SECTION("a base space shifted 1 m along +X sees the wrist 1 m along -X")
++    {
++        XrPosef shifted = {{0.0f, 0.0f, 0.0f, 1.0f}, {1.0f, 1.2f, -1.0f}};
++        oxr::ExpressHandJointsInSpace(shifted, joints, 2);
++        CHECK_THAT(joints[0].pose.position.x, WithinAbs(-1.0f, 1e-5));
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

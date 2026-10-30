@@ -1,0 +1,113 @@
+From 9c482c28fa02763439312b80d4bdfe894c373bbe Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 08:11:16 +0000
+Subject: [PATCH 11/23] runtime: rate lock holds the client queue wait
+ (pacing_lock_wait_ms = 6), not the total age
+
+Worn, a 15 ms age setpoint was a full period of pickup latency (13-14.6 ms measured); the wait before pickup
+is the part of the age that is this sender phase, with a floor near 0. GetClientQueueWaitMs on StreamingServer.
+---
+ runtime/src/Config.cpp        |  4 ++--
+ runtime/src/Config.h          | 16 ++++++++--------
+ runtime/src/Session.cpp       | 10 +++++-----
+ runtime/src/StreamingServer.h |  8 ++++++++
+ 4 files changed, 23 insertions(+), 15 deletions(-)
+
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index a93175d..e51c7f8 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -404,9 +404,9 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+                 value = ParseString(value);
+                 values.pacingThread = (value == "qos" || value == "realtime") ? value : "default";
+             }
+-            else if (key == "pacing_lock_age_ms")
++            else if (key == "pacing_lock_wait_ms")
+             {
+-                values.pacingLockAgeMs = std::max(0.0f, std::min(30.0f, std::stof(value)));
++                values.pacingLockWaitMs = std::max(0.0f, std::min(30.0f, std::stof(value)));
+             }
+             else if (key == "pacing_spin_ms")
+             {
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index d0364fa..f2985e5 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -34,14 +34,14 @@ struct ConfigValues
+     // pacing_thread: "default" | "qos" (USER_INTERACTIVE QoS on the app thread that calls WaitFrame)
+     // | "realtime" (Mach time-constraint policy: period = frame, computation 2 ms, constraint 5 ms).
+     std::string pacingThread = "default";
+-    // pacing_lock_age_ms: hold the client's reported displayed-frame age at this value by trimming
+-    // the WaitFrame period (PI, clamped to 0.5% of the period); locks the sender's rate to the
+-    // panel's. 0 = off. Measured 2026-10-18 on the Frame: unlocked, the age walks 6 -> 19 ms
+-    // every ~2 min. The achievable band is [floor, floor + period) where floor is the client's
+-    // decode + pickup time (8.3 ms at 1728x1728); a setpoint below the floor drives the sender
+-    // slower and slower and starves the client (trim pinned, 0.5% repaints, first try at 8 ms).
+-    // Aim for the middle of the band: 15 ms here.
+-    float pacingLockAgeMs = 15.0f;
++    // pacing_lock_wait_ms: hold the time a decoded frame waits on the client before it is shown
++    // (its displayed age minus receive->submit, decode and the client's eye pass - the part that is
++    // this sender's phase) at this value, by trimming the WaitFrame period (PI, clamp 0.5% of the
++    // period). That locks the sender's rate to the panel's and sets the latency margin: worn on the
++    // Steam Frame the wait's floor is ~0 ms and arrivals jitter sd 1.3-3.3 ms with 25-30 ms spikes,
++    // so 6 ms buys the lock without a frame of waiting (a fixed 15 ms AGE setpoint, the first form,
++    // cost a full period of pickup latency worn: 13-14.6 ms). 0 = off. Measured 2026-10-18.
++    float pacingLockWaitMs = 6.0f;
+     // Feed the low-latency (rtvc) or software session the BGRA surface directly
+     // instead of a BT.709 video-range 4:2:0 conversion of each frame (about 1 ms
+     // of submit per frame, measured 2026-10-17). Those sessions then write a
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index 0cdec2b..e23b59c 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -573,15 +573,15 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+         // different crystals (72.000 vs 72.1 Hz measured): their phase slides through a period
+         // every ~2 min, and the client's displayed-frame age (decoded -> shown) walks 6 -> 19 ms
+         // and back, with a repaint or a skipped frame at every wrap - "the boxes slow down
+-        // cyclically". The client reports that age about once a second; hold it at
+-        // pacing_lock_age_ms by trimming the period: age too large means we run early, so
+-        // lengthen. PI, trim clamped to 0.5% of the period (far more than the 0.14% drift),
++        // cyclically". The client reports that age about once a second; hold the part of it that
++        // is our phase (the decoded frame's wait before pickup) at pacing_lock_wait_ms by trimming
++        // the period: waiting too long means we run early, so lengthen. PI, trim clamped to 0.5% of the period (far more than the 0.14% drift),
+         // reset whenever the client's report counter restarts (reconnect) or nobody is connected.
+         {
+             static uint32_t lastReportCount = 0;
+             static double integralMs = 0.0;
+             static double trimNs = 0.0;
+-            const float setpoint = Config::Get().GetValues().pacingLockAgeMs;
++            const float setpoint = Config::Get().GetValues().pacingLockWaitMs;
+             if (setpoint > 0.0f && streamingServer_ && streamingServer_->IsClientConnected())
+             {
+                 const uint32_t count = streamingServer_->GetClientLatencyReportCount();
+@@ -589,7 +589,7 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+                 {
+                     if (count < lastReportCount) { integralMs = 0.0; trimNs = 0.0; }
+                     lastReportCount = count;
+-                    const double errMs = (double)streamingServer_->GetClientDisplayedFrameAgeMs() - setpoint;
++                    const double errMs = (double)streamingServer_->GetClientQueueWaitMs() - setpoint;
+                     integralMs = std::clamp(integralMs + errMs, -15.0, 15.0);   // anti-windup: at most 0.15% from the integral
+                     const double periodNs = (double)targetFrameTime.count();
+                     const double maxTrim = 0.005 * periodNs;
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index 3d5f635..dabf32f 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -88,6 +88,14 @@ class StreamingServer
+     // that carried it, so a reader can act once per report. Both reset on disconnect.
+     float GetClientDisplayedFrameAgeMs() const { return clientDisplayedFrameAgeMs_.load(); }
+     uint32_t GetClientLatencyReportCount() const { return clientLatencyReportCount_.load(); }
++    // How long the displayed frame sat decoded and untaken on the client (ms): its age minus
++    // receive->submit, decode and the client's eye pass. The part of the age that is this sender's
++    // phase against the panel - what the rate lock holds.
++    float GetClientQueueWaitMs() const
++    {
++        return clientDisplayedFrameAgeMs_.load() - clientReceiveToSubmitMs_.load()
++             - clientDecodeLatencyMs_.load() - clientCompositorLatencyMs_.load();
++    }
+ 
+     // Get the connected client info
+     std::string GetClientName() const;
+-- 
+2.43.0
+

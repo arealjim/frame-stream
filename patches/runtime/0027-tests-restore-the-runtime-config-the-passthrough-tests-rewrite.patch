@@ -1,0 +1,87 @@
+From 73b86f34e9ae9d0eb8f2dcd7310460dc184a688d Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 23:50:22 +0000
+Subject: [PATCH] tests: put the user's runtime config back after the
+ passthrough tests rewrite it
+
+WriteRuntimeConfig() writes a five-line stub over $HOME/Library/Application Support/OXRSys/oxrsys-runtime.toml.
+ctest points HOME at build/test-env, but running oxrsys_runtime_api_tests directly (as a reviewer does) used the
+real file and left the stub there: send pacing, refresh rate, keyframe interval and the rest silently reverted to
+defaults for the next stream. Each test that writes the config now holds a RuntimeConfigRestore, which restores
+the original bytes (or removes the file if there was none) when the test ends, failed REQUIREs included.
+---
+ tests/TestRuntimeApi.cpp | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/tests/TestRuntimeApi.cpp b/tests/TestRuntimeApi.cpp
+index 29a13e6..97c5cd7 100644
+--- a/tests/TestRuntimeApi.cpp
++++ b/tests/TestRuntimeApi.cpp
+@@ -14,6 +14,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <iterator>
+ #include <string>
+ #include <thread>
+ #include <vector>
+@@ -89,6 +90,40 @@ std::filesystem::path RuntimeConfigPath()
+            "Library/Application Support/OXRSys/oxrsys-runtime.toml";
+ }
+ 
++// WriteRuntimeConfig replaces the user's real runtime config; a test that calls it holds one of these, which puts the
++// file back (or removes it, if there was none) when the test ends, failed REQUIREs included.
++class RuntimeConfigRestore
++{
++public:
++    RuntimeConfigRestore() : path_(RuntimeConfigPath())
++    {
++        std::ifstream file(path_, std::ios::binary);
++        if (file.is_open())
++        {
++            existed_ = true;
++            saved_.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
++        }
++    }
++    ~RuntimeConfigRestore()
++    {
++        std::error_code ignored;
++        if (!existed_)
++        {
++            std::filesystem::remove(path_, ignored);
++            return;
++        }
++        std::ofstream file(path_, std::ios::binary | std::ios::trunc);
++        file << saved_;
++    }
++    RuntimeConfigRestore(const RuntimeConfigRestore&) = delete;
++    RuntimeConfigRestore& operator=(const RuntimeConfigRestore&) = delete;
++
++private:
++    std::filesystem::path path_;
++    std::string saved_;
++    bool existed_ = false;
++};
++
+ void WriteRuntimeConfig(bool passthroughEnabled, bool appAlphaBlendPassthrough = false)
+ {
+     const std::filesystem::path path = RuntimeConfigPath();
+@@ -420,6 +455,7 @@ TEST_CASE("Instance view and blend APIs reject missing output pointers", "[runti
+ 
+ TEST_CASE("Alpha blend modes are stable for an instance after config reload", "[runtime][passthrough]")
+ {
++    RuntimeConfigRestore restoreConfig;
+     WriteRuntimeConfig(true, true);
+ 
+     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
+@@ -458,6 +494,7 @@ TEST_CASE("Alpha blend modes are stable for an instance after config reload", "[
+ 
+ TEST_CASE("Passthrough underlay alone does not advertise alpha blend", "[runtime][passthrough]")
+ {
++    RuntimeConfigRestore restoreConfig;
+     WriteRuntimeConfig(true, false);
+ 
+     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
+-- 
+2.50.1 (Apple Git-155)
+

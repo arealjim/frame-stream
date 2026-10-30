@@ -1,0 +1,1284 @@
+#!/bin/bash
+# frame-stream - PC VR from an Apple Silicon Mac into the Steam Frame, as one command. Run it on the Mac.
+#
+#   frame-stream up [--app godot|unity|unreal|external] [--mac-ip IP | --via-hotspot] [--bitrate N]
+#                   [--ffe off|light|medium|medium_plus|dense_2880|high] [--render PROFILE] [--full-range on|off]
+#                   [--low-latency on|off]   on: about 12 ms less latency, more repainted frames (off by default)
+#                   [--rate 72|80|90|120]    the headset's panel rate for apps; it stays set (default: leave it, 90 after install)
+#                   [--depth on|off]         SteamVR warps head movement by the app's depth (needs a depth-grid runtime + client; down turns it off)
+#                   [--force-second]         start even though something is already streaming (logged)
+#   frame-stream down                  stop the headset client and quit the engine that up started (only that one)
+#   frame-stream streams               what is streaming, or in the way of a new stream, and how to stop each (exit 3 if any)
+#   frame-stream status                both ends and the stream's health on one screen
+#   frame-stream log [-f|-n N]         the headset client's log, filtered to what matters
+#   frame-stream audio on|off|status  game sound into the headset (up starts it, down stops it; see FRAME_STREAM_AUDIO)
+#   frame-stream card on|off           show or hide the Godot test scene's sharpness card and text rows, live
+#   frame-stream passthrough [F DOWN BASE DEPTH | off]   render from the passthrough cameras (see docs/troubleshooting.md)
+#   frame-stream check-link            read-only check of the hotspot link: bands, roaming lock, AWDL, the Mac's profile
+#   frame-stream doctor [--fix]        the whole setup: the link, what is really running on each end, the Mac, Wine.
+#                                      Read-only; --fix acts on this Mac only (AWDL, the firewall), never on the headset
+#   frame-stream watch                 during a session: one line when something goes wrong, with its cure (Ctrl-C ends it)
+#   frame-stream bench [--seconds N] [--warmup N] [--label TEXT] [up's options]   start, measure, stop: the latency
+#                                      chain, Mac encode, headset decode, SteamVR's reprojected count; one JSON line
+#   frame-stream get [--all | KEY...]  the stream settings on file, and when each takes effect: live, at the next
+#                                      client connect, or at the next up (docs/live-tuning.md has the measured table)
+#   frame-stream set KEY=VALUE... [--reconnect]   change settings on a running stream; --reconnect restarts the
+#                                      headset client so connect-time keys (bitrate_mbps, encoder_min_qp, ...) land now
+#   frame-stream ab "K=V,..." "K=V,..." [--every S] [--rounds N] [--reconnect]   flip between two settings while you
+#                                      wear it; every flip is logged to ab.jsonl, the old settings come back on exit
+#
+#   --app godot      engines/godot in Godot 4 (Vulkan via MoltenVK); the default
+#   --app unity      the Unity project made from engines/unity, in Play Mode (~60 s to the first frame)
+#   --app unreal     the Unreal project made by engines/unreal/mkproject.sh, as -game -vr (~40 s)
+#   --app external   your own app, already running with XR_RUNTIME_JSON pointing at the OXRSys runtime;
+#                    only the headset client is started
+#   --mac-ip IP      the address the headset reaches this Mac on. Default: the USB-C tether's address if the cable
+#                    is in, else FRAME_STREAM_MAC_IP. --via-hotspot takes it from the headset's hotspot lease table.
+#                    The tether is found by its first three octets, FRAME_STREAM_USB_NET (default 10.86.200).
+#   --bitrate N      Mbit/s (default 50); --ffe foveated encoding preset (medium_plus is the largest that fits 90 Hz on
+#                    an M5); --render the per-eye size the runtime announces (quest3, steam_frame, steam_frame_native,
+#                    steam_frame_dense); --full-range streams full-range video. These four edit the runtime's toml,
+#                    so they need the engine stopped first.
+#
+# Settings, all optional (environment):
+#   FRAME_STREAM_FRAME     ssh destination of the headset (default: frame - add a Host frame entry to ~/.ssh/config)
+#   FRAME_STREAM_RUNTIME   the OXRSys runtime build dir (default ~/src/oxrsys/build/macos-arm64/runtime)
+#   FRAME_STREAM_GODOT     Godot binary (default /Applications/Godot.app/Contents/MacOS/Godot)
+#   FRAME_STREAM_GODOT_PROJECT, FRAME_STREAM_UNITY_PROJECT, FRAME_STREAM_UNREAL_PROJECT   the engine projects
+#   FRAME_STREAM_GODOT_METHOD   Godot renderer: forward_plus (default, what the stand has always run) or mobile
+#   FRAME_STREAM_UNITY_APP the Unity editor .app (default: the newest 6000.3 under the Hub's install dir)
+#   FRAME_STREAM_UE_ENGINE the Unreal engine dir (default /Users/Shared/Epic Games/UE_5.8)
+#   FRAME_STREAM_AUDIO     1 (default): up plays this Mac's sound in the headset (output switched to BlackHole 2ch,
+#                          the old one back on down); 0 leaves the Mac's sound alone
+#   FRAME_CLIENT_*         forwarded to the headset client (frame/oxrsys-client lists them)
+#
+# One client per runtime: never run the OXRSys Simulator with --auto-connect beside a headset. Two clients interleave
+# their tracking and the view shakes violently; 'up' refuses while the simulator runs.
+set -euo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)
+
+FRAME=${FRAME_STREAM_FRAME:-frame}
+MAC_IP=${FRAME_STREAM_MAC_IP:-}
+RUNTIME_DIR=${FRAME_STREAM_RUNTIME:-$HOME/src/oxrsys/build/macos-arm64/runtime}
+GODOT=${FRAME_STREAM_GODOT:-/Applications/Godot.app/Contents/MacOS/Godot}
+GODOT_PROJECT=${FRAME_STREAM_GODOT_PROJECT:-$HERE/engines/godot}
+UNITY_PROJECT=${FRAME_STREAM_UNITY_PROJECT:-$HOME/src/unity-smoke}
+UNREAL_PROJECT=${FRAME_STREAM_UNREAL_PROJECT:-$HOME/src/unreal-smoke/UnrealSmoke.uproject}
+UE_ENGINE=${FRAME_STREAM_UE_ENGINE:-/Users/Shared/Epic Games/UE_5.8}
+LOGS=$HOME/Library/Logs/frame-stream
+APPDATA="$HOME/Library/Application Support/OXRSys"
+RUNTIME_LOG="$APPDATA/oxrsys-runtime.log"
+DECODER=${FRAME_CLIENT_DECODER:-hevc_v4l2m2m}
+FILTER='pose match|ClientConnect|dropped \(|requested keyframe|Session state|connection lost|first decoded|decode:|ERROR'
+
+die(){ echo "frame-stream: $*" >&2; exit 1; }
+say(){ echo "frame-stream: $*"; }
+frame(){  # ssh exits 255 for its own failures: say so, or a caller under set -e would end the script without a word
+  local r=0; ssh -o ConnectTimeout=8 "$FRAME" "$@" || r=$?
+  [ "$r" -ne 255 ] || echo "frame-stream: cannot reach the headset as '$FRAME' (set FRAME_STREAM_FRAME, or add Host frame to ~/.ssh/config)" >&2
+  return "$r"
+}
+[ "$(uname -s)" = Darwin ] || die "run this on the Mac (the headset is reached over ssh)"
+
+unity_app(){
+  if [ -n "${FRAME_STREAM_UNITY_APP:-}" ]; then echo "$FRAME_STREAM_UNITY_APP"; return; fi
+  # ls fails when either Hub folder is missing; under pipefail that failure would end the script silently, so swallow it
+  { ls -d /Applications/Unity/Hub/Editor/6000.3.*/Unity.app "$HOME"/Applications/Unity/Hub/Editor/6000.3.*/Unity.app 2>/dev/null || true; } | sort -V | tail -1
+}
+app_pid(){ case "$1" in godot) pgrep -x Godot;; unity) pgrep -x Unity;; unreal) pgrep -x UnrealEditor;; esac 2>/dev/null | head -1 || true; }
+apps_running(){ local a p out=""; for a in godot unity unreal; do p=$(app_pid $a); if [ -n "$p" ]; then out="$out $a($p)"; fi; done; echo "${out# }"; }
+app_log(){ case "$1" in godot) echo "$LOGS/godot.log";; unity) echo "$LOGS/unity.log";; *) echo "$RUNTIME_LOG";; esac; }
+sim_pid(){ pgrep -f "OXRSys Simulator" 2>/dev/null | head -1 || true; }
+# The runtime never retries a failed bind: a wedged earlier process on UDP 9944-9946 leaves the next session deaf.
+ports_busy(){ { lsof -nP -iUDP:9944-9946 2>/dev/null || true; } | tail -n +2 | awk '{print $1"("$2")"}' | sort -u | tr '\n' ' '; }   # lsof exits 1 on no match
+
+# 'up' records the pid of the engine it launched, and 'down' stops only that process: an editor you opened yourself,
+# with your own unsaved work in it, is left alone.
+app_name(){ case "$1" in godot) echo Godot;; unity) echo Unity;; unreal) echo UnrealEditor;; esac; }
+record_pid(){ local p; p=$(app_pid "$1"); if [ -n "$p" ]; then echo "$p" > "$LOGS/$1.pid"; fi; }
+our_pid(){  # the recorded pid of <app>, if that process is still the engine we started
+  local f="$LOGS/$1.pid" p; [ -f "$f" ] || return 0; p=$(cat "$f")
+  if [[ "$p" =~ ^[0-9]+$ ]] && pgrep -x "$(app_name "$1")" | grep -qx "$p"; then echo "$p"; fi
+}
+stop_app(){  # TERM, ten seconds, KILL. Unity also leaves a lock and a scene backup that make the next launch wait
+  local a=$1 p; p=$(our_pid $a); rm -f "$LOGS/$a.pid"   # behind two dialogs nobody can see.
+  if [ -z "$p" ]; then
+    if [ -n "$(app_pid $a)" ]; then say "leaving $a (pid $(app_pid $a)) alone: frame-stream did not start it; quit it yourself"; fi
+    return 0
+  fi
+  say "stopping $a (pid $p, started by frame-stream up)"
+  kill "$p" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+  kill -0 "$p" 2>/dev/null && { kill -9 "$p"; sleep 3; }
+  if [ "$a" = unity ]; then rm -rf "$UNITY_PROJECT/Temp/__Backupscenes" "$UNITY_PROJECT/Temp/UnityLockfile"; fi
+  ! kill -0 "$p" 2>/dev/null || die "$a is still running (pid $p)"
+}
+
+# The runtime status file names the app and its pid, stamped on every state change.
+runtime_status(){
+  local f="$APPDATA/runtime_status.json"; [ -f "$f" ] || { echo none; return; }
+  python3 -c 'import json,sys,time,os
+d=json.load(open(sys.argv[1])); pid=d.get("process_id",0)
+try: os.kill(pid,0); alive="alive"
+except Exception: alive="dead"
+print(d.get("state","?"), d.get("application_name","?").replace(" ","_"), pid, alive, int(time.time()-d.get("updated_at_unix_ms",0)/1000))' "$f"
+}
+wait_runtime(){  # <app> <seconds/2>
+  local a=$1 n=$2 st s_state s_app s_pid s_alive s_age
+  for _ in $(seq 1 "$n"); do
+    sleep 2
+    [ -n "$(app_pid $a)" ] || die "$a exited before the runtime came up - see $(app_log $a)"
+    st=$(runtime_status); if [ "$st" = none ]; then continue; fi
+    read -r s_state s_app s_pid s_alive s_age <<<"$st"
+    if [ "$s_alive" = alive ] && [ "$s_age" -lt 20 ] && [ "$s_state" != "?" ]; then say "$a runtime up: $s_app pid $s_pid, state $s_state"; return 0; fi
+  done
+  die "$a's OXRSys runtime did not come up in $((n*2)) s - see $(app_log $a) (last status: $(runtime_status))"
+}
+
+# One stream at a time (2026-10-28): two engines on the runtime's ports, or a second up pointing the headset at
+# whichever engine it found first, gives a stream nobody asked for. up refuses while anything below is found, names
+# it and says how to stop it; --force-second starts anyway and logs it. One line per thing: "<what> | <how to stop it>".
+# Arg: the runtime's live pid when --app external is about to stream that app, so it and its own processes pass.
+ancestors(){ local c=$1 a=" $1 " _; for _ in 1 2 3 4 5 6 7 8; do c=$(ps -o ppid= -p "$c" 2>/dev/null | tr -d ' '); [ -n "$c" ] && [ "$c" -gt 1 ] || break; a="$a$c "; done; echo "$a"; }
+streams_up(){
+  local skip=${1:-} rt a p engines=" " pid cmd ports
+  rt=$(runtime_status | awk '$4=="alive"{print $3}')
+  for a in godot unity unreal; do
+    p=$(app_pid $a); [ -n "$p" ] || continue; engines="$engines$p "; [ "$p" = "$skip" ] && continue
+    if [ -n "$(our_pid $a)" ]; then echo "$a (pid $p, started by frame-stream up) | frame-stream down"
+    else echo "$a (pid $p, not started by frame-stream) | quit it yourself"; fi
+  done
+  for pid in $({ lsof -nP -iUDP:9944-9946 2>/dev/null || true; } | awk 'NR>1{print $2}' | sort -u); do
+    case "$engines" in *" $pid "*) continue;; esac; [ "$pid" = "$skip" ] && continue
+    cmd=$(ps -o command= -p "$pid" 2>/dev/null | cut -c1-100); ports=$(lsof -nP -a -p "$pid" -iUDP:9944-9946 2>/dev/null | awk 'NR>1{sub(/.*:/,"",$9); print $9}' | sort -u | tr '\n' ' ')
+    # Under Wine a game's sockets are held by more than its status-file pid: its own children, and Steam's
+    # steamerrorreporter64.exe -pid=<game>, which Steam starts beside every game it launches and which holds copies of
+    # them. Those are the external app, not a rival (Pistol Whip, 2026-10-28).
+    if [ -n "$rt" ] && [ "$pid" != "$rt" ]; then
+      case "$(ancestors "$pid")" in *" $rt "*) [ "$skip" = "$rt" ] && continue; echo "$cmd (pid $pid, part of the app on pid $rt) holds UDP ${ports% } | quit that app"; continue;; esac
+      case "$cmd" in *steamerrorreporter64.exe\ -pid=*) [ "$skip" = "$rt" ] && continue; echo "$cmd (pid $pid, Steam's error reporter for the app on pid $rt) holds UDP ${ports% } | quit that app"; continue;; esac
+    fi
+    echo "$cmd (pid $pid) holds UDP ${ports% }, the runtime's ports | quit it, or kill -9 $pid if it is wedged (the runtime never retries a bind)"
+  done
+  if [ -n "$rt" ] && [ "$rt" != "$skip" ]; then
+    case "$engines" in *" $rt "*) ;; *) echo "$(runtime_status | awk '{print $2}') (pid $rt) is running on the OXRSys runtime, an app frame-stream did not start | quit it (frame-stream down stops only the headset client for it)";; esac
+  fi
+  local since; since=$(frame "systemctl --user is-active --quiet oxrsys-client.service && systemctl --user show oxrsys-client.service -p ActiveEnterTimestamp --value" 2>/dev/null || true)
+  if [ -n "$since" ]; then echo "the headset client (up since $since) | frame-stream down"; fi
+  return 0
+}
+cmd_streams(){
+  local l; l=$(streams_up); if [ -z "$l" ]; then say "nothing is streaming"; return 0; fi
+  while IFS='|' read -r what how; do echo "  ${what% }"; echo "     stop: ${how# }"; done <<<"$l"; return 3
+}
+
+# The runtime reads ~/Library/Application Support/OXRSys/oxrsys-runtime.toml when it exists, and only then the toml
+# beside the library; the simulator's settings panel creates the first, after which the second is silently ignored.
+cfg(){ if [ -f "$APPDATA/oxrsys-runtime.toml" ]; then echo "$APPDATA/oxrsys-runtime.toml"; else echo "$RUNTIME_DIR/oxrsys-runtime.toml"; fi; }
+get_key(){ { grep -E "^$1 *=" "$(cfg)" 2>/dev/null || true; } | awk -F'= *' '{print $2}' | tr -d '"'; }
+set_key(){  # set or insert "<key> = <value>" under [streaming]
+  local c; c=$(cfg)
+  [ -f "$c" ] || die "no runtime config at $c - copy mac/oxrsys-runtime.toml there"
+  if grep -qE "^$1 *=" "$c"; then sed -i '' -E "s/^$1 *=.*/$1 = $2/" "$c"
+  elif grep -q '^\[streaming\]' "$c"; then sed -i '' -E "s/^\[streaming\]\$/[streaming]\\
+$1 = $2/" "$c"
+  else printf '[streaming]\n%s = %s\n' "$1" "$2" >> "$c"; fi
+}
+change_key(){  # <key> <value> <quoted 0|1> <default>: change only when different, and only with no engine running
+  local cur; cur=$(get_key "$1"); cur=${cur:-$4}
+  if [ "$cur" = "$2" ]; then return 0; fi
+  if [ -n "$(apps_running)" ]; then die "$(apps_running) is running with $1 = $cur; 'frame-stream down' first to change it"; fi
+  if [ "$3" = 1 ]; then set_key "$1" "\"$2\""; else set_key "$1" "$2"; fi
+  say "$1 = $2 (was $cur) in $(cfg)"
+}
+
+USB_NET=${FRAME_STREAM_USB_NET:-10.86.200}   # the USB-C tether's first three octets: 10.86.200 on the headset we measured
+find_mac_ip(){  # the USB-C tether puts the Mac on a /29 with the headset; else --mac-ip
+  ifconfig 2>/dev/null | awk -v p="inet $USB_NET." 'index($0, p){print $2; exit}'
+}
+via_hotspot(){
+  MAC_IP=$(frame "awk '{print \$3}' /var/run/softap_dnsmasq.leases 2>/dev/null | head -1" || true)
+  [ -n "$MAC_IP" ] || die "no station holds a lease on the headset's hotspot - is this Mac joined to it?"
+}
+
+# The Unity 6000.3 editor sometimes dies in its first minute: a stack overflow in its own analytics uploader (a Unity
+# editor bug; it stops once Editor analytics is switched off for the account). So a death during startup is retried once.
+launch_unity(){
+  local u; u=$(unity_app); [ -n "$u" ] || die "no Unity 6000.3 editor found; set FRAME_STREAM_UNITY_APP"
+  [ -d "$UNITY_PROJECT/Assets" ] || die "no Unity project at $UNITY_PROJECT - make it with engines/unity/README.md, or set FRAME_STREAM_UNITY_PROJECT"
+  say "starting the Unity editor in Play ($(get_key bitrate_mbps || true) Mbps; ~60 s)"
+  local try
+  for try in 1 2; do
+    if unity_start_once "$u"; then return 0; fi
+    if [ "$try" = 2 ]; then die "the Unity editor quit during startup twice$(unity_crash_note) - see $LOGS/unity.log and docs/troubleshooting.md"; fi
+    say "the Unity editor quit during startup$(unity_crash_note); starting it once more"
+    stop_app unity
+  done
+}
+unity_crash_note(){
+  local r; r=$({ find "$HOME/Library/Logs/DiagnosticReports" -name 'Unity-*.ips' -newer "$LOGS/unity.launch" 2>/dev/null || true; } | sort | tail -1)
+  if [ -n "$r" ]; then echo " (crash report $r)"; fi
+}
+unity_start_once(){  # 0 = in Play with the scene up and the editor alive a full minute; 1 = the editor died; dies on anything else
+  rm -rf "$UNITY_PROJECT/Temp/__Backupscenes" "$UNITY_PROJECT/Temp/UnityLockfile"
+  if [ -f "$LOGS/unity.log" ]; then mv "$LOGS/unity.log" "$LOGS/unity.prev.log"; fi
+  touch "$LOGS/unity.launch"
+  # A GUI app started from a shell without open never gets a window server; open passes the environment with --env:
+  # our own prefixes only, FRAMELAB_ and SMOKE_ for the sample scenes and OXRSYS_ for the runtime inside the app.
+  # engines/unity's Bootstrap.Play reads FRAME_XR_RUNTIME_JSON (it sets XR_RUNTIME_JSON itself just before Play).
+  local rj="$RUNTIME_DIR/oxrsys-runtime.json"
+  local env=(--env "XR_RUNTIME_JSON=$rj" --env "FRAME_XR_RUNTIME_JSON=$rj"); local kv
+  while IFS= read -r kv; do env+=(--env "$kv"); done < <(env | grep -E '^(FRAMELAB|SMOKE|OXRSYS)_' || true)
+  open -n -a "$1" "${env[@]}" --args -projectPath "$UNITY_PROJECT" -executeMethod FrameLab.Bootstrap.Play -logFile "$LOGS/unity.log"
+  local t0=$SECONDS up=""
+  sleep 3; [ -n "$(app_pid unity)" ] || return 1
+  record_pid unity
+  # Play may still be compiling after the runtime is up: the rig's first report says the scene has a tracked camera.
+  while [ $((SECONDS - t0)) -lt 150 ]; do
+    sleep 2
+    [ -n "$(app_pid unity)" ] || return 1
+    if [ -z "$up" ] && grep -q 'frame-lab rig: scene' "$LOGS/unity.log" 2>/dev/null; then up=1; say "Unity in Play, scene up"; fi
+    if [ -n "$up" ] && [ $((SECONDS - t0)) -ge 60 ]; then return 0; fi
+  done
+  # The status file outlives its app (another engine's, or a dead one): only a live, fresh one means this runtime came up.
+  local st s_state s_app s_pid s_alive s_age; st=$(runtime_status)
+  read -r s_state s_app s_pid s_alive s_age <<<"$st"
+  if [ "$st" = none ] || [ "$s_alive" != alive ] || [ "${s_age:-99}" -ge 20 ]; then
+    die "Unity's OXRSys runtime did not come up in 150 s - see $LOGS/unity.log (last status: $st)"; fi
+  die "Unity's runtime is up but the scene never reported - see $LOGS/unity.log (runtime: $st)"
+}
+launch_unreal(){
+  local app="$UE_ENGINE/Engine/Binaries/Mac/UnrealEditor.app"
+  [ -d "$app" ] || die "no Unreal editor at $app; set FRAME_STREAM_UE_ENGINE"
+  [ -f "$UNREAL_PROJECT" ] || die "no Unreal project at $UNREAL_PROJECT - make it with engines/unreal/README.md, or set FRAME_STREAM_UNREAL_PROJECT"
+  say "starting Unreal (-game -vr; ~40 s)"
+  local env=(--env "XR_RUNTIME_JSON=$RUNTIME_DIR/oxrsys-runtime.json"); local kv
+  while IFS= read -r kv; do env+=(--env "$kv"); done < <(env | grep -E '^(FRAMELAB|SMOKE|OXRSYS)_' || true)
+  # The engine's own default (BaseEngine.ini [Audio] UnfocusedVolumeMultiplier=0.0) silences a game whose window is not
+  # the Mac's frontmost, which in a stream it never is: worn 2026-10-29 the campfire was silent beside it. Measured at
+  # the headset with a looping cue: rms 1 without this, about 320 with it, Unreal in the background both times.
+  open -n -a "$app" "${env[@]}" --args "$UNREAL_PROJECT" -game -vr -windowed -ResX=1280 -ResY=720 -NoSplash -unattended -abslog="$LOGS/unreal.log" \
+    -ini:Engine:[Audio]:UnfocusedVolumeMultiplier=1.0
+  sleep 3; [ -n "$(app_pid unreal)" ] || die "Unreal did not start ($app)"
+  record_pid unreal
+  wait_runtime unreal 30
+}
+launch_godot(){
+  [ -x "$GODOT" ] || die "no Godot at $GODOT; set FRAME_STREAM_GODOT"
+  say "starting Godot + the OXRSys runtime"
+  if [ -f "$LOGS/godot.log" ]; then mv "$LOGS/godot.log" "$LOGS/godot.prev.log"; fi
+  # Every fd of the launch goes to the log, the subshell's own included: with the redirect on Godot alone, bash's
+  # forked copy of the list kept this script's stdout open until Godot exited, so 'up' over ssh or into a pipe
+  # never returned. exec leaves no shell between us and Godot; disown keeps it out of our job table.
+  # -ApplePersistenceIgnoreState YES: after one Godot crash, macOS holds every new Godot in a modal "reopen windows?"
+  # alert, which nobody at the headset can see, and the runtime never comes up. The flag sits in the argument domain
+  # for this launch only and changes no saved setting.
+  # --rendering-method is spelled out because --rendering-driver alone makes Godot 4.7 run Forward+ and ignore the
+  # project's rendering_method (xr-bench asks for mobile and got forward_plus on every stand run before 10-27).
+  # FRAME_STREAM_GODOT_METHOD=mobile runs the renderer a project asks for; the default keeps what every run measured.
+  # FRAME_STREAM_GODOT_DRIVER=metal runs Godot on Metal instead of Vulkan (MoltenVK). The rare Godot GPU hang
+  # (macOS "firmware-detected lockup", about 1 launch in 80) came on Vulkan every time, once with no headset connected,
+  # so the runtime did no GPU work; Metal is the way around it to try. Stand 10-28, MSAA off: 90 Hz, 3 of 11,721
+  # reprojected, appGPU 2.54 ms, like Vulkan; not yet run long enough to say it never hangs. Vulkan stays the
+  # default: every number was measured on it.
+  local driver=${FRAME_STREAM_GODOT_DRIVER:-vulkan}
+  case $driver in vulkan|metal) ;; *) die "FRAME_STREAM_GODOT_DRIVER is vulkan or metal, not '$driver'";; esac
+  # Godot 4.7's Metal driver aborts on multiview with MSAA (a 2D view of its own 2DMultisampleArray; 10-28), so a
+  # Metal launch needs msaa_3d off. Refuse here rather than crash.
+  if [ "$driver" = metal ] && grep -qE '^anti_aliasing/quality/msaa_3d=[1-9]' "$GODOT_PROJECT/project.godot" 2>/dev/null; then
+    die "Godot on Metal crashes with MSAA on (Godot's multiview bug): set Project Settings > Rendering > Anti Aliasing > MSAA 3D to Disabled, or leave FRAME_STREAM_GODOT_DRIVER unset for Vulkan"
+  fi
+  ( cd ~ || exit 1; export XR_RUNTIME_JSON="$RUNTIME_DIR/oxrsys-runtime.json"
+    exec nohup "$GODOT" --path "$GODOT_PROJECT" --rendering-driver "$driver" --rendering-method "${FRAME_STREAM_GODOT_METHOD:-forward_plus}" --verbose -ApplePersistenceIgnoreState YES ) > "$LOGS/godot.log" 2>&1 < /dev/null &
+  disown
+  sleep 1; record_pid godot
+  for _ in $(seq 1 20); do sleep 1; grep -q 'WaitFrame pacing' "$LOGS/godot.log" 2>/dev/null && break; done
+  grep -q 'WaitFrame pacing' "$LOGS/godot.log" || die "the runtime did not come up in 20 s - see $LOGS/godot.log"
+  say "runtime up"
+}
+
+# A built Unity player stalls when the Mac's display sleeps (the editor does not; stand S4, 2026-10-25), so hold the
+# display and idle sleep off for exactly as long as the streaming app lives: caffeinate -w ends with that pid.
+keep_awake(){
+  local p=${1:-} f="$LOGS/caffeinate.pid"
+  [ -n "$p" ] && command -v caffeinate >/dev/null || return 0
+  if [ -f "$f" ] && [ "$(cat "$f" 2>/dev/null)" = "$p" ] && pgrep -f "caffeinate -d -i -w $p\$" >/dev/null; then return 0; fi
+  nohup caffeinate -d -i -w "$p" >/dev/null 2>&1 &
+  echo "$p" > "$f"
+  say "keeping the Mac's display awake while pid $p runs"
+}
+cmd_up(){
+  local app=godot bitrate="" ffe="" render="" fullrange="" lowlat="" rate="" depth="" force=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --force-second) force=1; shift;;
+    --app) case "${2:-}" in godot|unity|unreal|external) app=$2;; *) die "--app takes godot, unity, unreal or external";; esac; shift 2;;
+    --mac-ip) [[ "${2:-}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "--mac-ip takes an IPv4 address"; MAC_IP=$2; shift 2;;
+    --via-hotspot) via_hotspot; shift;;
+    --bitrate) [[ "${2:-}" =~ ^[0-9]{1,3}$ ]] || die "--bitrate takes whole Mbit/s"; bitrate=$2; shift 2;;
+    --ffe) case "${2:-}" in off|light|medium|medium_plus|dense_2880|high) ffe=$2;; *) die "--ffe takes off, light, medium, medium_plus, dense_2880 or high";; esac; shift 2;;
+    --render) case "${2:-}" in quest2|quest3|avp|steam_frame|steam_frame_native|steam_frame_dense) render=$2;; *) die "--render takes quest2, quest3, avp, steam_frame, steam_frame_native or steam_frame_dense";; esac; shift 2;;
+    --full-range) case "${2:-}" in on|true|1) fullrange=true;; off|false|0) fullrange=false;; *) die "--full-range takes on or off";; esac; shift 2;;
+    --low-latency) case "${2:-}" in on|off) lowlat=$2;; *) die "--low-latency takes on or off";; esac; shift 2;;
+    --rate) case "${2:-}" in 72|80|90|120) rate=$2;; *) die "--rate takes 72, 80, 90 or 120";; esac; shift 2;;
+    --depth) case "${2:-}" in on|off) depth=$2;; *) die "--depth takes on or off";; esac; shift 2;;
+    *) awk 'NR>=4 && /^#   frame-stream down/{exit} NR>=4' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
+  esac; done
+  [ -n "$MAC_IP" ] || MAC_IP=$(find_mac_ip)
+  [ -n "$MAC_IP" ] || die "no USB-C tether address found on $USB_NET.x (FRAME_STREAM_USB_NET); give --mac-ip <the address the headset reaches this Mac on> or --via-hotspot"
+  mkdir -p "$LOGS"
+  [ -f "$RUNTIME_DIR/oxrsys-runtime.json" ] || die "no OXRSys runtime at $RUNTIME_DIR (build it per the README, or set FRAME_STREAM_RUNTIME)"
+  frame true || die "cannot ssh to the headset as '$FRAME' (set FRAME_STREAM_FRAME, or add Host frame to ~/.ssh/config)"
+  local skip="" up_now; if [ "$app" = external ]; then skip=$(runtime_status | awk '$4=="alive"{print $3}'); fi
+  up_now=$(streams_up "$skip")
+  if [ -n "$up_now" ]; then
+    if [ "$force" = 1 ]; then
+      printf '%s --app %s beside: %s\n' "$(date -u +%FT%TZ)" "$app" "$(cut -d'|' -f1 <<<"$up_now" | tr '\n' ';')" >> "$LOGS/force-second.log"
+      say "--force-second: starting beside what is already up (logged to $LOGS/force-second.log):"; cut -d'|' -f1 <<<"$up_now" | sed 's/^/  /'
+    else
+      echo "frame-stream: a stream is already up; up refuses to start a second one. Running now:" >&2
+      while IFS='|' read -r what how; do echo "  ${what% }" >&2; echo "     stop: ${how# }" >&2; done <<<"$up_now"
+      die "stop it first ('frame-stream streams' re-checks), or pass --force-second to start beside it (logged)"
+    fi
+  fi
+  local hz; hz=$(frame 'XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} timeout 10 ~/.local/bin/frame-vrsettings get steamvr defaultPerAppRefreshRate 2>/dev/null' | awk '/^float/{print $2}' || true)
+  # --rate (2026-10-28): the client reads SteamVR's per-app rate when it starts and the Mac paces to what the client
+  # reports, so this one setting moves the whole chain. 120 Hz on the stand: about 39 ms against 50 at 90, 0.1 %
+  # reprojected; the bitrate is per second, so each frame gets three quarters of the bytes it gets at 90.
+  if [ -n "$rate" ] && [ "${hz%.*}" != "$rate" ]; then
+    if frame "systemctl --user is-active --quiet oxrsys-client.service"; then die "--rate needs the headset client stopped first ('frame-stream down'): it reads the rate when it starts"; fi
+    frame "XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)} timeout 10 ~/.local/bin/frame-vrsettings set steamvr defaultPerAppRefreshRate float $rate" >/dev/null 2>&1 || true
+    hz=$(frame 'XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} timeout 10 ~/.local/bin/frame-vrsettings get steamvr defaultPerAppRefreshRate 2>/dev/null' | awk '/^float/{print $2}' || true)
+    [ "${hz%.*}" = "$rate" ] || die "could not set $rate Hz (SteamVR reads ${hz:-nothing}; SteamVR up, frame-vrsettings installed?)"
+    say "SteamVR now runs apps at $rate Hz (it stays set; back: --rate 90)"
+  fi
+  case "${hz%.*}" in 90|120|"") ;; *) say "note: SteamVR runs apps at $hz Hz; this release is tuned for 90 (on the headset: frame-vrsettings set steamvr defaultPerAppRefreshRate float 90)";; esac
+  if [ -n "$(sim_pid)" ]; then die "the OXRSys Simulator is running - quit it first (two clients = a shaking view)"; fi
+  # Positional reprojection (opt-in, 2026-10-28): the runtime sends the app's depth as a grid and the client submits it,
+  # but SteamVR on the Frame only warps by depth with both of these keys set (the first alone tears a seam across the
+  # picture: worn 2026-10-28). They are global and SteamVR keeps them, so down removes them again.
+  if [ "$depth" = on ]; then
+    frame "XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)} timeout 10 ~/.local/bin/frame-vrsettings set steamvr depthReprojection bool true; XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)} timeout 10 ~/.local/bin/frame-vrsettings set steamvr depthReprojectionMesh bool true" >/dev/null 2>&1 || true
+    [ "$(depth_keys)" = "true true" ] || die "could not set SteamVR's depth reprojection keys (they read: $(depth_keys))"
+    say "SteamVR depth reprojection on (down turns it off)"
+  elif [ "$depth" = off ]; then depth_keys_off; fi
+  if [ -n "$bitrate" ]; then change_key bitrate_mbps "$bitrate" 0 50; fi
+  if [ -n "$fullrange" ]; then change_key encoder_full_range "$fullrange" 0 false; fi
+  # Low-latency mode (opt-in, v1 2026-10-28): the speed encoder preset, a one-frame queue on the headset and a 3 ms
+  # grace for a late frame. About 12 ms less head-to-photon on the stand (measured at 80 and 90 Hz), at the cost of more
+  # repainted frames when the link wobbles. The preset stays in the config; the two client settings apply per up.
+  if [ -n "$lowlat" ]; then change_key encoder_preset "$([ "$lowlat" = on ] && echo speed || echo balanced)" 1 balanced; fi
+  if [ "$(get_key encoder_preset)" = speed ]; then
+    export FRAME_CLIENT_QUEUE=${FRAME_CLIENT_QUEUE:-1} FRAME_CLIENT_WAIT_MS=${FRAME_CLIENT_WAIT_MS:-3}
+  fi
+  if [ -n "$ffe" ]; then
+    # Foveated encoding is only announced at resolution_scale 1.0, so the two move together.
+    change_key foveated_encoding_preset "$ffe" 1 off
+    change_key resolution_scale "$([ "$ffe" = off ] && echo 0.75 || echo 1.0)" 0 0.75
+  fi
+  if [ -n "$render" ]; then
+    # 2880 eyes need a 2880 swapchain on the headset, or the denser centre is resampled back down on the way in.
+    if [ "$render" = steam_frame_dense ]; then export FRAME_CLIENT_SWAPCHAIN_SCALE=${FRAME_CLIENT_SWAPCHAIN_SCALE:-1.6667}; fi
+    change_key render_device "$render" 1 quest3
+  fi
+  # Tell the client the range outright: the headset's decoder does not report it.
+  if [ -z "${FRAME_CLIENT_FULL_RANGE:-}" ]; then
+    [ "$(get_key encoder_full_range)" = true ] && export FRAME_CLIENT_FULL_RANGE=1 || export FRAME_CLIENT_FULL_RANGE=0
+  fi
+  # Sound before the engine: it picks the Mac's default output when it starts.
+  if [ "${FRAME_STREAM_AUDIO:-1}" = 1 ]; then audio_on || true; fi
+  if [ "$app" = external ]; then
+    local st s_state s_app s_pid s_alive s_age; st=$(runtime_status)
+    if [ "$st" = none ]; then die "no OXRSys runtime status - start your app with XR_RUNTIME_JSON=$RUNTIME_DIR/oxrsys-runtime.json first"; fi
+    read -r s_state s_app s_pid s_alive s_age <<<"$st"
+    [ "$s_alive" = alive ] || die "the runtime's last app ($s_app, pid $s_pid) is gone - start the app first"
+    say "external app's runtime is live: $s_app pid $s_pid, state $s_state"
+    keep_awake "$s_pid"
+  elif [ -n "$(app_pid $app)" ]; then
+    if [ -n "$(our_pid $app)" ]; then say "$app already running (pid $(app_pid $app))"
+    else say "$app already running (pid $(app_pid $app)), not started by frame-stream: down will leave it running"; fi
+  else
+    local others busy; others=$(apps_running)
+    if [ -n "$others" ]; then die "$others is running; 'frame-stream down' first (one app owns the runtime's ports)"; fi
+    busy=$(ports_busy); if [ -n "$busy" ]; then die "UDP 9944-9946 are held by $busy - a wedged earlier process; kill -9 it first"; fi
+    launch_$app
+  fi
+  [ "$app" = external ] || keep_awake "$(app_pid "$app")"
+  if frame "systemctl --user is-active --quiet oxrsys-client.service"; then
+    say "the headset client is already running"
+  else
+    [[ "$DECODER" =~ ^[a-z0-9_]+$ ]] || die "FRAME_CLIENT_DECODER '$DECODER' is not a plain word"
+    local cenv; cenv=$(env | { grep '^FRAME_CLIENT_' || true; } | { grep -v '^FRAME_CLIENT_DECODER=' || true; } | while IFS= read -r kv; do printf ' %q' "$kv"; done)
+    say "starting the headset client against $MAC_IP"
+    frame "FRAME_CLIENT_DECODER=$DECODER$cenv ~/.local/bin/oxrsys-client start $(printf '%q' "$MAC_IP")" >/dev/null
+  fi
+  sleep 8
+  cmd_status
+}
+
+depth_keys(){ frame "XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)} timeout 10 ~/.local/bin/frame-vrsettings get steamvr depthReprojection 2>/dev/null; XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)} timeout 10 ~/.local/bin/frame-vrsettings get steamvr depthReprojectionMesh 2>/dev/null" | awk '/^bool true/{printf "%s%s", s, $2; s=" "} END{print ""}' || true; }  # an unset key reads its default, bool false: only true counts
+depth_keys_off(){ frame "XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)} timeout 10 ~/.local/bin/frame-vrsettings remove steamvr depthReprojection; XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)} timeout 10 ~/.local/bin/frame-vrsettings remove steamvr depthReprojectionMesh" >/dev/null 2>&1 || true; }
+
+# Game sound (on by default since v1; FRAME_STREAM_AUDIO=0 leaves the Mac's sound alone): the Mac's default output is
+# switched to BlackHole 2ch before the engine starts (Godot, Unity and Unreal play to the default output and pick it at
+# launch), mac/frame-audio-tx sends BlackHole over UDP 9950 and frame-audio-rx plays it into the headset's PipeWire.
+# Before this, only Wine games (whose prefix names BlackHole) could reach the headset, and nothing started the relay:
+# an Unreal stream played out of the MacBook (worn, 2026-10-29). down puts the old output back.
+AUDIO_DEV="BlackHole 2ch"
+AUDIO_BIN=$HOME/.local/share/frame-stream
+audio_out(){  # frame-audio-out, compiled on first use and again when its source changes
+  local src="$HERE/mac/frame-audio-out.swift" bin="$AUDIO_BIN/frame-audio-out"
+  if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
+    command -v swiftc >/dev/null || { echo "frame-stream: game sound needs swiftc (xcode-select --install)" >&2; return 1; }
+    mkdir -p "$AUDIO_BIN" && swiftc -O -o "$bin" "$src" 2>/dev/null || { echo "frame-stream: could not build frame-audio-out" >&2; return 1; }
+  fi
+  "$bin" "$@"
+}
+audio_tx_pids(){ pgrep -f 'mac/[f]rame-audio-tx' 2>/dev/null | tr '\n' ' ' || true; }   # this copy's sender
+audio_tx_any(){ pgrep -f '[f]rame-audio-tx' 2>/dev/null | tr '\n' ' ' || true; }        # any sender: two would play twice
+audio_on(){
+  audio_out has "$AUDIO_DEV" || { say "WARNING: no game sound in the headset: no '$AUDIO_DEV' output on this Mac (README: Requirements)"; return 1; }
+  command -v sox >/dev/null || [ -x /opt/homebrew/bin/sox ] || { say "WARNING: no game sound in the headset: needs sox (brew install sox)"; return 1; }
+  local cur; cur=$(audio_out get)
+  if [ "$(cut -f2 <<<"$cur")" != "$AUDIO_DEV" ]; then
+    mkdir -p "$LOGS"; cut -f1 <<<"$cur" > "$LOGS/audio-prev-output"
+    audio_out set "$AUDIO_DEV" || { say "WARNING: could not switch the Mac's sound to $AUDIO_DEV"; return 1; }
+  fi
+  # The headset's own address on the path to this Mac: the sound goes back the way the headset says hello from.
+  local hs; hs=$(frame "ip route get $(printf '%q' "$MAC_IP") | grep -oE 'src [0-9.]+' | cut -d' ' -f2" || true)
+  [[ "$hs" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { say "WARNING: no game sound: no route from the headset to $MAC_IP"; return 1; }
+  frame "systemctl --user is-active --quiet frame-audio-rx || ~/.local/bin/frame-audio-rx start $(printf '%q' "$MAC_IP")" >/dev/null 2>&1 \
+    || { say "WARNING: no game sound: frame-audio-rx did not start on the headset (re-run frame/install.sh)"; return 1; }
+  local pids; pids=$(audio_tx_any)
+  if [ -z "${pids// /}" ]; then
+    # Capturing needs macOS's microphone permission, which a process under ssh lacks (it records silence, no error):
+    # from a Terminal it inherits Terminal's; otherwise it is opened as a .command in Terminal.
+    if [ -z "${SSH_CONNECTION:-}" ] && [ "${TERM_PROGRAM:-}" = Apple_Terminal ]; then
+      nohup "$HERE/mac/frame-audio-tx" "$hs" >> "$LOGS/audio-tx.log" 2>&1 < /dev/null &
+    else
+      mkdir -p "$AUDIO_BIN"
+      printf '#!/bin/bash\nexec %q %q\n' "$HERE/mac/frame-audio-tx" "$hs" > "$AUDIO_BIN/audio-tx.command"
+      chmod 755 "$AUDIO_BIN/audio-tx.command" && open "$AUDIO_BIN/audio-tx.command"
+    fi
+    local i; for i in 1 2 3 4 5 6 7 8; do sleep 1; pids=$(audio_tx_any); [ -n "${pids// /}" ] && break; done
+    [ -n "${pids// /}" ] || { say "WARNING: no game sound: the sender did not start (is someone logged in to this Mac's desktop?)"; return 1; }
+  fi
+  say "game sound: this Mac's output is $AUDIO_DEV -> $hs:9950 -> the headset (sender pid ${pids% }; FRAME_STREAM_AUDIO=0 skips it)"
+}
+audio_off(){
+  local p pids; pids=$(audio_tx_pids)
+  # The sender is a restart loop around sox | nc: its children first, then the loop, each by pid.
+  for p in $pids; do kill $(pgrep -P "$p") "$p" 2>/dev/null || true; done
+  # A sender this copy did not start (yours, from frame-audio-tx by hand) keeps its receiver.
+  if [ -z "$(audio_tx_any | tr -d ' ')" ]; then frame "systemctl --user stop frame-audio-rx 2>/dev/null" || true; fi
+  local prev; prev=$(cat "$LOGS/audio-prev-output" 2>/dev/null || true)
+  if [ -n "$prev" ] && [ "$(audio_out get 2>/dev/null | cut -f2)" = "$AUDIO_DEV" ]; then
+    audio_out set "$prev" && rm -f "$LOGS/audio-prev-output" && say "this Mac's sound is back on $(audio_out get | cut -f2)"
+  fi
+  [ -z "${pids// /}" ] || say "game sound stopped"
+}
+cmd_audio(){
+  case "${1:-status}" in
+    on) [ -n "$MAC_IP" ] || MAC_IP=$(find_mac_ip); [ -n "$MAC_IP" ] || die "audio on: give FRAME_STREAM_MAC_IP (the address the headset reaches this Mac on)"; audio_on;;
+    off) audio_off;;
+    status) say "game sound: this Mac's output: $(audio_out get | cut -f2); sender: $(audio_tx_pids | sed 's/^ *$/not running/'); headset receiver: $(frame 'systemctl --user is-active frame-audio-rx 2>/dev/null' || true)";;
+    *) die "usage: frame-stream audio on|off|status";;
+  esac
+}
+
+cmd_down(){
+  audio_off
+  if [ -n "$(depth_keys)" ]; then depth_keys_off; say "SteamVR depth reprojection keys removed (they now read: $(depth_keys | sed 's/^$/unset/'))"; fi
+  frame "~/.local/bin/oxrsys-client stop 2>/dev/null; sleep 1; systemctl --user is-active --quiet oxrsys-client.service && echo 'headset client still active' || echo 'headset client stopped'"
+  local a; for a in godot unity unreal; do stop_app $a; done
+  local busy; busy=$(ports_busy); if [ -n "$busy" ]; then say "warning: UDP 9944-9946 still held by $busy (kill -9 it before the next up)"; fi
+  say "nothing is streaming"
+}
+
+cmd_status(){
+  local apps sim; apps=$(apps_running); sim="not running"; if [ -n "$(sim_pid)" ]; then sim="RUNNING - two-client hazard"; fi
+  echo "== Mac"
+  local rt; rt=$(runtime_status | awk '$4=="alive"{print $2"("$3")"}')
+  if [ -z "$apps" ] && [ -n "$rt" ]; then
+    # An app frame-stream did not start reads its own toml (the runtime its XR_RUNTIME_JSON names), which frame-stream
+    # cannot see: printing ours beside it would name the wrong file and settings (2026-10-28).
+    echo "   app+runtime: external:$rt   simulator: $sim"
+    echo "   runtime config: the app's own (its log's \"config from\" line)"
+  else
+  echo "   app+runtime: ${apps:-down}   bitrate: $(get_key bitrate_mbps) Mbps   ffe: $(get_key foveated_encoding_preset)   render: $(get_key render_device)   full range: $(get_key encoder_full_range)   low-latency: $([ "$(get_key encoder_preset)" = speed ] && echo on || echo off)   simulator: $sim"
+  echo "   runtime config: $(cfg)"
+  fi
+  if [ -n "$apps" ]; then
+    local rl; rl=$(app_log "${apps%%(*}")
+    { grep -iE 'client connected|client disconnected|HandleClientConnect' "$rl" | tail -1 | cut -c1-120
+      grep 'WaitFrame pacing' "$rl" | tail -1 | grep -oE 'app late [0-9]+[^;]*'
+      grep 'encode queue' "$rl" | tail -1 | grep -oE '(encDrops|keyframeReq|sendDrops|abr)=[^ ]+|callback\([^)]*\)|total\([^)]*\)' | tr '\n' ' '; echo; } 2>/dev/null | sed 's/^/   /' || true
+  fi
+  echo "== headset"
+  frame 'if systemctl --user is-active --quiet oxrsys-client.service; then
+      since=$(systemctl --user show oxrsys-client.service -p ActiveEnterTimestamp --value)
+      echo "   client: up since $since"
+      L=$(journalctl --user -u oxrsys-client --no-pager -o cat --since "$since")
+      echo "   $(grep -E "ClientConnect answered|no video after" <<<"$L" | tail -1 | sed "s/\[[A-Z]*\] StreamConnection: //")"
+      echo "   $(grep -E "decoder hevc|decoder .*threads" <<<"$L" | tail -1 | sed "s/\[INFO\] VideoDecoder: //")"
+      echo "   $(grep -E "pose match" <<<"$L" | tail -1 | sed "s/\[INFO\] StreamConnection: //;s/pts=[0-9]* //")"
+      echo "   $(grep -E "decode:" <<<"$L" | tail -1 | sed "s/\[INFO\] VideoDecoder: //")"
+      echo "   keyframe requests: $(grep -cE "requested keyframe" <<<"$L")   connection lost: $(grep -cE "connection lost" <<<"$L")"
+    else echo "   client: down"; fi'
+}
+
+# Read by the client once a second; no restart.
+cmd_card(){  # the head-locked test card is uncomfortable worn (2026-10-28); the Godot scene re-reads the flag every second
+  case "${1:-}" in
+    off) : > /tmp/xr-smoke-card-off; say "test card hidden (takes effect within a second)";;
+    on) rm -f /tmp/xr-smoke-card-off; say "test card shown";;
+    *) die "card takes on or off";;
+  esac
+}
+
+cmd_passthrough(){
+  if [ $# -eq 0 ]; then
+    frame 'f=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/frame-passthrough; [ -r "$f" ] && echo "passthrough: $(cat "$f")" || echo "passthrough: not set (eye geometry)"'
+    return
+  fi
+  local line
+  if [ "$1" = off ]; then line=off
+  elif [ $# -eq 4 ]; then
+    for v in "$@"; do [[ "$v" =~ ^-?[0-9]*\.?[0-9]+$ ]] || die "passthrough: '$v' is not a number (forward down baseline depth, metres)"; done
+    awk -v f="$1" -v b="$3" -v d="$4" 'BEGIN{ if (!(d > f + 0.05) || !(b > 0.03 && b < 0.09)) exit 1 }' || die "passthrough: depth must exceed forward by 0.05 m and the baseline must sit in 0.03..0.09 m"
+    line="$1 $2 $3 $4"
+  else die "passthrough takes four numbers (forward down baseline depth, metres), or off, or nothing to show"; fi
+  frame "printf '%s\\n' '$line' > \${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}/frame-passthrough" && say "passthrough: $line"
+}
+
+cmd_log(){ frame "journalctl --user -u oxrsys-client --no-pager -o short-precise $(printf '%q ' "$@") | grep -E '$FILTER' || true"; }   # no matching line is an empty answer, not a failure
+
+# The two-link setup: the headset hosts a hotspot for the Mac and stays on the house Wi-Fi, on one radio. It holds
+# when the two links sit on different bands and the house link never scans. Read-only: nothing here changes either end.
+# Check lines for check-link and doctor. They count into the caller's own local fails and warns (bash scoping).
+ok(){ printf '  ok    %s\n' "$*"; }
+warn(){ printf '  warn  %s\n' "$*"; warns=$((warns+1)); }
+fail(){ printf '  FAIL  %s\n' "$*"; fails=$((fails+1)); }
+info(){ printf '  info  %s\n' "$*"; }
+band_of(){ awk -v f="$1" 'BEGIN{ if (f < 2500) print "2.4"; else if (f < 5925) print "5"; else print "6" }'; }
+cmd_check_link(){
+  local fails=0 warns=0
+  link_checks || true
+  echo "$fails fail, $warns warn"
+  [ "$fails" -eq 0 ]
+}
+link_checks(){  # counts into its caller's fails and warns; 1 = no hotspot, nothing more to check
+  local k v
+  local H; H=$(frame 'iw dev 2>/dev/null | awk "
+      /^\tInterface/{i=\$2} /type AP/{ap=i} /type managed/{st=i}
+      /ssid /{s[i]=\$2} /channel /{gsub(/[()]/,\"\",\$3); f[i]=\$3; w[i]=\$6}
+      END{ print \"ap=\" ap; print \"ap_ssid=\" s[ap]; print \"ap_freq=\" f[ap]; print \"ap_width=\" w[ap];
+           print \"st=\" st; print \"st_ssid=\" s[st]; print \"st_freq=\" f[st] }"
+    ap=$(iw dev 2>/dev/null | awk "/^\tInterface/{i=\$2} /type AP/{print i; exit}")
+    [ -n "$ap" ] && echo "ap_ip=$(ip -4 -o addr show "$ap" | awk "{print \$4}" | cut -d/ -f1)"
+    [ -n "$ap" ] && iw dev "$ap" station dump 2>/dev/null | awk "/^Station/{n++} /avg ack signal/{print \"sta_ack=\" \$4} /rx bitrate/{print \"sta_rx=\" \$3 \" \" \$4 \" \" \$6 \" \" \$7 \" \" \$8 \" \" \$9} END{print \"stations=\" n+0}"
+    st=$(iw dev 2>/dev/null | awk "/^\tInterface/{i=\$2} /type managed/{print i; exit}")
+    if [ -n "$st" ]; then c=$(nmcli -g GENERAL.CONNECTION dev show "$st" 2>/dev/null)
+      [ -n "$c" ] && echo "st_bssid_lock=$(nmcli -g 802-11-wireless.bssid con show "$c" 2>/dev/null | tr -d "\\\\")"; fi
+    awk "{print \"lease=\" \$3}" /var/run/softap_dnsmasq.leases 2>/dev/null' 2>/dev/null) \
+    || die "cannot ssh to the headset as '$FRAME'"
+  local ap="" ap_ssid="" ap_freq="" ap_width="" ap_ip="" st="" st_ssid="" st_freq="" st_bssid_lock="" sta_ack="" sta_rx="" stations=0 leases=""
+  while IFS='=' read -r k v; do case "$k" in
+    ap) ap=$v;; ap_ssid) ap_ssid=$v;; ap_freq) ap_freq=$v;; ap_width) ap_width=$v;; ap_ip) ap_ip=$v;;
+    st) st=$v;; st_ssid) st_ssid=$v;; st_freq) st_freq=$v;; st_bssid_lock) st_bssid_lock=$v;;
+    sta_ack) sta_ack=$v;; sta_rx) sta_rx=$v;; stations) stations=$v;; lease) leases="$leases $v";; esac; done <<<"$H"
+
+  echo "== headset"
+  if [ -z "$ap" ]; then
+    fail "no hotspot running on the headset: turn it on in the headset's network settings (or use the USB-C cable)"
+    return 1
+  fi
+  local apb; apb=$(band_of "$ap_freq")
+  ok "hotspot $ap_ssid on $apb GHz ($ap_freq MHz, ${ap_width:-?} MHz wide), headset at $ap_ip"
+  if [ -z "$st" ] || [ -z "$st_freq" ]; then
+    ok "no house Wi-Fi link on the headset: the radio is the Mac's alone"
+  else
+    local stb; stb=$(band_of "$st_freq")
+    if [ "$stb" = "$apb" ]; then
+      warn "the house link ($st_ssid) is on $stb GHz too: one band carries both links, so they most likely take turns on the air (not measured here). Put the house link on another band (on the headset: sudo nmcli con modify '$st_ssid' 802-11-wireless.band bg, for 2.4 GHz; undo: the same with band ''), or leave the house Wi-Fi"
+    elif [ "$st_freq" -ge 5250 ] && [ "$st_freq" -le 5730 ]; then
+      # The headset's radio runs two channels at once only when neither needs radar detection (iw list, 10-27).
+      warn "the house link ($st_ssid) is on a DFS channel ($st_freq MHz, 5 GHz channels 52-144): the headset's radio then time-shares between it and the hotspot, and streams here had 1-2 s blackouts in that state. Put the house access point on a non-DFS channel (36-48, 149-165, or 2.4 GHz: on the headset sudo nmcli con modify '$st_ssid' 802-11-wireless.band bg; undo: the same with band ''), or turn the headset's house Wi-Fi off while streaming"
+    else
+      ok "house link $st_ssid on $stb GHz, the hotspot on $apb GHz: different bands"
+    fi
+    if [ -n "$st_bssid_lock" ]; then ok "house link locked to one access point ($st_bssid_lock): no background roaming scans"
+    else warn "house link not locked to one access point: each roaming scan takes the radio off the hotspot and the stream stalls up to 2 s. Fix (headset, sudo): nmcli con modify '$st_ssid' 802-11-wireless.bssid <the AP's BSSID from 'iw dev $st link'>, then nmcli device reapply $st (undo: the same with bssid ''). If you move or change router, undo it first"; fi
+  fi
+  house_link_checks
+  case "$stations" in
+    0) fail "no device joined to the hotspot";;
+    1) ok "one device joined";;
+    *) warn "$stations devices joined to the hotspot: they share its airtime with the stream";;
+  esac
+  if [ -n "$sta_ack" ]; then
+    if [ "${sta_ack%.*}" -lt -75 ] 2>/dev/null; then warn "the Mac's signal at the headset is $sta_ack dBm: move them closer, nothing between them (6 GHz is easily blocked)"
+    else ok "the Mac's signal at the headset: $sta_ack dBm"; fi
+  fi
+  [ -n "$sta_rx" ] && info "Mac -> headset link rate: $sta_rx (needs to be well above the stream's bitrate)"
+
+  echo "== Mac"
+  local myip; myip=$(route -n get "$ap_ip" 2>/dev/null | awk '/interface:/{print $2}' | xargs -I{} ipconfig getifaddr {} 2>/dev/null || true)
+  if [ -n "$myip" ] && [[ " $leases " == *" $myip "* ]]; then ok "this Mac is on the hotspot ($myip)"
+  else fail "this Mac is not on the headset's hotspot (its route to $ap_ip leaves from ${myip:-nowhere}): join $ap_ssid, or use --mac-ip for another link"; fi
+  if ifconfig awdl0 2>/dev/null | head -1 | grep -q '<UP'; then
+    warn "AWDL (AirDrop's radio) is up: it takes the Wi-Fi off channel and gave 150-200 ms hiccups here. sudo ifconfig awdl0 down (macOS raises it again after a Wi-Fi restart)"
+    if [ "${FIX:-0}" = 1 ]; then sudo ifconfig awdl0 down && ok "fixed: AWDL is down now (until macOS raises it again; undo: sudo ifconfig awdl0 up)"; fi
+  else ok "AWDL is down"; fi
+  local hidden
+  # The known-networks plist is root-only. sudo -n never prompts: without a cached sudo this check is skipped, and the
+  # doctor stays read-only either way.
+  hidden=$(sudo -n cat /Library/Preferences/com.apple.wifi.known-networks.plist 2>/dev/null | python3 -c '
+import plistlib, sys
+try: d = plistlib.loads(sys.stdin.buffer.read())
+except Exception: sys.exit()
+n = d.get("wifi.network.ssid." + sys.argv[1])
+if n is not None: print("yes" if n.get("Hidden") else "no")' "$ap_ssid" 2>/dev/null || true)
+  case "$hidden" in
+    yes) ok "the Mac's saved profile for $ap_ssid is marked hidden";;
+    no) warn "the Mac's saved profile for $ap_ssid is not marked hidden, so it never asks for it by name and may not rejoin: docs/troubleshooting.md, 'The Mac does not see the hotspot'";;
+    *) info "the Mac's saved-network list needs sudo to read; skipped (if the Mac cannot find the hotspot, see docs/troubleshooting.md)";;
+  esac
+  local gw; gw=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}' || true)   # exits 0 with no route
+  if [ -n "$gw" ]; then info "the Mac has internet beside the hotspot (default route on $gw)"
+  else info "no internet on the Mac while it is on the hotspot (the hotspot does not route out); a USB Ethernet adapter or an iPhone over USB gives it one"; fi
+}
+
+# A house link locked to one access point never scans, which is why we lock it; but when that access point is gone (a new
+# router, another mesh node, a move) the headset quietly stops rejoining its own Wi-Fi. So every lock is checked against
+# the access points the headset last saw (its cached list: a fresh scan would stall the stream). And 802.11v roaming
+# requests from the house router (WNM) each gave a ~200 ms hitch here, a minute apart, for minutes. Read-only; only
+# counts leave the headset, never a log line (the headset's journal holds secrets).
+house_link_checks(){
+  local L k v b n vis act wl=0 wn=0
+  L=$(frame 'bash -s' 2>/dev/null <<'PROBE'
+seen=$(nmcli -t -f BSSID dev wifi list --rescan no 2>/dev/null | tr -d '\\' | tr a-z A-Z)
+nmcli -t -f NAME,TYPE con show 2>/dev/null | sed -n 's/:802-11-wireless$//p' | sed 's/\\:/:/g' | while IFS= read -r n; do
+  b=$(nmcli -g 802-11-wireless.bssid con show "$n" 2>/dev/null | tr -d '\\' | tr a-z A-Z)
+  [ -n "$b" ] || continue
+  vis=no; grep -qx "$b" <<<"$seen" && vis=yes
+  act=no; nmcli -t -f NAME con show --active 2>/dev/null | sed 's/\\:/:/g' | grep -qxF "$n" && act=yes
+  printf 'lock=%s|%s|%s|%s\n' "$b" "$vis" "$act" "$n"
+done
+journalctl -q -o cat -t wpa_supplicant --since -24h 2>/dev/null | awk '{n++} /WNM: Preferred List Available/{w++} END{print "wnm=" n+0 " " w+0}'
+PROBE
+) || true
+  while IFS='=' read -r k v; do case "$k" in
+    lock) IFS='|' read -r b vis act n <<<"$v"
+      if [ "$act" = yes ]; then :   # the active one is reported by link_checks
+      elif [ "$vis" = no ]; then warn "the saved Wi-Fi '$n' is locked to an access point ($b) the headset cannot see: if it is gone (new router, mesh node, moved house) the headset will not rejoin it. Undo (headset, sudo): nmcli con modify '$n' 802-11-wireless.bssid ''"
+      else info "the saved Wi-Fi '$n' is locked to $b, in range but not in use"; fi;;
+    wnm) read -r wl wn <<<"$v";;
+  esac; done <<<"$L"
+  if [ "$wl" -eq 0 ]; then info "no Wi-Fi log lines readable on the headset for 24 h; roaming requests not counted"
+  elif [ "$wn" -eq 0 ]; then ok "no roaming requests from the house router in 24 h"
+  else warn "the house router sent $wn roaming requests (802.11v) in 24 h: each burst gives ~200 ms hitches a minute apart for a few minutes. docs/troubleshooting.md, 'A short hitch about once a minute'"; fi
+}
+
+# What is really running, against what this copy ships: a test is only of the release if both ends run its patches.
+# Patches are matched by git patch-id (the diff, not the commit), so the same series applied anywhere matches.
+CLIENT_BASE=5753dc1cd12494938683d3be3ee3d69bb0b8ead7    # demonixis/oxrsys pull/30/head, as in frame/install.sh
+RUNTIME_BASE=b41d892137f2e4ac71ccca6b2ea472e74968d8ce   # OXRSys main, as in the README's runtime build
+want_ids(){  # one id per commit; only the diffs are hashed, since a commit message quoting a diff misleads patch-id
+  local p; for p in "$HERE/patches/$1"/*.patch; do [ -f "$p" ] || continue
+    awk '/^From [0-9a-f]{40} /{print "commit " $2; d=0; next} /^diff --git /{d=1} d' "$p"; done | git patch-id --stable | cut -d' ' -f1
+}
+compare_series(){  # <what> <expected ids> <found ids>
+  local miss extra
+  [ -n "$2" ] || { info "$1: this copy has no patches/ to compare with"; return 0; }
+  miss=$(comm -23 <(sort <<<"$2") <(sort <<<"$3") | grep -c . || true); extra=$(comm -13 <(sort <<<"$2") <(sort <<<"$3") | grep -c . || true)
+  if [ "$miss" -eq 0 ] && [ "$extra" -eq 0 ]; then ok "$1: exactly this copy's $(grep -c . <<<"$2") patches"
+  else warn "$1: not this release's build ($miss of its patches missing, $extra commits it does not ship)"; return 1; fi
+}
+mtime(){ date -r "$1" +%s 2>/dev/null || echo 0; }
+started_at(){ LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | python3 -c 'import sys,time
+s=sys.stdin.read().strip()
+print(int(time.mktime(time.strptime(s,"%a %b %d %H:%M:%S %Y"))) if s else 0)' 2>/dev/null || echo 0; }
+stamp_checks(){  # the headset's client
+  local k v exe="" src="" rev="" branch="" dirty=0 headtime=0 bintime=0 nobase="" ids=""
+  local S; S=$(frame "bash -s $CLIENT_BASE" 2>/dev/null <<'PROBE'
+pid=$(systemctl --user show oxrsys-client.service -p MainPID --value 2>/dev/null)
+[ "${pid:-0}" -gt 0 ] 2>/dev/null && echo "exe=$(readlink /proc/$pid/exe)"
+src=$(cat ~/games/oxrsys/client-src 2>/dev/null); src=${src:-$HOME/src/oxrsys}; echo "src=$src"
+if cd "$src" 2>/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then   # a worktree's .git is a file
+  echo "rev=$(git rev-parse --short HEAD)"; echo "branch=$(git rev-parse --abbrev-ref HEAD)"
+  echo "dirty=$(git status --porcelain --untracked-files=no | grep -c .)"; echo "headtime=$(git log -1 --format=%ct)"
+  echo "bintime=$(stat -c %Y build-frame/steam_frame_client 2>/dev/null || echo 0)"
+  if git merge-base --is-ancestor "$1" HEAD 2>/dev/null; then
+    git log --reverse -p --format='commit %H' "$1"..HEAD | nice -n 15 git patch-id --stable | awk '{print "id=" $1}'
+  else echo "nobase=1"; fi
+fi
+PROBE
+) || true
+  while IFS='=' read -r k v; do case "$k" in
+    exe) exe=$v;; src) src=$v;; rev) rev=$v;; branch) branch=$v;; dirty) dirty=$v;; headtime) headtime=$v;; bintime) bintime=$v;;
+    nobase) nobase=1;; id) ids="$ids$v"$'\n';; esac; done <<<"$S"
+  ids=${ids%$'\n'}
+  info "headset client source: $src (${branch:-?} at ${rev:-?})"
+  if [ -z "$rev" ]; then fail "no OXRSys source at $src on the headset: run frame/install.sh there"
+  else
+    if [ -n "$nobase" ]; then warn "the headset's client source is not built on pull request #30 at ${CLIENT_BASE:0:7}: not this release's client. Run frame/install.sh"
+    else compare_series "headset client" "$(want_ids client)" "$ids" || warn "run frame/install.sh on the headset to build this copy's client"; fi
+    [ "${dirty:-0}" -eq 0 ] || warn "the headset's client source has $dirty changed files: the build may not be the patches"
+    [ "${bintime:-0}" -ge "${headtime:-0}" ] || warn "the headset's client binary is older than its source: run frame/install.sh again"
+  fi
+  if [ -z "$exe" ]; then info "no client running on the headset"
+  elif [ "$exe" = "$src/build-frame/steam_frame_client" ]; then ok "the running client is $exe"
+  elif [ "${exe% (deleted)}" = "$src/build-frame/steam_frame_client" ]; then warn "the running client is an older build of $src (rebuilt since it started): frame-stream down, then up"
+  else warn "the running client is $exe, not $src/build-frame/steam_frame_client: something other than this release started it"; fi
+}
+stamp_mac(){
+  # The Mac: the runtime's source tree, the library the manifest names, and the library the running app really loaded.
+  local json="$RUNTIME_DIR/oxrsys-runtime.json" lib="" top hid lt
+  # The settings: the runtime reads only the first toml that exists (cfg), so a short override in Application
+  # Support silently hides every key in the full one beside the library.
+  local side="$RUNTIME_DIR/oxrsys-runtime.toml" miss
+  if [ "$(cfg)" = "$side" ]; then
+    # Every runtime build copies OXRSys's own default toml over the one beside the library (a POST_BUILD step), so a
+    # rebuild silently drops this release's settings: 72 Hz, no foveation (found 2026-10-28).
+    local updef; updef="$(git -C "$RUNTIME_DIR" rev-parse --show-toplevel 2>/dev/null || true)/runtime/oxrsys-runtime.toml"
+    if [ -f "$side" ] && [ -f "$updef" ] && cmp -s "$side" "$updef"; then
+      if [ "${FIX:-0}" = 1 ]; then cp "$HERE/mac/oxrsys-runtime.toml" "$side" && ok "fixed: copied this release's settings beside the library (a rebuild had put OXRSys's defaults there)"
+      else warn "the settings beside the library are OXRSys's defaults, not this release's (a runtime build copies them over it): cp $HERE/mac/oxrsys-runtime.toml $side, or frame-stream doctor --fix"; fi
+    elif [ -f "$side" ]; then ok "the runtime reads its settings from $side"; else warn "no settings file at $side: the runtime runs on its defaults, not the ones this release is tuned with"; fi
+  else
+    keys(){ { grep -oE '^[A-Za-z_][A-Za-z0-9_]* *=' "$1" 2>/dev/null || true; } | tr -d ' =' | sort -u; }
+    miss=$(comm -23 <(keys "$side") <(keys "$(cfg)") | paste -sd, - | sed 's/,/, /g')
+    if [ -n "$miss" ]; then warn "the runtime reads $(cfg), not $side; it lacks ${miss}, which then take the runtime's defaults. Delete it, or copy the full file over it"
+    else info "the runtime reads $(cfg), not the file beside the library (it has every key that one has)"; fi
+  fi
+  if [ ! -f "$json" ]; then fail "no runtime manifest at $json"; return; fi
+  lib=$(python3 -c 'import json,os,sys
+p=json.load(open(sys.argv[1]))["runtime"]["library_path"]
+print(os.path.normpath(os.path.join(os.path.dirname(sys.argv[1]),p)))' "$json" 2>/dev/null || true)
+  if [ -z "$lib" ] || [ ! -f "$lib" ]; then fail "the manifest $json names no library that exists (${lib:-none})"; return; fi
+  info "Mac runtime: $lib ($(shasum -a 256 "$lib" | cut -c1-12), built $(date -r "$lib" '+%Y-%m-%d %H:%M'))"
+  top=$(git -C "$RUNTIME_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -z "$top" ]; then warn "the runtime at $RUNTIME_DIR is not inside an OXRSys source tree, so its patches cannot be checked"
+  elif ! git -C "$top" merge-base --is-ancestor "$RUNTIME_BASE" HEAD 2>/dev/null; then warn "the Mac runtime's source ($top) is not built on OXRSys ${RUNTIME_BASE:0:7}: not this release's runtime"
+  else
+    hid=$(git -C "$top" log --reverse -p --format='commit %H' "$RUNTIME_BASE"..HEAD | git patch-id --stable | cut -d' ' -f1)
+    compare_series "Mac runtime ($top at $(git -C "$top" rev-parse --short HEAD))" "$(want_ids runtime)" "$hid" || true
+    [ -z "$(git -C "$top" status --porcelain --untracked-files=no)" ] || warn "the Mac runtime's source has local changes: the library may not be the patches"
+    [ "$(mtime "$lib")" -ge "$(git -C "$top" log -1 --format=%ct)" ] || warn "the runtime library is older than its source's last commit: rebuild it (README, the runtime build)"
+  fi
+  local st s_state s_app s_pid s_alive s_age loaded
+  st=$(runtime_status); read -r s_state s_app s_pid s_alive s_age <<<"$st"; s_app=${s_app//_/ }
+  if [ "$st" = none ] || [ "$s_alive" != alive ]; then info "no app is using the runtime now"; return; fi
+  loaded=$({ lsof -p "$s_pid" -Fn 2>/dev/null || true; } | sed -n 's/^n//p' | grep -F "$(basename "$lib")" | head -1)
+  if [ -z "$loaded" ]; then info "$s_app (pid $s_pid) has the runtime's status file but no $(basename "$lib") open that lsof can see"
+  elif [ "$loaded" != "$lib" ]; then warn "$s_app (pid $s_pid) loaded $loaded, not $lib: its XR_RUNTIME_JSON points at another runtime"
+  else ok "$s_app (pid $s_pid) runs this runtime"; fi
+  lt=$(started_at "$s_pid")
+  if [ "$lt" -gt 0 ] && [ "$(mtime "$lib")" -gt "$lt" ]; then warn "the runtime library was rebuilt after $s_app started, so it still runs the old one: frame-stream down, then up"; fi
+  if [ "$lt" -gt 0 ] && [ "$(mtime "$(cfg)")" -gt "$lt" ]; then warn "$(cfg) changed after $s_app started; the runtime reads it once: frame-stream down, then up"; fi
+}
+
+# The headset's battery, from sysfs (any power_supply of type Battery): "bat=<pct> <status> <uA> <uV>". A session drains
+# it, and a flat headset drops the stream and needs its power button to come back (the lab, 10-28 15:52, on the cable).
+BAT_WARN=${FRAME_STREAM_BATTERY_WARN:-25}
+BAT_PROBE='for d in /sys/class/power_supply/*; do [ "$(cat "$d/type" 2>/dev/null)" = Battery ] || continue; echo "bat=$(cat "$d/capacity" 2>/dev/null || echo -) $(cat "$d/status" 2>/dev/null | tr " " _ || echo Unknown) $(cat "$d/current_now" 2>/dev/null || echo 0) $(cat "$d/voltage_now" 2>/dev/null || echo 0)"; break; done'
+bat_watts(){ awk -v i="${1:-0}" -v v="${2:-0}" 'BEGIN{ w=i*v/1e12; if (w<0) w=-w; printf "%.1f", w }'; }   # uA x uV
+battery_check(){
+  local line pct st i v wt usb; line=$(frame "$BAT_PROBE" 2>/dev/null | sed -n 's/^bat=//p' | head -1 || true)
+  read -r pct st i v <<<"$line"
+  if ! [[ "${pct:-}" =~ ^[0-9]+$ ]]; then info "headset battery not read (no Battery in /sys/class/power_supply)"; return 0; fi
+  wt=$(bat_watts "$i" "$v"); usb=$(ioreg -p IOUSB -w0 2>/dev/null | grep 'Steam Frame@' | head -1 || true)
+  case "$st" in
+    Discharging)
+      if [ "$pct" -lt "$BAT_WARN" ]; then warn "the headset battery is at $pct % and falling ($wt W): plug it into a charger, or end the session soon. A flat headset drops the stream and needs its power button to come back"
+      else ok "headset battery $pct %, on battery ($wt W)"; fi
+      [ -z "$usb" ] || warn "the headset is on the USB-C cable but its battery is discharging: the cable does not keep it charged. Use the headset's own charger, or stream over the hotspot";;
+    Charging|Full) ok "headset battery $pct %, $(echo "$st" | tr "[:upper:]" "[:lower:]")";;
+    *) if [ "$pct" -lt "$BAT_WARN" ]; then warn "the headset battery is at $pct % ($st): plug it into a charger"; else ok "headset battery $pct % ($st)"; fi;;
+  esac
+}
+cmd_doctor(){
+  local FIX=0 fails=0 warns=0
+  case "${1:-}" in --fix) FIX=1;; "") ;; *) die "doctor takes --fix or nothing";; esac
+  if frame true 2>/dev/null; then
+    link_checks || true
+    echo "== what is running"
+    stamp_checks; stamp_mac
+    echo "== SteamVR"
+    local rate; rate=$(frame 'XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} timeout 10 ~/.local/bin/frame-vrsettings get steamvr defaultPerAppRefreshRate 2>/dev/null' | awk '/^float/{print $2}' || true)
+    case "${rate%.*}" in
+      90) ok "SteamVR runs apps at 90 Hz";;
+      120) info "SteamVR runs apps at 120 Hz: the opt-in (frame-stream up --rate 120; back: --rate 90)";;
+      80) info "SteamVR runs apps at 80 Hz: it works (about 51 ms), but this release is tuned for 90 (frame-vrsettings set steamvr defaultPerAppRefreshRate float 90)";;
+      "") info "refresh rate not read (SteamVR not up, or frame-vrsettings not installed): docs/troubleshooting.md, 'It runs at 72 Hz, not 90'";;
+      *) warn "SteamVR runs apps at $rate Hz. On the headset, with SteamVR up: frame-vrsettings set steamvr defaultPerAppRefreshRate float 90";;
+    esac
+    case "$(depth_keys)" in
+      "") ok "SteamVR depth reprojection off (the default)";;
+      "true true") info "SteamVR depth reprojection on (frame-stream up --depth on); a stream without depth is unaffected, down removes it";;
+      *) warn "SteamVR depth reprojection keys half set ($(depth_keys)): depthReprojection without depthReprojectionMesh tears a seam; frame-stream down clears both";;
+    esac
+    echo "== headset battery"
+    battery_check
+  else
+    fail "cannot reach the headset as '$FRAME': the link, the client and the headset checks are skipped"
+    echo "== what is running"; stamp_mac
+  fi
+
+  echo "== USB-C cable"
+  local usb; usb=$(ioreg -p IOUSB -w0 2>/dev/null | grep 'Steam Frame@' | head -1 || true)
+  if [ -z "$usb" ]; then info "no headset on USB (fine over Wi-Fi)"
+  elif [ -n "$(find_mac_ip)" ]; then ok "the cable is up: this Mac is $(find_mac_ip) on the tether"
+  elif [[ "$usb" == *'!registered'* ]]; then
+    fail "the headset is on the cable but macOS has not let it connect: macOS holds a new accessory back while the Mac is locked. Unlock the Mac, unplug the cable and plug it in again, and answer Allow if asked (System Settings > Privacy & Security > Allow accessories to connect)"
+  else warn "the headset is on the cable but there is no tether address on $USB_NET.x: unplug and replug; if your headset uses another subnet, set FRAME_STREAM_USB_NET"; fi
+
+  echo "== Mac apps"
+  local fw=/usr/libexec/ApplicationFirewall/socketfilterfw a name
+  if "$fw" --getglobalstate 2>/dev/null | grep -qi enabled; then
+    for a in "${GODOT%/Contents/MacOS/*}" "$(unity_app)" "$UE_ENGINE/Engine/Binaries/Mac/UnrealEditor.app"; do
+      [ -n "$a" ] && [ -d "$a" ] || continue; name=$(basename "$a")
+      if "$fw" --getappblocked "$a" 2>/dev/null | grep -qi permitted; then ok "the firewall lets $name receive"
+      elif [ "$FIX" = 1 ]; then sudo "$fw" --add "$a" >/dev/null && sudo "$fw" --unblockapp "$a" >/dev/null && ok "fixed: the firewall now lets $name receive; quit and start it again (undo: sudo $fw --remove \"$a\")"
+      else warn "the firewall may drop the headset's packets to $name (it says 'no server found'): frame-stream doctor --fix, or docs/troubleshooting.md"; fi
+    done
+  else ok "the macOS firewall is off"; fi
+  local th; th=$(pmset -g therm 2>/dev/null || true)
+  if [ -z "$th" ]; then :
+  elif grep -qiE '(Speed|Scheduler)_Limit *= *([0-9]|[1-9][0-9])$' <<<"$th" || { grep -qi 'thermal warning level' <<<"$th" && ! grep -qi 'no thermal warning' <<<"$th"; }; then
+    warn "the Mac is thermally limited, which cost heavy games 15-20 % here: let it cool, raise it for air. $(grep -iE 'limit|warning level' <<<"$th" | head -1 | xargs)"
+  else ok "no thermal limit on the Mac now"; fi
+
+  if [ -x "$HERE/wine/wine/bin/wine" ]; then
+    echo "== Windows games (wine/)"
+    local msg rc=0
+    msg=$( (. "$HERE/wine/pin-check.sh"; pin_check "$HERE/wine/wine") 2>&1 ) || rc=$?
+    if [ "$rc" -ne 0 ]; then while IFS= read -r v; do fail "${v#pin-check: }"; done <<<"$msg"
+    elif [ -n "$msg" ]; then while IFS= read -r v; do warn "${v#pin-check: }"; done <<<"$msg"
+    else ok "Wine 11.16 with the DXMT winemac and the patched kernel32"; fi
+  fi
+  echo "$fails fail, $warns warn"
+  [ "$fails" -eq 0 ]
+}
+
+# watch, once a poll: the battery line. It runs inside cmd_watch and uses its locals (bpct bst bi bv, bat_last,
+# bat_said, bat_t0, bat_p0) and its w(); bash scoping makes those visible here. NOW overrides the clock for the stub test.
+bat_step(){
+  # The battery: below BAT_WARN % and falling, one line, again every 5 % lower, with the rate once 10 min are seen.
+  if [[ "$bpct" =~ ^[0-9]+$ ]]; then
+    local falling=""; [ "$bst" = Discharging ] && falling=1
+    [ -n "$bat_last" ] && [ "$bpct" -lt "$bat_last" ] && [ "$bst" != Charging ] && falling=1
+    if [ -n "$falling" ]; then
+      [ -n "$bat_t0" ] || { bat_t0=${NOW:-$(date +%s)}; bat_p0=$bpct; }
+      if [ "$bpct" -lt "$BAT_WARN" ] && { [ -z "$bat_said" ] || [ "$bpct" -le $((bat_said-5)) ]; }; then
+        local el rate=""; el=$(( ${NOW:-$(date +%s)} - bat_t0 ))
+        if [ "$el" -ge 600 ] && [ "$bat_p0" -gt "$bpct" ]; then rate=$(( (bat_p0-bpct)*3600/el )); if [ "$rate" -gt 0 ]; then rate=", about $rate %/h, so about $(( bpct*60/rate )) min left"; else rate=""; fi; fi
+        w "the headset battery is at $bpct % and falling ($(bat_watts "$bi" "$bv") W$rate): plug it into a charger, or end the session soon. A flat headset drops the stream and needs its power button to come back"
+        bat_said=$bpct
+      fi
+    elif [ "$bst" = Charging ] || [ "$bst" = Full ]; then
+      [ -n "$bat_said" ] && w "the headset is charging again ($bpct %)"
+      bat_said=""; bat_t0=""; bat_p0=""
+    fi
+    bat_last=$bpct
+  fi
+}
+app_flag(){ case "$1" in Godot*) echo godot;; Unity*) echo unity;; Unreal*) echo unreal;; *) echo "<the same engine>";; esac; }
+# One line when something goes wrong, with the cure; a quiet ok a minute. It changes nothing on either end.
+cmd_watch(){
+  [ $# -eq 0 ] || die "watch takes no arguments"
+  local T=${FRAME_STREAM_WATCH_SECS:-5} t0 ap_ip="" my_if="" my_ip="" engine="" was_up="" unreach=0 house="" k v
+  local n p f wnm last_ok sum_p=0 sum_f=0 bad=0 said="" since=0 lost_at=0
+  local bpct="" bst="" bi=0 bv=0 bat_last="" bat_said="" bat_t0="" bat_p0=""
+  t0=$(date +%s); last_ok=$t0; mkdir -p "$LOGS"; touch "$LOGS/watch.start"
+  ap_ip=$(frame "ip -4 -o addr show \$(iw dev 2>/dev/null | awk '/^\tInterface/{i=\$2} /type AP/{print i; exit}') 2>/dev/null | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null || true)
+  if [ -n "$ap_ip" ]; then my_if=$(route -n get "$ap_ip" 2>/dev/null | awk '/interface:/{print $2}' || true); my_ip=$(ipconfig getifaddr "$my_if" 2>/dev/null || true); fi
+  w(){ echo "$(date +%H:%M:%S) $*"; }
+  w "watching (every $T s; Ctrl-C ends it). It only reports; nothing is changed."
+  while true; do
+    # The engine: gone after it was up is the event (Godot's GPU loss, an editor crash).
+    local st s_state s_app s_pid s_alive s_age; st=$(runtime_status); read -r s_state s_app s_pid s_alive s_age <<<"$st"
+    if [ "$st" != none ] && [ "$s_alive" = alive ]; then engine="${s_app//_/ } (pid $s_pid)"; was_up=1
+    elif [ -n "$was_up" ]; then
+      local r; r=$({ find "$HOME/Library/Logs/DiagnosticReports" -name '*.ips' -newer "$LOGS/watch.start" 2>/dev/null || true; } | sort | tail -1)
+      case "$engine" in
+        Godot*) w "Godot quit${r:+ (crash report $r)}. A GPU lockup ('Vulkan device lost') does this after minutes to hours: frame-stream up --app godot again (the headset went back to SteamVR home within 20 s; up starts its client again, no down needed). docs/troubleshooting.md, 'Godot quits during a long session'";;
+        *) w "$engine quit${r:+ (crash report $r)}: frame-stream up --app $(app_flag "$engine") again; the headset goes back to SteamVR home (about 5 s after a clean quit, 20 s after a crash) and up starts its client again (no down needed)";;
+      esac
+      was_up=""; bad=0; said=""
+    fi
+    # The headset: the client's own per-second lines, the house link, and roaming requests. Counts only.
+    local H; H=$(ssh -o ConnectTimeout=4 -o ServerAliveInterval=2 -o ServerAliveCountMax=2 "$FRAME" "nice -n 10 bash -s $T $(printf %q "$BAT_PROBE")" 2>/dev/null <<'PROBE'
+journalctl --user -u oxrsys-client --no-pager -o cat --since "-$1s" 2>/dev/null | awk '
+  /client pipeline: /{n++; for(i=1;i<=NF;i++){if($(i+1)=="presented,")p+=$i; if($(i+1)=="fresh,")f+=$i}}
+  END{printf "client=%d %d %d\n", n, p, f}'
+systemctl --user is-active --quiet oxrsys-client.service && echo "unit=up" || echo "unit=down"
+st=$(iw dev 2>/dev/null | awk '/^\tInterface/{i=$2} /type managed/{print i; exit}')
+[ -n "$st" ] && { iw dev "$st" link 2>/dev/null | grep -q '^Connected' && echo "house=up" || echo "house=down"; }
+journalctl -q -o cat -t wpa_supplicant --since "-$1s" 2>/dev/null | grep -c 'WNM: Preferred List Available' | sed 's/^/wnm=/'
+eval "$2"
+PROBE
+) || H=""
+    if [ -z "$H" ]; then
+      unreach=$((unreach+1)); [ "$unreach" -gt 1 ] || lost_at=$(( $(date +%s) - T ))
+      if [ "$unreach" -eq 2 ]; then
+        if [ -n "$my_if" ] && [ -n "$(ipconfig getifaddr "$my_if" 2>/dev/null || true)" ]; then
+          w "the headset has not answered for $(( $(date +%s) - lost_at )) s while this Mac keeps its hotspot address $my_ip: the Mac's Wi-Fi link has likely wedged. Pick the hotspot again in the Wi-Fi menu. docs/troubleshooting.md, 'Two links'"
+        elif [ -n "$my_if" ]; then w "this Mac has no address on the headset's hotspot any more: is the headset asleep, or did the Mac join another network? Rejoin the hotspot, then frame-stream up"
+        else w "the headset has not answered for $(( $(date +%s) - lost_at )) s"; fi
+      fi
+      sleep "$T"; continue
+    fi
+    [ "$unreach" -ge 2 ] && w "the headset answers again"
+    unreach=0; n=0; p=0; f=0; wnm=0; local unit=""
+    while IFS='=' read -r k v; do case "$k" in
+      client) read -r n p f <<<"$v";; unit) unit=$v;; wnm) wnm=$v;;
+      bat) read -r bpct bst bi bv <<<"$v";;
+      house) if [ -n "$house" ] && [ "$house" != "$v" ]; then
+               if [ "$v" = down ]; then w "the headset's house Wi-Fi dropped: expect hitches until it rejoins"; else w "the headset's house Wi-Fi is back"; fi; fi
+             house=$v;;
+    esac; done <<<"$H"
+    bat_step
+    [ "${wnm:-0}" -gt 0 ] && w "the house router just sent roaming requests: a ~200 ms hitch may follow, a minute apart for a few minutes. docs/troubleshooting.md, 'A short hitch about once a minute'"
+    # No new video while the engine is up: which end is stuck? The runtime rewrites its status every few seconds while
+    # it streams (the stand: every write within 10 s). A status written after the video stopped means the engine is
+    # alive, so the headset client is stuck; a status over 30 s old means the engine is. Until one of those holds,
+    # wait: a fresh status at the start of a stall proves nothing (the stand's SIGSTOP run, where the quiet client was
+    # blamed at 10 s). With no engine the client idles in discovery.
+    local stuck=""
+    if [ "$unit" = up ] && [ -n "$was_up" ] && { [ "$n" -eq 0 ] || { [ "$p" -gt 0 ] && [ "$f" -eq 0 ]; }; }; then stuck=1; fi
+    if [ -n "$stuck" ]; then
+      bad=$((bad+1)); [ "$bad" -gt 1 ] || since=$(( $(date +%s) - T )); sum_p=0; sum_f=0; last_ok=$(date +%s)   # no "ok" line from the frames before it
+      if [ "${s_age:-0}" -gt 30 ]; then
+        [ "$said" = engine ] || w "$engine has stopped: its runtime has not reported for ${s_age} s and no new video arrives. Quit it (Force Quit if it does not answer), then frame-stream up --app $(app_flag "$engine"); the headset client waits for it"
+        said=engine
+      elif [ "${s_age:-0}" -lt $(( $(date +%s) - since - 2 )) ] && [ "$bad" -ge 2 ] && [ -z "$said" ]; then
+        if [ "$n" -eq 0 ]; then w "the headset client is running but has logged nothing for $(( $(date +%s) - since )) s while $engine reports normally: it has likely frozen. frame-stream down, then up. docs/troubleshooting.md, 'The picture freezes on the first frame'"
+        else w "the headset is showing a frozen picture: no new video for $(( $(date +%s) - since )) s while $engine reports normally. frame-stream down, then up. docs/troubleshooting.md, 'The picture freezes on the first frame'"; fi
+        said=client
+      fi
+    else
+      [ -n "$said" ] && w "new video again"
+      bad=0; said=""
+    fi
+    sum_p=$((sum_p+p)); sum_f=$((sum_f+f))
+    if [ $(( $(date +%s) - last_ok )) -ge 60 ]; then
+      if [ "$sum_p" -gt 0 ]; then
+        if [ $((100*sum_f/sum_p)) -lt 95 ]; then w "only $((100*sum_f/sum_p)) % of frames were new in the last minute ($sum_f of $sum_p): the picture repeats. frame-stream status, then docs/troubleshooting.md, 'A game stutters'"
+        else w "ok: $((100*sum_f/sum_p)) % new frames in the last minute${engine:+, $engine}"; fi
+      elif [ "$unit" != up ]; then w "no headset client running (frame-stream up starts one)"; fi
+      last_ok=$(date +%s); sum_p=0; sum_f=0
+    fi
+    sleep "$T"
+  done
+}
+
+# bench: the stand's measurement in one command, for any Mac. Starts a session with up's options, waits out the
+# warm-up, measures, ends the session, then reads SteamVR's own verdict, which it writes only when a session ends.
+# Prints the same figures the README quotes and appends one JSON line to bench.jsonl, to paste into an issue.
+cmd_bench(){
+  local secs=120 warm=30 app=godot label="" pass=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --seconds) [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -ge 30 ] || die "--seconds takes whole seconds, 30 or more"; secs=$2; shift 2;;
+    --warmup) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--warmup takes whole seconds"; warm=$2; shift 2;;
+    --label) label=${2:-}; shift 2;;
+    --app) app=${2:-}; pass+=("$1" "$app"); shift 2;;
+    *) pass+=("$1"); shift;; esac; done
+  [ -z "$(apps_running)" ] || die "an engine is already running ($(apps_running)): 'frame-stream down' first, so the numbers are this run's alone"
+  command -v python3 >/dev/null || die "bench needs python3 (xcode-select --install)"
+  BENCH_TMP=$(mktemp -d); local tmp=$BENCH_TMP; trap 'rm -rf "${BENCH_TMP:?}"' EXIT
+  ( cmd_up ${pass[@]+"${pass[@]}"} ) > "$tmp/up.txt" 2>&1 || { cat "$tmp/up.txt"; die "up failed, nothing measured"; }
+  local log; log=$(app_log "$app")
+  say "bench: warming up ${warm} s, then measuring ${secs} s (keep the headset still or on a stand for comparable numbers)"
+  sleep "$warm"
+  local n0 t0 cpid; n0=$(wc -l < "$log" 2>/dev/null || echo 0); t0=$(date +%s)
+  cpid=$(frame 'pgrep -o steam_frame_cli || true')
+  [ -n "$cpid" ] || { cmd_down >/dev/null; die "the headset client is not running after the warm-up: see 'frame-stream log'"; }
+  sleep "$secs"
+  tail -n "+$((n0+1))" "$log" > "$tmp/mac.log" 2>/dev/null || true
+  frame "journalctl --user -u oxrsys-client --no-pager -o cat --since '-$((secs+5)) s'" > "$tmp/client.log" || true
+  frame 'm=0; for z in /sys/class/thermal/thermal_zone*/temp; do v=$(cat "$z" 2>/dev/null || echo 0); [ "$v" -gt "$m" ] && m=$v; done; echo $((m/1000))' > "$tmp/headset.txt" || true
+  cmd_down > "$tmp/down.txt" 2>&1 || true
+  local k; for k in 1 2 3 4 5 6 7 8 9 10; do frame "grep -q 'Cumulative stats for pid: $cpid\$' ~/.local/share/Steam/logs/vrcompositor.txt" && break; sleep 2; done
+  frame "grep -A8 'Cumulative stats for pid: $cpid\$' ~/.local/share/Steam/logs/vrcompositor.txt | tail -9" > "$tmp/comp.txt" || true
+  { sysctl -n machdep.cpu.brand_string; sysctl -n hw.model; sw_vers -productVersion; } > "$tmp/mac.txt" 2>/dev/null || true
+  BENCH_APP=$app BENCH_SECS=$secs BENCH_LABEL=$label BENCH_CFG=$(cfg) BENCH_LINK=${MAC_IP:-} \
+    python3 - "$tmp" "$LOGS/bench.jsonl" <<'PY'
+import hashlib, json, os, re, statistics, sys, time
+d, out = sys.argv[1], sys.argv[2]
+rd = lambda f: open(os.path.join(d, f), errors="replace").read() if os.path.exists(os.path.join(d, f)) else ""
+mac, cl, comp = rd("mac.log"), rd("client.log"), rd("comp.txt")
+def stats(v):
+    v = sorted(v)
+    return {"median": round(statistics.median(v), 2), "p95": round(v[min(len(v) - 1, int(0.95 * len(v)))], 2), "n": len(v)} if v else None
+def grab(text, pat, line_pat=None):
+    lines = [l for l in text.splitlines() if not line_pat or line_pat in l]
+    return [float(m.group(1)) for m in (re.search(pat, l) for l in lines) if m]
+L = "sample->display latency (measured)"
+rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "label": os.environ.get("BENCH_LABEL") or None,
+       "app": os.environ["BENCH_APP"], "seconds": int(os.environ["BENCH_SECS"])}
+m = rd("mac.txt").splitlines() + ["", "", ""]
+rec["mac"] = {"chip": m[0], "model": m[1], "macos": m[2]}
+cfg = os.environ.get("BENCH_CFG", "")
+if os.path.exists(cfg):
+    t = open(cfg, errors="replace").read()
+    rec["config"] = {"file": cfg, "sha256_12": hashlib.sha256(t.encode()).hexdigest()[:12]}
+    for k in ("bitrate_mbps", "foveated_encoding_preset", "render_device", "refresh_rate_hz", "low_latency", "encoder_full_range"):
+        mm = re.search(r"^\s*%s\s*=\s*\"?([^\"\n#]+?)\"?\s*(#.*)?$" % k, t, re.M)
+        if mm: rec["config"][k] = mm.group(1)
+h = rd("headset.txt").split()
+rec["headset"] = {"max_temp_c": int(h[0]) if h and h[0].isdigit() else None}
+lat = {k: stats(grab(mac, p, L)) for k, p in {
+    "total": r"\(measured\) ([0-9.]+)ms", "rtt": r"= rtt ([0-9.]+)", "sample_age": r"sample age at fetch ([0-9.]+)",
+    "render": r"\+ render ([0-9.]+)", "encode_send": r"encode\+send ([0-9.]+)", "client_displayed_age": r"client displayed age ([0-9.]+)"}.items()}
+rec["latency_ms"] = {k: v for k, v in lat.items() if v}
+if any(L in l and "assumed" in l for l in mac.splitlines()): rec["latency_ms"]["rtt_source"] = "assumed (not measured this run)"
+rec["mac_encode_ms"] = {k: v for k, v in {"gpu": stats(grab(mac, r"gpu\(([0-9.]+)/", "encode queue")),
+    "encoder_callback": stats(grab(mac, r"callback\(([0-9.]+)/", "encode queue")),
+    "total": stats(grab(mac, r"total\(([0-9.]+)/", "encode queue"))}.items() if v}
+rec["mac_frame_period_ms"] = stats(grab(mac, r"actual mean=([0-9.]+)ms", "WaitFrame pacing"))
+rec["headset_ms"] = {k: v for k, v in {"decode": stats(grab(cl, r"avg ([0-9.]+) ms", "decode:")),
+    "convert": stats(grab(cl, r"convert avg ([0-9.]+) ms", "decode:")),
+    "render_thread": stats(grab(cl, r"render thread: ([0-9.]+) ms/frame"))}.items() if v}
+rec["network"] = {"nacks": sum(1 for l in cl.splitlines() if "NACK sent" in l),
+                  "gaps_over_20ms": int(sum(grab(cl, r"([0-9]+) gaps over 20 ms"))),
+                  "keyframe_requests": sum(1 for l in cl.splitlines() if "requested keyframe" in l)}
+c = {}
+mm = re.search(r"Total\.+\s*([0-9]+) presents\.\s*([0-9]+) dropped\.\s*([0-9]+) reprojected", comp)
+if mm:
+    c = {"presents": int(mm.group(1)), "dropped": int(mm.group(2)), "reprojected": int(mm.group(3))}
+    c["reprojected_pct"] = round(100 * c["reprojected"] / c["presents"], 2) if c["presents"] else None
+mm = re.search(r"Game Info.*?CPU: ([0-9.]+)ms / GPU: ([0-9.]+)ms", comp)
+if mm: c.update({"headset_app_cpu_ms": float(mm.group(1)), "headset_app_gpu_ms": float(mm.group(2))})
+mm = re.search(r"Game Info.*?Target ([0-9.]+)", comp)
+if mm: c["target_hz"] = float(mm.group(1))
+rec["steamvr"] = c or None
+open(out, "a").write(json.dumps(rec, separators=(",", ":")) + "\n")
+f = lambda x, k="median": "-" if not x else x[k]
+lm, me, hm = rec["latency_ms"], rec["mac_encode_ms"], rec["headset_ms"]
+print(f"frame-stream bench: {rec['app']}, {rec['seconds']} s, {rec['mac']['chip']} / macOS {rec['mac']['macos']}, SteamVR target {c.get('target_hz', '-')} Hz")
+print(f"  head sample to photons  median {f(lm.get('total'))} ms, p95 {f(lm.get('total'),'p95')} ms  "
+      f"(= rtt {f(lm.get('rtt'))}{' assumed' if 'rtt_source' in lm else ''} + sample age {f(lm.get('sample_age'))} + render {f(lm.get('render'))}"
+      f" + encode+send {f(lm.get('encode_send'))} + headset {f(lm.get('client_displayed_age'))})")
+print(f"  Mac                     encode total {f(me.get('total'))} ms (GPU squeeze {f(me.get('gpu'))}, encoder {f(me.get('encoder_callback'))}), frame period {f(rec['mac_frame_period_ms'])} ms")
+print(f"  headset                 decode {f(hm.get('decode'))} ms, convert {f(hm.get('convert'))} ms, render thread {f(hm.get('render_thread'))} ms, max temp {rec['headset']['max_temp_c']} C")
+n = rec["network"]; print(f"  network                 {n['nacks']} NACKs, {n['gaps_over_20ms']} arrival gaps over 20 ms, {n['keyframe_requests']} keyframe requests")
+if c:
+    print(f"  SteamVR compositor      {c['presents']} presents, {c['reprojected']} reprojected ({c['reprojected_pct']} %), headset app GPU {c.get('headset_app_gpu_ms')} ms"
+          + ("  <- over 1 %: SteamVR is showing frames twice (judder); see docs/troubleshooting.md" if (c['reprojected_pct'] or 0) > 1 else ""))
+else:
+    print("  SteamVR compositor      no session stats found (SteamVR writes them when the session ends; see 'frame-stream log')")
+if not lm: print("  no latency lines in the runtime log: is file_logging = true in the runtime's toml?")
+print(f"  appended to {out}")
+PY
+}
+
+# Live settings (2026-10-28, docs/live-tuning.md). The runtime re-reads its toml every 250 ms, but most keys are taken
+# when something is built: the encoder at each client connect, the stream layout when the app's session begins. When
+# each key lands, measured on this runtime with a loopback client (bitrate 20 and QP 30 moved the stream only after a
+# reconnect; keyframe and send pacing moved it within 2 s; resolution_scale did not move it even after a reconnect):
+#   live       the next frames
+#   reconnect  the next headset-client connect: 'set --reconnect' restarts the client (a few seconds of black)
+#   restart    only a new app session: 'frame-stream down', then 'up' (refused while an engine runs)
+# A key not listed here is refused: the runtime silently keeps its default for a name it does not know.
+key_when(){ case "$1" in
+  keyframe_interval_sec|send_pacing_ms|send_pacing_keyframe_ms|pacing_spin_ms|pacing_lock_wait_ms|pacing_lock_on|pacing_lock_age_ms|stage_height_offset_m) echo live;;
+  bitrate_mbps|encoder_min_qp|encoder_preset|encoder_low_latency|foveation_box_filter|video_codec|abr_mode) echo reconnect;;
+  resolution_scale|render_device|foveated_encoding_preset|refresh_rate_hz|encoder_full_range|pose_prediction|pose_prediction_horizon_ms|pose_prediction_position_scale|rtt_probe|rtt_assumed_ms|dynamic_resolution_min_scale|pacing_thread|passthrough_enabled|app_alpha_blend_passthrough|client_sharpening|client_upscaling|client_foveation_preset|client_reprojection) echo restart;;
+  client.predict_ms|client.stamp_lead_ms) echo live;;   # the headset client's own files, polled about once a second
+  *) echo unknown;; esac; }
+LIVE_KEYS="keyframe_interval_sec send_pacing_ms send_pacing_keyframe_ms pacing_spin_ms pacing_lock_wait_ms pacing_lock_on pacing_lock_age_ms stage_height_offset_m client.predict_ms client.stamp_lead_ms bitrate_mbps encoder_min_qp encoder_preset encoder_low_latency foveation_box_filter video_codec abr_mode resolution_scale render_device foveated_encoding_preset refresh_rate_hz encoder_full_range pose_prediction pose_prediction_horizon_ms pose_prediction_position_scale rtt_probe rtt_assumed_ms dynamic_resolution_min_scale pacing_thread passthrough_enabled app_alpha_blend_passthrough client_sharpening client_upscaling client_foveation_preset client_reprojection"
+client_file(){ case "$1" in client.predict_ms) echo frame-predict-ms;; client.stamp_lead_ms) echo frame-stamp-lead-ms;; esac; }
+# The client logs each value it takes up (patch 0016): 'prediction horizon now X ms', 'stamp lead: X ms'.
+client_log_pat(){ case "$1" in client.predict_ms) echo 'prediction horizon now';; client.stamp_lead_ms) echo 'stamp lead:';; esac; }
+client_get(){ frame "f=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}/$(client_file "$1"); [ -r \"\$f\" ] && cat \"\$f\" || true" 2>/dev/null | head -1; }
+any_get(){ case "$1" in client.*) client_get "$1";; *) get_key "$1";; esac; }
+toml_value(){  # numbers and booleans bare, everything else quoted
+  if [[ "$1" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || [ "$1" = true ] || [ "$1" = false ]; then echo "$1"; else echo "\"$1\""; fi; }
+parse_pairs(){  # "k=v" words (and "k=v,k=v" lists) -> PAIRS="k=v k=v", checked; dies on the first bad one
+  PAIRS=""; local w kv k v
+  for w in "$@"; do for kv in ${w//,/ }; do
+    [[ "$kv" == *=* ]] || die "'$kv' is not key=value"
+    k=${kv%%=*}; v=${kv#*=}
+    [ "$(key_when "$k")" != unknown ] || die "'$k' is not a key frame-stream can set (frame-stream get --all lists them)"
+    [[ "$v" =~ ^[A-Za-z0-9_.-]+$ ]] || die "'$v' for $k is not a plain value (letters, digits, . _ -)"
+    case "$k" in client.*) [[ "$v" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || die "$k takes a number";; esac
+    PAIRS="$PAIRS $k=$v"
+  done; done
+  PAIRS=${PAIRS# }; [ -n "$PAIRS" ] || die "nothing to set"
+}
+# The runtime writes its own file only with [logging] file_logging on; otherwise its lines go to the engine's stdout,
+# which frame-stream keeps for Godot and Unity. Waiting on a file nobody writes made 'ab' die before its first flip on
+# 10-28 (file_logging = false in the lab toml). So: the one of them written last, chosen once per verb (RTL).
+RTL=""
+rt_log(){ [ -n "$RTL" ] || RTL=$(ls -t "$RUNTIME_LOG" "$LOGS/godot.log" "$LOGS/unity.log" 2>/dev/null | head -1 || true); echo "${RTL:-$RUNTIME_LOG}"; }
+runtime_log_lines(){ local n; n=$(wc -l < "$(rt_log)" 2>/dev/null | tr -d ' ' || true); echo "${n:-0}"; }
+runtime_log_since(){ local f n; f=$(rt_log); n=$(runtime_log_lines); if [ "$n" -ge "$1" ]; then tail -n "+$(( $1 + 1 ))" "$f" 2>/dev/null || true; else cat "$f" 2>/dev/null || true; fi; }
+# Apply PAIRS: one atomic rewrite of the toml (the 250 ms poll never sees half of it), then the client files.
+# Prints "key: old -> new (when)". Sets APPLIED_WHEN to the latest stage any key needs: live < reconnect < restart.
+apply_pairs(){
+  local c t kv k v old when tv l0 i
+  c=$(cfg); [ -f "$c" ] || die "no runtime config at $c - copy mac/oxrsys-runtime.toml there"
+  t="$c.frame-stream.tmp"; cp -p "$c" "$t"; APPLIED_WHEN=live; l0=$(runtime_log_lines)
+  local tomlchanged=0 report=""
+  for kv in $PAIRS; do
+    k=${kv%%=*}; v=${kv#*=}; when=$(key_when "$k"); old=$(any_get "$k")
+    case "$when" in reconnect) [ "$APPLIED_WHEN" = restart ] || APPLIED_WHEN=reconnect;; restart) APPLIED_WHEN=restart;; esac
+    report="$report  $k: ${old:-<default>} -> $v ($when)\n"
+    case "$k" in client.*) continue;; esac
+    tv=$(toml_value "$v")
+    if grep -qE "^$k *=" "$t"; then sed -i '' -E "s/^$k *=.*/$k = $tv/" "$t"
+    elif grep -q '^\[streaming\]' "$t"; then awk -v l="$k = $tv" '{print} /^\[streaming\]$/{print l}' "$t" > "$t.2" && mv "$t.2" "$t"
+    else printf '[streaming]\n%s = %s\n' "$k" "$tv" >> "$t"; fi
+    [ "$(grep -E "^$k *=" "$t" | head -1 | awk -F'= *' '{print $2}' | tr -d '"')" = "$v" ] || { rm -f "$t"; die "could not write $k = $v into $c"; }
+    tomlchanged=1
+  done
+  if [ $tomlchanged = 1 ]; then mv "$t" "$c"; else rm -f "$t"; fi
+  for kv in $PAIRS; do k=${kv%%=*}; v=${kv#*=}
+    case "$k" in client.*) frame "printf '%s\\n' '$v' > \${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}/$(client_file "$k")" || die "could not write $k on the headset";; esac
+  done
+  printf "$report"
+  # The runtime re-reads the file only while an app calls into it (every frame when streaming).
+  if [ $tomlchanged = 1 ] && [ -n "$(runtime_alive)" ]; then
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do runtime_log_since "$l0" | grep -q 'Reloaded config from' && break; sleep 0.25; done
+    if runtime_log_since "$l0" | grep -q 'Reloaded config from'; then say "the runtime re-read $c"; RELOADED=1
+    else say "warning: no 'Reloaded config' line in $(rt_log) within 3 s (is the app paused or not rendering?)"; RELOADED=0; fi
+  fi
+  { printf '{"ts":"%s","set":{' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; local sep=""
+    for kv in $PAIRS; do printf '%s"%s":"%s"' "$sep" "${kv%%=*}" "${kv#*=}"; sep=,; done
+    printf '},"when":"%s","label":"%s"}\n' "$APPLIED_WHEN" "${SET_LABEL:-}"; } >> "$LOGS/live.jsonl"
+}
+runtime_alive(){ local st s_state s_app s_pid s_alive s_age; st=$(runtime_status); [ "$st" = none ] && return 0
+  read -r s_state s_app s_pid s_alive s_age <<<"$st"; [ "$s_alive" = alive ] && echo "$s_app($s_pid)"; return 0; }
+# A reconnect: restart the headset client's unit with the same address and environment (systemd keeps both), so the
+# runtime builds a new encoder from the toml as it now stands. Waits for the encoder's own line, which names what it took.
+client_reconnect(){
+  frame "systemctl --user is-active --quiet oxrsys-client.service" || die "the headset client is not running - nothing to reconnect ('frame-stream up')"
+  local l0 i; l0=$(runtime_log_lines)
+  say "reconnecting the headset client (a few seconds of black)"
+  frame "systemctl --user restart oxrsys-client.service" || die "could not restart the headset client"
+  for i in $(seq 1 40); do runtime_log_since "$l0" | grep -q 'VideoEncoder: Initialized' && break; sleep 0.5; done
+  local got; got=$(runtime_log_since "$l0" | { grep -E 'VideoEncoder: (Initialized|minimum frame QP)' || true; } | tail -2 | sed -E 's/^(\[[^]]*\] )+//' | tr '\n' ' ')
+  [ -n "$got" ] || die "no new encoder in 20 s in $(rt_log) - see 'frame-stream status' and 'frame-stream log'"
+  say "encoder rebuilt: $got"
+  # Check the encoder took what was asked: on 10-28 a reconnect that beat the config re-read gave a blind A/B a wrong arm.
+  local kv k v want; for kv in $PAIRS; do k=${kv%%=*}; v=${kv#*=}; want=""
+    case "$k" in bitrate_mbps) want=", ${v}Mbps";; encoder_min_qp) want="minimum frame QP $v ";; encoder_preset) want="preset=$v,";; esac
+    [ -z "$want" ] || [[ "$got" == *"$want"* ]] || die "the encoder did not take $k=$v (it says: $got)"
+  done
+}
+
+cmd_get(){
+  local all=0 k ks="" when cur
+  if [ "${1:-}" = --all ]; then all=1; shift; fi
+  if [ $# -gt 0 ]; then ks="$*"; else ks=$LIVE_KEYS; fi
+  echo "runtime config: $(cfg)   app: $(runtime_alive || true)"
+  for k in $ks; do
+    when=$(key_when "$k"); [ "$when" != unknown ] || die "'$k' is not a key frame-stream knows"
+    case "$k" in client.*) [ $all = 1 ] || [ $# -gt 0 ] || continue; cur=$(client_get "$k");; *) cur=$(get_key "$k");; esac
+    if [ -z "$cur" ] && [ $all = 0 ] && [ $# -eq 0 ]; then continue; fi
+    printf '  %-32s %-22s %s\n' "$k" "${cur:-<default>}" "$when"
+  done
+  local enc; enc=$(grep -E 'VideoEncoder: Initialized' "$(rt_log)" 2>/dev/null | tail -1 | sed -E 's/^(\[[^]]*\] )+//' || true)
+  [ -z "$enc" ] || echo "the encoder last took: ${enc#VideoEncoder: }"
+}
+
+cmd_set(){
+  local reconnect=0 words=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --reconnect) reconnect=1; shift;;
+    --label) SET_LABEL=${2:-}; shift 2;;
+    -*) die "set takes key=value ... [--reconnect] [--label TEXT]";;
+    *) words+=("$1"); shift;; esac; done
+  [ ${#words[@]} -gt 0 ] || die "usage: frame-stream set key=value ... [--reconnect]   (frame-stream get --all lists the keys)"
+  parse_pairs "${words[@]}"; mkdir -p "$LOGS"
+  local kv; for kv in $PAIRS; do
+    if [ "$(key_when "${kv%%=*}")" = restart ] && [ -n "$(apps_running)$(runtime_alive)" ]; then
+      die "${kv%%=*} is taken only when the app's session starts: 'frame-stream down', then set it, then 'frame-stream up'"; fi
+  done
+  # Reach the client before writing anything, so a failed reconnect never leaves a change on file that did not land.
+  if [ $reconnect = 1 ]; then frame "systemctl --user is-active --quiet oxrsys-client.service" || die "the headset client is not running - nothing to reconnect ('frame-stream up'); nothing was changed"; fi
+  apply_pairs
+  case "$APPLIED_WHEN" in
+    live) say "live: the next frames carry it";;
+    reconnect) if [ $reconnect = 1 ]; then [ "${RELOADED:-1}" = 1 ] || die "not reconnecting: the runtime has not re-read the config yet, so the client would get the old values (the change is on file)"; client_reconnect
+               else say "written; it takes effect at the next headset-client connect (add --reconnect to do that now)"; fi;;
+    restart) say "written; it takes effect at the next 'frame-stream up'";;
+  esac
+}
+
+# Flip between two settings while wearing it. Each flip is a line in ab.jsonl (wall clock, arm, values), so a bench or
+# a log read afterwards splits by arm. The settings in force before the first flip are put back on any exit.
+cmd_ab(){
+  local every=10 rounds=0 reconnect=0 sides=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --every) [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -ge 2 ] || die "--every takes whole seconds, 2 or more"; every=$2; shift 2;;
+    --rounds) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--rounds takes a whole number (0 = until Ctrl-C)"; rounds=$2; shift 2;;
+    --reconnect) reconnect=1; shift;;
+    -*) die "usage: frame-stream ab \"k=v,...\" \"k=v,...\" [--every S] [--rounds N] [--reconnect]";;
+    *) sides+=("$1"); shift;; esac; done
+  [ ${#sides[@]} = 2 ] || die "ab takes two settings, A and B: frame-stream ab \"bitrate_mbps=30\" \"bitrate_mbps=80\" --reconnect"
+  [ -n "$(runtime_alive)" ] || die "no app is streaming: 'frame-stream up' first"
+  mkdir -p "$LOGS"
+  parse_pairs "${sides[0]}"; local A=$PAIRS; parse_pairs "${sides[1]}"; local B=$PAIRS
+  local kv k need=live orig=""
+  for kv in $A $B; do k=${kv%%=*}
+    case "$(key_when "$k")" in
+      restart) die "$k is taken only when the app's session starts, so it cannot flip in a running stream";;
+      reconnect) need=reconnect;; esac
+    case " $orig " in *" $k="*) ;; *)
+      local cur; cur=$(any_get "$k")
+      if [ -z "$cur" ]; then
+        case "$k" in client.*) die "the current $k is not on file, so it could not be put back: 'frame-stream set $k=<its value>' first";; esac
+        cur=__default__; fi
+      orig="$orig $k=$cur";; esac
+  done
+  if [ $need = reconnect ] && [ $reconnect = 0 ]; then die "these keys take effect only at a client connect: add --reconnect (each flip then costs a few seconds of black; use --every 20 or more)"; fi
+  if [ $need = reconnect ] && [ "$every" -lt 15 ]; then every=15; say "--every raised to 15 s: a reconnect flip takes several seconds"; fi
+  AB_ORIG=${orig# }; AB_RECONNECT=$reconnect
+  trap ab_restore EXIT; trap 'exit 130' INT TERM HUP
+  say "A: $A"; say "B: $B"; say "flipping every ${every} s$([ "$rounds" -gt 0 ] && echo " for $rounds rounds" || echo ", Ctrl-C ends it and puts back: $AB_ORIG")"
+  local n=0 arm=A
+  while :; do
+    n=$((n+1)); if [ "$arm" = A ]; then PAIRS=$A; else PAIRS=$B; fi
+    SET_LABEL="ab $arm" apply_pairs > /dev/null
+    if [ $reconnect = 1 ] && [ "$APPLIED_WHEN" = reconnect ]; then
+      [ "${RELOADED:-1}" = 1 ] || die "flip $n: the runtime has not re-read the config, so a reconnect would show the wrong arm - stopping"
+      client_reconnect > /dev/null; fi
+    printf '{"ts":"%s","unix":%s,"flip":%d,"arm":"%s","set":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(date +%s)" "$n" "$arm" "$PAIRS" >> "$LOGS/ab.jsonl"
+    say "$(date +%T) now $arm  ($PAIRS)"
+    # sleep in the background and wait for it: a TERM then ends the wait at once, not after the whole period
+    if [ "$rounds" -gt 0 ] && [ "$arm" = B ] && [ $((n/2)) -ge "$rounds" ]; then sleep "$every" & wait $!; break; fi
+    sleep "$every" & wait $!; if [ "$arm" = A ]; then arm=B; else arm=A; fi
+  done
+}
+ab_restore(){
+  trap - EXIT; [ -n "${AB_ORIG:-}" ] || return 0
+  local kv k c t; PAIRS=""; c=$(cfg); t="$c.frame-stream.tmp"
+  for kv in $AB_ORIG; do k=${kv%%=*}
+    if [ "${kv#*=}" = __default__ ]; then grep -vE "^$k *=" "$c" > "$t" && mv "$t" "$c"; else PAIRS="$PAIRS $kv"; fi; done
+  PAIRS=${PAIRS# }
+  if [ -n "$PAIRS" ]; then SET_LABEL="ab restore" apply_pairs > /dev/null; fi
+  if [ "${AB_RECONNECT:-0}" = 1 ]; then client_reconnect > /dev/null || true; fi
+  printf '{"ts":"%s","unix":%s,"arm":"restored","set":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(date +%s)" "$AB_ORIG" >> "$LOGS/ab.jsonl"
+  say "put back: $AB_ORIG"; AB_ORIG=""
+}
+
+case "${1:-}" in
+  up) shift; cmd_up "$@";;
+  down) cmd_down;;
+  audio) shift; cmd_audio "$@";;
+  status) cmd_status;;
+  streams) cmd_streams;;
+  log) shift; cmd_log "$@";;
+  card) shift; cmd_card "$@";;
+  passthrough) shift; cmd_passthrough "$@";;
+  check-link) cmd_check_link;;
+  doctor) shift; cmd_doctor "$@";;
+  watch) shift; cmd_watch "$@";;
+  bench) shift; cmd_bench "$@";;
+  get) shift; cmd_get "$@";;
+  set) shift; cmd_set "$@";;
+  ab) shift; cmd_ab "$@";;
+  *) awk 'NR>3 && /^#$/{exit} NR>=2' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
+esac

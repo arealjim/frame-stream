@@ -1,0 +1,1534 @@
+From ecac93c497e1dd789606566df7328f10062cab93 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 08:13:26 +0000
+Subject: [PATCH] steam-frame client: review 2026-10-21 close-out (M2-M12,
+ L1-L9)
+
+Patch 0016. Every Steam Frame client finding the adversarial review left OPEN or PARTLY,
+closed as the smallest correct change; 734 unit checks (was 692), 0 failures.
+
+M2  PollEvents: xrBeginSession/xrEndSession failures logged; a poll error is not "no events";
+    session LOSS_PENDING and INSTANCE_LOSS_PENDING end the client with a clear line and exit
+    status 3 (the client does not rebuild its session; the launcher restarts it).
+M3  xrWaitSwapchainImage (and acquire) results checked: a failed eye is neither rendered nor
+    released, and the layer is not submitted that frame.
+M4  Reconnect, shaped like the sibling android-vr client and the server: discovery stays up
+    through the connection; the server announces only while it has no client and drops one
+    after 3 s without tracking, so an announce arriving while connected > 3 s means it
+    restarted or forgot us. Also: the USB/TCP lost callback, and no video at all within
+    FRAME_CLIENT_RECONNECT_S (default 5; 0 = off) of a connect. An idle server is left
+    alone. Discovery runs on its own thread; the search gives up after 600 s. The direct
+    (FRAME_CLIENT_SERVER) ask slows to every 5 s while connected.
+M5  VideoDecoder::ResetStreamState: access unit, submit records, ready frames, pts history;
+    called by OpenStream, ReconfigureStream and before every (re)connect wiring.
+M6  avcodec_send_packet EAGAIN: drain the decoder's output, resend once; only a second
+    refusal drops the access unit (counted, logged rate-limited).
+M7  OpenStream refuses Codec::H264: the access-unit assembly reads HEVC NAL headers.
+M8  PeekLatestPts names the frame TakeLatest would return (after the queue catch-up).
+M9  lastConnect_ under connectMu_; the retry thread copies the current one per resend;
+    testDropConnects_ atomic.
+M10 Post-discovery wiring: a failed control socket, tracking connect or first ClientConnect
+    stops the receiver and tracker before returning false; a failed decoder reconfigure
+    with a nonzero size is a failed connect (the codec is closed); a zero size is said.
+M11 runtime_paths.h: live-tuning files (frame-predict-ms, frame-passthrough,
+    frame-stamp-lead-ms) read from $XDG_RUNTIME_DIR, else /dev/shm only when a regular
+    file owned by this user; all debug dumps go to $XDG_RUNTIME_DIR as fresh 0600 files
+    (O_EXCL | O_NOFOLLOW after an unlink), never through a planted symlink.
+M12 g_poseEpoch: the velocity low-pass, the stamp-lead finite difference and the slip
+    direction restart on every session state change, hidden/visible flip and reconnect.
+L1  g_running is volatile sig_atomic_t.
+L2  FindMemoryType UINT32_MAX checked at its three callers; frame fences and the readback
+    dump's submit/wait checked; LoadFile checks tellg and the read.
+L3  EnsureVideoTexture refuses a frame larger than the announced encode + 64 and a second
+    re-creation within 1 s.
+L4  serverName terminated before it is printed (discovery thread and connection).
+L5  inet_ntop in PunchVideoPath; lastPunchNs_ atomic.
+L6  latestMutex_ mutable; LastDecodeMs locks.
+L7  The frame's own VIDEO_FLAG_ALPHA_BLEND rides SubmitNal -> FrameTiming; the layer flags,
+    the blend mode and the shader's alpha key follow the displayed frame, not the latest
+    received one.
+L8  FRAME_CLIENT_PREDICT_MS / PREDICT_POS_MS clamped to 0..200, PREDICT_POS_TAU_MS to >= 0.
+L9  xrGetDisplayRefreshRateFB's PFN is an App member.
+
+Tests (tests/test_client_state.cpp): H.264 refused; the test clip decodes in stream mode
+NAL by NAL; peek == take with and without a backlog; the alpha flag reaches FrameTiming;
+reconfigure and reset forget the pending access unit and the ready frames and decoding
+resumes with no old pts; runtime_paths reads the runtime dir, ignores symlinks, honours
+only our own /dev/shm file, and a dump replaces a planted symlink with a 0600 regular file.
+
+Also: CLIENT_CAPABILITY_PACING_LOCK set in ClientConnect (the Mac runtime gates its rate lock,
+pacing_lock_wait_ms, on it since its own close-out). Defined here as 0x00002000: the Mac tree
+chose 0x00000800, which on this branch is CLIENT_CAPABILITY_FOVEATION_CENTER (already sent, so
+the Mac gate opens for this client either way); the Mac definition should move to 0x00002000.
+---
+ clients/steam-frame/CMakeLists.txt            |   1 +
+ clients/steam-frame/src/NetworkReceiver.cpp   |  11 +-
+ clients/steam-frame/src/NetworkReceiver.h     |   7 +-
+ clients/steam-frame/src/main.cpp              | 230 ++++++++++++++----
+ clients/steam-frame/src/runtime_paths.h       |  75 ++++++
+ clients/steam-frame/src/stream_connection.cpp | 175 +++++++++----
+ clients/steam-frame/src/stream_connection.h   |  37 ++-
+ clients/steam-frame/src/video_decoder.cpp     |  58 ++++-
+ clients/steam-frame/src/video_decoder.h       |  29 ++-
+ .../steam-frame/tests/test_client_state.cpp   | 193 +++++++++++++++
+ clients/steam-frame/tests/test_main.cpp       |   2 +
+ .../include/oxrsys/protocol/Protocol.h        |   6 +
+ 12 files changed, 710 insertions(+), 114 deletions(-)
+ create mode 100644 clients/steam-frame/src/runtime_paths.h
+ create mode 100644 clients/steam-frame/tests/test_client_state.cpp
+
+diff --git a/clients/steam-frame/CMakeLists.txt b/clients/steam-frame/CMakeLists.txt
+index 613e6c2..d23ff7c 100644
+--- a/clients/steam-frame/CMakeLists.txt
++++ b/clients/steam-frame/CMakeLists.txt
+@@ -80,6 +80,7 @@ add_executable(steam_frame_client_tests
+     tests/test_protocol_fec.cpp
+     tests/test_foveation.cpp
+     tests/test_yuv.cpp
++    tests/test_client_state.cpp
+     src/video_decoder.cpp)
+ target_include_directories(steam_frame_client_tests PRIVATE
+     ${OXRSYS_PROTO_INC} ${OXRSYS_STREAMING_INC} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/clients/steam-frame/src/NetworkReceiver.cpp b/clients/steam-frame/src/NetworkReceiver.cpp
+index 18322c4..dd50bc4 100644
+--- a/clients/steam-frame/src/NetworkReceiver.cpp
++++ b/clients/steam-frame/src/NetworkReceiver.cpp
+@@ -165,6 +165,7 @@ bool NetworkReceiver::StartDiscovery(OnServerFoundCallback callback)
+ void NetworkReceiver::DiscoveryThread(OnServerFoundCallback callback)
+ {
+     uint8_t buffer[sizeof(protocol::ServerAnnounce)];
++    uint32_t loops = 0;
+ 
+     while (discovering_.load())
+     {
+@@ -172,9 +173,9 @@ void NetworkReceiver::DiscoveryThread(OnServerFoundCallback callback)
+         timeval tv = {1, 0};
+         setsockopt(discoverySocket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+ 
+-        if (haveDirectServer_)
++        if (haveDirectServer_ && loops++ % (uint32_t)discoveryAskEvery_.load() == 0)
+         {
+-            // One byte, once per loop (~1 Hz), until an announce arrives and discovery stops.
++            // One byte, once per loop (~1 Hz) while searching; every few loops once connected (review M4).
+             const uint8_t request = static_cast<uint8_t>(protocol::MessageType::DiscoveryRequest);
+             sendto(discoverySocket_, &request, sizeof(request), 0,
+                    (const sockaddr*)&directServer_, sizeof(directServer_));
+@@ -198,6 +199,7 @@ void NetworkReceiver::DiscoveryThread(OnServerFoundCallback callback)
+         {
+             protocol::ServerAnnounce hello = {};
+             memcpy(&hello, buffer, std::min<size_t>(static_cast<size_t>(received), sizeof(hello)));
++            hello.serverName[sizeof(hello.serverName) - 1] = 0;   // review L4: printed with %s; the wire need not terminate it
+             if (hello.type == protocol::MessageType::ServerAnnounce)
+             {
+                 char ipStr[INET_ADDRSTRLEN];
+@@ -230,8 +232,9 @@ void NetworkReceiver::PunchVideoPath()
+            sizeof(videoServer_));
+     if (packetsReceived_.load() == 0)
+     {
+-        LOGI("Video path: punched %s:%u from the video socket", inet_ntoa(videoServer_.sin_addr),
+-             (unsigned)ntohs(videoServer_.sin_port));
++        char who[INET_ADDRSTRLEN];   // review L5: inet_ntoa's static buffer is shared by the two threads that punch
++        inet_ntop(AF_INET, &videoServer_.sin_addr, who, sizeof(who));
++        LOGI("Video path: punched %s:%u from the video socket", who, (unsigned)ntohs(videoServer_.sin_port));
+     }
+ }
+ 
+diff --git a/clients/steam-frame/src/NetworkReceiver.h b/clients/steam-frame/src/NetworkReceiver.h
+index 8adbc5f..9524661 100644
+--- a/clients/steam-frame/src/NetworkReceiver.h
++++ b/clients/steam-frame/src/NetworkReceiver.h
+@@ -47,6 +47,10 @@ class NetworkReceiver
+ 
+     bool StartDiscovery(OnServerFoundCallback callback);
+     void StopDiscovery();
++    // With FRAME_CLIENT_SERVER the discovery thread asks the pinned server for an announce once per loop (~1 Hz).
++    // Review 2026-10-21 (M4): discovery now stays up through the connection (the server answers only while it has no
++    // client, so an answer means it restarted or dropped us), and the connected client asks every n loops instead.
++    void SetDiscoveryAskEvery(int loops) { discoveryAskEvery_.store(loops < 1 ? 1 : loops); }
+     bool StartReceiving(const char* serverIp, uint16_t videoPort, OnNalUnitCallback callback,
+                         OnConnectionLostCallback connectionLostCallback);
+     bool StartReceivingTcp(uint16_t videoPort, OnNalUnitCallback callback,
+@@ -118,7 +122,8 @@ class NetworkReceiver
+     void PunchVideoPath();
+     sockaddr_in videoServer_ = {};
+     bool haveVideoServer_ = false;
+-    int64_t lastPunchNs_ = 0;
++    std::atomic<int64_t> lastPunchNs_{0};   // review L5: punched from the caller's thread and the receive thread
++    std::atomic<int> discoveryAskEvery_{1};  // direct (FRAME_CLIENT_SERVER) ask every n discovery loops (~n seconds)
+     int discoverySocket_ = -1;
+     // Direct (unicast) discovery target from FRAME_CLIENT_SERVER, for networks that drop the
+     // server's broadcast beacon; the server answers a DiscoveryRequest with its ServerAnnounce.
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index a8244dc..126cbc6 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -22,6 +22,7 @@
+ #include "video_decoder.h"
+ #include "stream_connection.h"
+ #include "xr_input.h"
++#include "runtime_paths.h"
+ 
+ #include <oxrsys/protocol/Protocol.h>
+ 
+@@ -90,6 +91,8 @@ struct App {
+     bool hasEyeGaze = false;
+     bool hasRefreshRate = false;
+     float panelHz = 0.0f;          // what the panel actually runs (xrGetDisplayRefreshRateFB), 0 = unknown
++    PFN_xrGetDisplayRefreshRateFB pfnGetRefresh = nullptr;   // per instance, not a static (review L9)
++    bool lossPending = false;      // the runtime announced it is going away (review M2); main exits 3
+ 
+     // Vulkan
+     VkInstance vkInstance = VK_NULL_HANDLE;
+@@ -173,12 +176,19 @@ static double g_waitForFrameMs = 0.0;
+ static bool g_streamMode = false;
+ static XrInput g_xrInput;
+ 
+-static volatile bool g_running = true;
++static volatile sig_atomic_t g_running = 1;   // review L1: the one type a signal handler may write
+ static void SignalHandler(int)
+ {
+     if (!g_running) _exit(0); // second Ctrl-C: hard exit if graceful teardown hangs
+-    g_running = false;
++    g_running = 0;
+ }
++// Review 2026-10-21 (M12): per-session-episode state in the pose path (velocity low-pass, stamp-lead finite
++// difference, slip direction). Bumped on every session state change, every hidden<->visible flip and every
++// reconnect; each holder compares its own copy and starts afresh, so no stale velocity survives a hidden spell.
++static uint32_t g_poseEpoch = 1;
++// The displayed frame's own alpha-blend flag (review L7): set from the frame's FrameTiming when it is taken, kept
++// across repaints of the same texture, so the layer blends the way THIS frame was composed.
++static bool g_displayedAlpha = false;
+ 
+ // ============================================================================
+ // OpenXR: instance + extension dump (the V0 deliverable)
+@@ -596,9 +606,12 @@ static std::vector<char> LoadFile(const std::string& path)
+ {
+     std::ifstream f(path, std::ios::binary | std::ios::ate);
+     if (!f) { LOG_ERROR("cannot open %s", path.c_str()); return {}; }
+-    std::vector<char> buf((size_t)f.tellg());
++    const std::streamoff size = f.tellg();
++    if (size <= 0) { LOG_ERROR("cannot size %s", path.c_str()); return {}; }   // review L2
++    std::vector<char> buf((size_t)size);
+     f.seekg(0);
+     f.read(buf.data(), (std::streamsize)buf.size());
++    if (!f) { LOG_ERROR("short read of %s", path.c_str()); return {}; }
+     return buf;
+ }
+ 
+@@ -739,6 +752,7 @@ static bool CreateSampledImage(App& app, VkFormat format, uint32_t w, uint32_t h
+     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+     mai.allocationSize = mr.size;
+     mai.memoryTypeIndex = FindMemoryType(app, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (mai.memoryTypeIndex == UINT32_MAX) { LOG_ERROR("no device-local memory type for the video image"); return false; }   // review L2
+     VK_CHECK(vkAllocateMemory(app.device, &mai, nullptr, &mem));
+     VK_CHECK(vkBindImageMemory(app.device, image, mem, 0));
+ 
+@@ -772,6 +786,27 @@ static bool EnsureVideoTexture(App& app, uint32_t w, uint32_t h, bool nv12)
+ {
+     if (app.videoImage != VK_NULL_HANDLE && app.videoW == w && app.videoH == h && app.videoNv12 == nv12) return true;
+ 
++    // Review 2026-10-21 (L3): the size comes from the stream's SPS. Cap it to the announced encode (plus alignment
++    // slack) and allow one re-creation a second, so a hostile stream alternating sizes cannot force a device idle
++    // per frame; a refused frame is simply not shown.
++    if (g_streamMode) {
++        static uint32_t refused = 0;
++        const uint32_t capW = g_stream.EncodedWidth(), capH = g_stream.EncodedHeight();
++        if (capW > 0 && capH > 0 && (w > capW + 64 || h > capH + 64)) {
++            refused++;
++            if (refused <= 5 || refused % 1000 == 0) LOG_ERROR("decoded frame %ux%u exceeds the announced encode %ux%u; not shown (%u so far)", w, h, capW, capH, refused);
++            return false;
++        }
++        static std::chrono::steady_clock::time_point lastResize{};
++        const auto now = std::chrono::steady_clock::now();
++        if (app.videoImage != VK_NULL_HANDLE && now - lastResize < std::chrono::seconds(1)) {
++            refused++;
++            if (refused <= 5 || refused % 1000 == 0) LOG_ERROR("video texture resize to %ux%u within 1 s of the last; frame not shown (%u so far)", w, h, refused);
++            return false;
++        }
++        lastResize = now;
++    }
++
+     vkDeviceWaitIdle(app.device);
+     DestroyVideoImages(app);
+ 
+@@ -800,6 +835,7 @@ static bool EnsureVideoTexture(App& app, uint32_t w, uint32_t h, bool nv12)
+             bmai.allocationSize = bmr.size;
+             bmai.memoryTypeIndex = FindMemoryType(app, bmr.memoryTypeBits,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++            if (bmai.memoryTypeIndex == UINT32_MAX) { LOG_ERROR("no host-visible memory type for the staging buffer"); return false; }   // review L2
+             VK_CHECK(vkAllocateMemory(app.device, &bmai, nullptr, &app.stagingMem[i]));
+             VK_CHECK(vkBindBufferMemory(app.device, app.staging[i], app.stagingMem[i], 0));
+             VK_CHECK(vkMapMemory(app.device, app.stagingMem[i], 0, need, 0, &app.stagingMapped[i]));
+@@ -894,12 +930,12 @@ static bool BeginFrameCommands(App& app)
+     const uint32_t s = app.frameSlot;
+     if (app.frameInFlight[s]) {
+         auto t0 = std::chrono::steady_clock::now();
+-        vkWaitForFences(app.device, 1, &app.frameFence[s], VK_TRUE, UINT64_MAX);
++        VK_CHECK(vkWaitForFences(app.device, 1, &app.frameFence[s], VK_TRUE, UINT64_MAX));   // review L2
+         double ms = MsSince(t0);
+         g_rt.fenceWait += ms; if (ms > g_rt.fenceWaitMax) g_rt.fenceWaitMax = ms;
+         app.frameInFlight[s] = false;
+     }
+-    vkResetFences(app.device, 1, &app.frameFence[s]);
++    VK_CHECK(vkResetFences(app.device, 1, &app.frameFence[s]));
+     VK_CHECK(vkResetCommandBuffer(app.frameCmd[s], 0));
+     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+@@ -919,7 +955,7 @@ static bool EndFrameCommands(App& app)
+     app.frameInFlight[s] = true;
+     if (app.syncGpu) {
+         auto t0 = std::chrono::steady_clock::now();
+-        vkWaitForFences(app.device, 1, &app.frameFence[s], VK_TRUE, UINT64_MAX);
++        VK_CHECK(vkWaitForFences(app.device, 1, &app.frameFence[s], VK_TRUE, UINT64_MAX));   // review L2
+         double ms = MsSince(t0);
+         g_rt.gpuWait += ms; if (ms > g_rt.gpuWaitMax) g_rt.gpuWaitMax = ms;
+         app.frameInFlight[s] = false;
+@@ -1022,10 +1058,12 @@ static void DumpSwapchainImage(App& app, Swapchain& sc, uint32_t imageIndex)
+     mai.allocationSize = mr.size;
+     mai.memoryTypeIndex = FindMemoryType(app, mr.memoryTypeBits,
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+-    if (vkAllocateMemory(app.device, &mai, nullptr, &mem) != VK_SUCCESS) { vkDestroyBuffer(app.device, buf, nullptr); return; }
+-    vkBindBufferMemory(app.device, buf, mem, 0);
++    if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(app.device, &mai, nullptr, &mem) != VK_SUCCESS) {   // review L2
++        LOG_ERROR("readback dump: no host-visible memory"); vkDestroyBuffer(app.device, buf, nullptr); return; }
++    if (vkBindBufferMemory(app.device, buf, mem, 0) != VK_SUCCESS) {
++        LOG_ERROR("readback dump: bind failed"); vkFreeMemory(app.device, mem, nullptr); vkDestroyBuffer(app.device, buf, nullptr); return; }
+ 
+-    vkResetFences(app.device, 1, &app.fence);
++    if (vkResetFences(app.device, 1, &app.fence) != VK_SUCCESS) LOG_ERROR("readback dump: vkResetFences failed");
+     vkResetCommandBuffer(app.cmdBuffer, 0);
+     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+@@ -1053,13 +1091,15 @@ static void DumpSwapchainImage(App& app, Swapchain& sc, uint32_t imageIndex)
+     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+     si.commandBufferCount = 1;
+     si.pCommandBuffers = &app.cmdBuffer;
+-    vkQueueSubmit(app.queue, 1, &si, app.fence);
+-    vkWaitForFences(app.device, 1, &app.fence, VK_TRUE, UINT64_MAX);
+-
+-    if (vkMapMemory(app.device, mem, 0, sz, 0, &mapped) == VK_SUCCESS) {
+-        FILE* f = fopen("/tmp/frame_client_eye0.rgba", "wb");
++    if (vkQueueSubmit(app.queue, 1, &si, app.fence) != VK_SUCCESS ||
++        vkWaitForFences(app.device, 1, &app.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {   // review L2
++        LOG_ERROR("readback dump: submit or fence wait failed; nothing written");
++    } else if (vkMapMemory(app.device, mem, 0, sz, 0, &mapped) == VK_SUCCESS) {
++        const std::string path = frame_paths::DumpPath("frame_client_eye0.rgba");   // review M11: runtime dir, fresh file
++        FILE* f = frame_paths::CreateDump(path);
+         if (f) { fwrite(mapped, 1, (size_t)sz, f); fclose(f);
+-            LOG_INFO("dumped rendered eye0 %ux%u to /tmp/frame_client_eye0.rgba", sc.width, sc.height); }
++            LOG_INFO("dumped rendered eye0 %ux%u to %s", sc.width, sc.height, path.c_str()); }
++        else LOG_ERROR("readback dump: cannot create %s", path.c_str());
+         vkUnmapMemory(app.device, mem);
+     }
+     vkDestroyBuffer(app.device, buf, nullptr);
+@@ -1103,7 +1143,7 @@ static bool RenderEye(App& app, uint32_t eye, uint32_t imageIndex)
+         pc.foveated = (g_streamMode && fv.enabled) ? 1 : 0;
+         pc.nv12 = app.videoNv12 ? 1 : 0;
+         pc.fullRange = app.videoFullRange ? 1 : 0;
+-        pc.alphaKey = (g_streamMode && g_alphaBlendSupported && g_stream.AlphaBlend()) ? 1 : 0;
++        pc.alphaKey = (g_streamMode && g_alphaBlendSupported && g_displayedAlpha) ? 1 : 0;   // the displayed frame's own flag (review L7)
+         // Review 2026-10-21 (H1): the video is gamma-encoded and an sRGB attachment encodes again on store, so the
+         // compositor was handed sRGB(sRGB(x)). Linearise first when the swapchain is an sRGB format.
+         // FRAME_CLIENT_SRGB_LINEARIZE=0 restores the old double-encoded picture for an A/B wear.
+@@ -1136,11 +1176,10 @@ static bool RenderEye(App& app, uint32_t eye, uint32_t imageIndex)
+ static bool ReadPanelRefreshRate(App& app, bool force)
+ {
+     if (!app.hasRefreshRate) return false;
+-    static PFN_xrGetDisplayRefreshRateFB pfnGet = nullptr;
+-    if (!pfnGet) xrGetInstanceProcAddr(app.instance, "xrGetDisplayRefreshRateFB", (PFN_xrVoidFunction*)&pfnGet);
+-    if (!pfnGet) return false;
++    if (!app.pfnGetRefresh) xrGetInstanceProcAddr(app.instance, "xrGetDisplayRefreshRateFB", (PFN_xrVoidFunction*)&app.pfnGetRefresh);
++    if (!app.pfnGetRefresh) return false;
+     float hz = 0.0f;
+-    if (XR_FAILED(pfnGet(app.session, &hz)) || hz <= 0.0f) return false;
++    if (XR_FAILED(app.pfnGetRefresh(app.session, &hz)) || hz <= 0.0f) return false;
+     const bool changed = std::fabs(hz - app.panelHz) > 0.5f;
+     if (changed || force) {
+         LOG_INFO("panel refresh rate: %.2f Hz%s", hz, changed && app.panelHz > 0 ? " (CHANGED)" : "");
+@@ -1178,30 +1217,53 @@ static void RequestMaxRefreshRate(App& app)
+ 
+ static void PollEvents(App& app)
+ {
++    // Review 2026-10-21 (M2): every outcome has its log line. A failed xrBeginSession/xrEndSession is said; a poll
++    // error is not "no events"; LOSS_PENDING (session) and INSTANCE_LOSS_PENDING both end the client with a clear
++    // line and exit status 3 - this client does not rebuild its session/instance (the swapchains, Vulkan device and
++    // stream are bound to them), the launcher restarts it instead.
+     XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
+-    while (xrPollEvent(app.instance, &ev) == XR_SUCCESS) {
++    XrResult pr;
++    while ((pr = xrPollEvent(app.instance, &ev)) == XR_SUCCESS) {
+         if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+             auto* ssc = (XrEventDataSessionStateChanged*)&ev;
+             app.sessionState = ssc->state;
++            g_poseEpoch++;   // review M12
+             LOG_INFO("Session state -> %d", (int)ssc->state);
+             if (ssc->state == XR_SESSION_STATE_READY) {
+                 XrSessionBeginInfo bi = {XR_TYPE_SESSION_BEGIN_INFO};
+                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+-                if (XR_SUCCEEDED(xrBeginSession(app.session, &bi))) {
++                const XrResult br = xrBeginSession(app.session, &bi);
++                if (XR_SUCCEEDED(br)) {
+                     app.sessionRunning = true;
+                     LOG_INFO("Session started");
+                     RequestMaxRefreshRate(app);
++                } else {
++                    LOG_ERROR("xrBeginSession failed: %d; the session stays idle", (int)br);
+                 }
+             } else if (ssc->state == XR_SESSION_STATE_STOPPING) {
+-                xrEndSession(app.session);
++                const XrResult er = xrEndSession(app.session);
++                if (XR_FAILED(er)) LOG_ERROR("xrEndSession failed: %d", (int)er);
+                 app.sessionRunning = false;
+-            } else if (ssc->state == XR_SESSION_STATE_EXITING ||
+-                       ssc->state == XR_SESSION_STATE_LOSS_PENDING) {
++            } else if (ssc->state == XR_SESSION_STATE_LOSS_PENDING) {
++                LOG_ERROR("session LOSS_PENDING: the runtime is dropping this session (SteamVR restarting?); exiting 3, restart the client when it is back");
++                app.lossPending = true;
++                app.exitRequested = true;
++            } else if (ssc->state == XR_SESSION_STATE_EXITING) {
+                 app.exitRequested = true;
+             }
++        } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
++            auto* ilp = (XrEventDataInstanceLossPending*)&ev;
++            LOG_ERROR("instance LOSS_PENDING at %lld: the runtime is going away; exiting 3", (long long)ilp->lossTime);
++            app.lossPending = true;
++            app.exitRequested = true;
+         }
+         ev = {XR_TYPE_EVENT_DATA_BUFFER};
+     }
++    if (pr != XR_EVENT_UNAVAILABLE) {
++        static uint32_t pollErrors = 0; pollErrors++;
++        if (pollErrors <= 5 || pollErrors % 900 == 0) LOG_ERROR("xrPollEvent failed: %d (%u so far)", (int)pr, pollErrors);
++        if (pr == XR_ERROR_INSTANCE_LOST) { LOG_ERROR("instance lost; exiting 3"); app.lossPending = true; app.exitRequested = true; }
++    }
+ }
+ 
+ 
+@@ -1224,15 +1286,16 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+     // the compositor's panels get) and send zero velocity, so the server renders exactly that pose and
+     // extrapolates nothing. The layer is still stamped with the pose the server rendered from.
+     // Default 40 ms since 2026-10-21 (review H2): the wears' setting, previously only in the launcher.
+-    static float kPredictMs = getenv("FRAME_CLIENT_PREDICT_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_MS")) : 40.0f;
++    static float kPredictMs = getenv("FRAME_CLIENT_PREDICT_MS") ? std::min(200.0f, std::max(0.0f, (float)atof(getenv("FRAME_CLIENT_PREDICT_MS")))) : 40.0f;   // clamped like the live file (review L8)
+     static bool predictLogged = false;
+     if (kPredictMs > 0 && !predictLogged) { predictLogged = true; LOG_INFO("head pose sampled %.1f ms ahead by the runtime (FRAME_CLIENT_PREDICT_MS); velocity sent as zero", kPredictMs); }
+-    // Live override (2026-10-19): /dev/shm/frame-predict-ms, read once a second, so a wear can tune the horizon.
++    // Live override (2026-10-19): the file frame-predict-ms in the per-user runtime dir (review M11; /dev/shm as the
++    // owner-checked fallback), read once a second, so a wear can tune the horizon.
+     {
+         static uint32_t predictPoll = 0;
+         if (predictPoll++ % 90 == 0) {
+-            if (FILE* pf = fopen("/dev/shm/frame-predict-ms", "r")) {
+-                float v; if (fscanf(pf, "%f", &v) == 1 && v >= 0.0f && v <= 200.0f && v != kPredictMs) { kPredictMs = v; LOG_INFO("prediction horizon now %.1f ms (/dev/shm/frame-predict-ms)", v); }
++            if (FILE* pf = frame_paths::OpenTuning("frame-predict-ms")) {
++                float v; if (fscanf(pf, "%f", &v) == 1 && v >= 0.0f && v <= 200.0f && v != kPredictMs) { kPredictMs = v; LOG_INFO("prediction horizon now %.1f ms (live file frame-predict-ms)", v); }
+                 fclose(pf);
+             }
+         }
+@@ -1306,13 +1369,16 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+                 // smear; near zero at rest, so the tracker's velocity noise does not reach the eye the way the
+                 // runtime's predicted position did (patches 0008/0012). Tether wear: the cube lagged the keyboard
+                 // on movement by the position's ~39 ms sample-to-display path. 0 = off (position at now).
+-                static float kPosMs = getenv("FRAME_CLIENT_PREDICT_POS_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_POS_MS")) : 40.0f;   // the tether wear's default
+-                static float kPosTau = getenv("FRAME_CLIENT_PREDICT_POS_TAU_MS") ? atof(getenv("FRAME_CLIENT_PREDICT_POS_TAU_MS")) : 100.0f;
++                // Review L8: a tau <= 0 gave a gain of 1 or a negative one; clamped to >= 0 (0 = the raw velocity), the horizon to 0..200.
++                static float kPosMs = getenv("FRAME_CLIENT_PREDICT_POS_MS") ? std::min(200.0f, std::max(0.0f, (float)atof(getenv("FRAME_CLIENT_PREDICT_POS_MS")))) : 40.0f;   // the tether wear's default
++                static float kPosTau = getenv("FRAME_CLIENT_PREDICT_POS_TAU_MS") ? std::max(0.0f, (float)atof(getenv("FRAME_CLIENT_PREDICT_POS_TAU_MS"))) : 100.0f;
+                 static bool posMsLogged = false;
+                 if (!posMsLogged) { posMsLogged = true; LOG_INFO("position extrapolation: %.1f ms by a %.0f ms low-passed velocity (FRAME_CLIENT_PREDICT_POS_MS/_TAU_MS)", kPosMs, kPosTau); }
+                 if (kPosMs > 0 && (hvNow.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT)) {
+                     static XrVector3f vf = {0, 0, 0};
+                     static XrTime tPrev = 0;
++                    static uint32_t vfEpoch = 0;
++                    if (vfEpoch != g_poseEpoch) { vfEpoch = g_poseEpoch; vf = {0, 0, 0}; tPrev = 0; }   // review M12: fresh after a hidden spell / state change
+                     const float dt = tPrev ? (float)(t - tPrev) * 1e-6f : 11.1f;   // ms
+                     tPrev = t;
+                     const float a = kPosTau > 0 ? (dt / (kPosTau + dt)) : 1.0f;
+@@ -1360,8 +1426,9 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+     // are the eye's scaled by D/(D-f) and shifted by the camera-eye offset over D - and stamp the layer with the
+     // EYE fov, so the compositor shows the wider render compressed into the eye's view, which is exactly the
+     // plane re-projection. FRAME_CLIENT_PASSTHROUGH="forward down baseline depth" (metres) turns it on;
+-    // /dev/shm/frame-passthrough with the same four numbers (or "off"), read once a second, retunes it live
+-    // during a wear - D is where the real and virtual sizes agree, f is tuned on the residual up close.
++    // the live file frame-passthrough (per-user runtime dir, review M11; /dev/shm as the owner-checked fallback) with
++    // the same four numbers (or "off"), read once a second, retunes it live during a wear - D is where the real and
++    // virtual sizes agree, f is tuned on the residual up close.
+     {
+         static bool ptOn = false; static float ptF = 0.08f, ptDown = 0.0f, ptBase = 0.0639f, ptDepth = 1.5f;
+         static bool ptInit = false; static uint32_t ptPoll = 0;
+@@ -1381,9 +1448,9 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+         };
+         if (!ptInit) { ptInit = true; if (const char* e = getenv("FRAME_CLIENT_PASSTHROUGH")) parse(e, "FRAME_CLIENT_PASSTHROUGH"); }
+         if (ptPoll++ % 90 == 0) {
+-            if (FILE* pf = fopen("/dev/shm/frame-passthrough", "r")) {
++            if (FILE* pf = frame_paths::OpenTuning("frame-passthrough")) {
+                 char line[128] = {0};
+-                if (fgets(line, sizeof line, pf)) { static char last[128] = {0}; if (strcmp(line, last) != 0) { strncpy(last, line, sizeof last - 1); parse(line, "/dev/shm/frame-passthrough"); } }
++                if (fgets(line, sizeof line, pf)) { static char last[128] = {0}; if (strcmp(line, last) != 0) { strncpy(last, line, sizeof last - 1); parse(line, "live file frame-passthrough"); } }
+                 fclose(pf);
+             }
+         }
+@@ -1490,7 +1557,12 @@ static void RenderFrame(App& app)
+     bool submitLayer = false;
+     // Passthrough (2026-10-19): a server frame flagged alpha-blend is submitted with source alpha over the
+     // headset's passthrough; the shader keys black to transparent. Opaque frames are unchanged.
+-    const bool alphaFrame = g_streamMode && g_alphaBlendSupported && g_stream.AlphaBlend();
++    // The displayed frame's own flag (review L7), refreshed below when a new frame is taken.
++    bool alphaFrame = g_streamMode && g_alphaBlendSupported && g_displayedAlpha;
++    {
++        static bool lastShouldRender = true;   // review M12: a hidden<->visible flip starts a new pose episode
++        if ((fs.shouldRender != 0) != lastShouldRender) { lastShouldRender = fs.shouldRender != 0; g_poseEpoch++; }
++    }
+     {
+         static bool alphaLogged = false;
+         if (alphaFrame && !alphaLogged) { alphaLogged = true; LOG_INFO("passthrough: first alpha-blend frame; layer blends source alpha (black key), environment ALPHA_BLEND"); }
+@@ -1581,14 +1653,16 @@ static void RenderFrame(App& app)
+             lastProbedPtsUs = probePtsUs;
+             g_hidden.fresh++;
+             // FRAME_CLIENT_DUMP_FRAMES=N: after the loop has settled, write N consecutive fresh frames' luma
+-            // (+ pts) to /tmp/frame-dump.{bin,pts} so content order and motion cadence can be checked off-head
+-            // (2026-10-18: judder seen worn that no cadence counter explains).
++            // (+ pts) to frame-dump.{bin,pts} in the per-user runtime dir (review M11; was /tmp) so content order
++            // and motion cadence can be checked off-head (2026-10-18: judder seen worn that no cadence counter explains).
+             {
+                 static int dumpWant = -1, dumpDone = 0; static FILE* df = nullptr; static FILE* dp = nullptr;
+                 if (dumpWant < 0) { const char* e = getenv("FRAME_CLIENT_DUMP_FRAMES"); dumpWant = e ? atoi(e) : 0; }
+                 if (dumpWant > 0 && dumpDone < dumpWant && g_hidden.loops > 300 && pl == VideoDecoder::PixelLayout::NV12 && pw > 0) {
+-                    if (!df) { df = fopen("/tmp/frame-dump.bin", "wb"); dp = fopen("/tmp/frame-dump.pts", "w");
+-                               LOG_INFO("frame dump: %d frames of %dx%d luma to /tmp/frame-dump.bin", dumpWant, pw, ph); }
++                    if (!df) { const std::string binPath = frame_paths::DumpPath("frame-dump.bin");
++                               df = frame_paths::CreateDump(binPath); dp = frame_paths::CreateDump(frame_paths::DumpPath("frame-dump.pts"));
++                               if (df && dp) LOG_INFO("frame dump: %d frames of %dx%d luma to %s", dumpWant, pw, ph, binPath.c_str());
++                               else { LOG_ERROR("frame dump: cannot create %s (+ .pts)", binPath.c_str()); dumpWant = 0; if (df) fclose(df); if (dp) fclose(dp); df = dp = nullptr; } }
+                     if (df && dp) { fwrite(g_hiddenTakeBuf.data(), 1, (size_t)pw * ph, df); fprintf(dp, "%lld\n", (long long)probePtsUs); }
+                     if (++dumpDone == dumpWant && df) { fclose(df); fclose(dp); df = dp = nullptr; LOG_INFO("frame dump: done"); }
+                 }
+@@ -1729,6 +1803,10 @@ static void RenderFrame(App& app)
+                 g_presentedReceivedAt = frameTiming.receivedAt;
+                 app.videoFullRange = frameTiming.fullRange;
+                 g_presentedValid = frameTiming.receivedAt.time_since_epoch().count() != 0;
++                // Review L7: blend the way this frame was composed; when its submit record was not found, the
++                // latest received flag is the best guess.
++                g_displayedAlpha = frameTiming.alphaKnown ? frameTiming.alphaBlend : g_stream.AlphaBlend();
++                alphaFrame = g_streamMode && g_alphaBlendSupported && g_displayedAlpha;
+             }
+             const bool frameNv12 = frameLayout == VideoDecoder::PixelLayout::NV12;
+             // Pose and foveation centre for the frame on screen, cached across repaints of the
+@@ -1756,10 +1834,11 @@ static void RenderFrame(App& app)
+                 }
+                 static bool dumped = false;
+                 if (!dumped && getenv("FRAME_CLIENT_DUMP")) {
+-                    const char* dumpPath = frameNv12 ? "/tmp/frame_client_decoded.nv12" : "/tmp/frame_client_decoded.rgba";
+-                    FILE* f = fopen(dumpPath, "wb");
++                    const std::string dumpPath = frame_paths::DumpPath(frameNv12 ? "frame_client_decoded.nv12" : "frame_client_decoded.rgba");   // review M11
++                    FILE* f = frame_paths::CreateDump(dumpPath);
+                     if (f) { fwrite(g_frameBuf.data(), 1, g_frameBuf.size(), f); fclose(f);
+-                        LOG_INFO("dumped decoded frame %dx%d to %s", fw, fh, dumpPath); }
++                        LOG_INFO("dumped decoded frame %dx%d to %s", fw, fh, dumpPath.c_str()); }
++                    else LOG_ERROR("cannot create %s", dumpPath.c_str());
+                     dumped = true;
+                 }
+             }
+@@ -1836,6 +1915,8 @@ static void RenderFrame(App& app)
+                 g_lat.slipYMm += slipY; if (slipY > g_lat.slipYMaxMm) g_lat.slipYMaxMm = slipY;
+                 {
+                     static double pmx = 0, pmy = 0, pmz = 0; static bool havePm = false;
++                    static uint32_t pmEpoch = 0;
++                    if (pmEpoch != g_poseEpoch) { pmEpoch = g_poseEpoch; havePm = false; }   // review M12
+                     const double cx = 0.5 * (views[0].pose.position.x + views[1].pose.position.x);
+                     const double cy = 0.5 * (views[0].pose.position.y + views[1].pose.position.y);
+                     const double cz = 0.5 * (views[0].pose.position.z + views[1].pose.position.z);
+@@ -1870,19 +1951,22 @@ static void RenderFrame(App& app)
+             // compositor warps the image that much further forward; the lead that zeroes the measured lag is the fixed
+             // offset of the compositor's layer path. Angular velocity is the finite difference of the displayed view pose
+             // (views[0]) over predictedDisplayTime. Positive lead = cures a lag; negative = adds one (the control).
+-            // FRAME_CLIENT_STAMP_LEAD_MS sets the start value; /dev/shm/frame-stamp-lead-ms, read once a second, overrides
+-            // it live so a wear can try several values without a restart. Each change is logged.
++            // FRAME_CLIENT_STAMP_LEAD_MS sets the start value; the live file frame-stamp-lead-ms (per-user runtime dir,
++            // review M11; /dev/shm as the owner-checked fallback), read once a second, overrides it live so a wear can
++            // try several values without a restart. Each change is logged.
+             {
+                 static float leadMs = getenv("FRAME_CLIENT_STAMP_LEAD_MS") ? atof(getenv("FRAME_CLIENT_STAMP_LEAD_MS")) : 0.0f;
+                 static float lastLoggedLead = -1e9f;
+                 static uint32_t leadPoll = 0;
+                 if (leadPoll++ % 72 == 0) {
+-                    if (FILE* lf = fopen("/dev/shm/frame-stamp-lead-ms", "r")) {
+-                        float v; if (fscanf(lf, "%f", &v) == 1) leadMs = v; fclose(lf);
++                    if (FILE* lf = frame_paths::OpenTuning("frame-stamp-lead-ms")) {
++                        float v; if (fscanf(lf, "%f", &v) == 1 && v >= -100.0f && v <= 100.0f) leadMs = v; fclose(lf);
+                     }
+                     if (leadMs != lastLoggedLead) { LOG_INFO("stamp lead: %.1f ms (positive pulls the stamp back along the head's motion)", leadMs); lastLoggedLead = leadMs; }
+                 }
+                 static XrQuaternionf prevQ = {0, 0, 0, 1}; static XrTime prevT = 0;
++                static uint32_t leadEpoch = 0;
++                if (leadEpoch != g_poseEpoch) { leadEpoch = g_poseEpoch; prevT = 0; }   // review M12: no finite difference across an episode
+                 const XrQuaternionf q = views[0].pose.orientation;
+                 const XrTime t = fs.predictedDisplayTime;
+                 if (leadMs != 0.0f && prevT != 0 && haveRenderPose) {
+@@ -1924,10 +2008,20 @@ static void RenderFrame(App& app)
+                 for (uint32_t eye = 0; eye < VIEW_COUNT && cmdOpen; eye++) {
+                     Swapchain& sc = app.swapchains[eye];
+                     XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+-                    if (XR_FAILED(xrAcquireSwapchainImage(sc.handle, &ai, &idx[eye]))) break;
++                    const XrResult ar = xrAcquireSwapchainImage(sc.handle, &ai, &idx[eye]);
++                    if (XR_FAILED(ar)) {   // review M3: say so; the layer is not submitted this frame
++                        static uint32_t acqFails = 0; acqFails++;
++                        if (acqFails <= 10 || acqFails % 900 == 0) LOG_ERROR("xrAcquireSwapchainImage(eye %u) failed: %d (%u so far)", eye, (int)ar, acqFails);
++                        break;
++                    }
+                     XrSwapchainImageWaitInfo wii = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                     wii.timeout = XR_INFINITE_DURATION;
+-                    xrWaitSwapchainImage(sc.handle, &wii);
++                    const XrResult wr = xrWaitSwapchainImage(sc.handle, &wii);
++                    if (XR_FAILED(wr)) {   // review M3: an image not waited on must be neither rendered into nor released
++                        static uint32_t waitFails = 0; waitFails++;
++                        if (waitFails <= 10 || waitFails % 900 == 0) LOG_ERROR("xrWaitSwapchainImage(eye %u) failed: %d (%u so far); frame not submitted", eye, (int)wr, waitFails);
++                        break;
++                    }
+                     acquired[eye] = true;
+                     RenderEye(app, eye, idx[eye]);
+ 
+@@ -2157,6 +2251,19 @@ int main(int argc, char** argv)
+     }
+ 
+     LOG_INFO("Entering frame loop (Ctrl-C to quit)");
++    // Review 2026-10-21 (M4): reconnect after the server goes away, the way the sibling android-vr client does. Lost =
++    // the server announces again while we are connected (it broadcasts only without a client, and drops one after 3 s
++    // without tracking: a restart, a dead link, a Mac that slept), the receiver said the link closed (USB/TCP), or no
++    // video at all within FRAME_CLIENT_RECONNECT_S seconds of a connect (default 5; 0 = reconnect off: the last frame
++    // for ever). A connected server that merely stops sending (no app running) is left alone. Discovery runs on its own
++    // thread, so this loop keeps serving the runtime meanwhile; tracking is not sent while disconnected. Bounded: after
++    // kReconnectGiveUpS without a server the search stops and the client stays up on its last frame, to be restarted
++    // by hand. frame-stream down stops it at any point.
++    const double kReconnectS = getenv("FRAME_CLIENT_RECONNECT_S") ? atof(getenv("FRAME_CLIENT_RECONNECT_S")) : 5.0;
++    constexpr double kReconnectGiveUpS = 600.0;
++    if (g_streamMode) LOG_INFO("reconnect: %s", kReconnectS > 0 ? "on - when the server announces again, the link closes, or no first video arrives (FRAME_CLIENT_RECONNECT_S)" : "off (FRAME_CLIENT_RECONNECT_S=0)");
++    std::chrono::steady_clock::time_point searchingSince{};
++    uint32_t reconnects = 0;
+     bool exitAsked = false;
+     std::chrono::steady_clock::time_point exitAskedAt{};
+     while (!app.exitRequested) {
+@@ -2169,11 +2276,32 @@ int main(int argc, char** argv)
+             if (XR_FAILED(xrRequestExitSession(app.session))) { LOG_INFO("session not running; leaving the loop"); break; }   // review M1
+         }
+         if (exitAsked && std::chrono::steady_clock::now() - exitAskedAt > std::chrono::seconds(3)) { LOG_INFO("no EXITING within 3 s; leaving the loop"); break; }
++        if (g_streamMode && kReconnectS > 0 && !exitAsked) {
++            const char* why = nullptr;
++            if (!g_stream.Reconnecting() && g_stream.Lost(kReconnectS, &why)) {
++                LOG_ERROR("stream lost: %s; looking for the server again (reconnect %u)", why ? why : "?", ++reconnects);
++                g_stream.Disconnect();
++                searchingSince = std::chrono::steady_clock::now();
++                g_poseEpoch++;   // review M12
++                if (!g_stream.StartReconnect(&g_decoder)) LOG_ERROR("could not restart discovery; staying disconnected on the last frame");
++            } else if (g_stream.Reconnecting()) {
++                if (g_stream.PollReconnect()) {
++                    LOG_INFO("reconnected to %s after %.1f s", g_stream.ServerIp().c_str(), MsSince(searchingSince) / 1000.0);
++                } else if (!g_stream.Reconnecting()) {
++                    LOG_ERROR("a server answered but the connection failed; looking again");
++                    g_stream.Disconnect();
++                    if (!g_stream.StartReconnect(&g_decoder)) LOG_ERROR("could not restart discovery; staying disconnected on the last frame");
++                } else if (MsSince(searchingSince) > kReconnectGiveUpS * 1000.0) {
++                    LOG_ERROR("no server for %.0f s; giving up the search - restart the client when the server is back", kReconnectGiveUpS);
++                    g_stream.Disconnect();
++                }
++            }
++        }
+         if (!app.sessionRunning) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+         RenderFrame(app);
+     }
+ 
+-    LOG_INFO("Shutting down");
++    LOG_INFO("Shutting down%s", app.lossPending ? " (runtime loss; exit status 3)" : "");
+     Destroy(app);
+-    return 0;
++    return app.lossPending ? 3 : 0;
+ }
+diff --git a/clients/steam-frame/src/runtime_paths.h b/clients/steam-frame/src/runtime_paths.h
+new file mode 100644
+index 0000000..967a1c0
+--- /dev/null
++++ b/clients/steam-frame/src/runtime_paths.h
+@@ -0,0 +1,75 @@
++// Frame VR client — where the live-tuning files and the debug dumps live
++// SPDX-License-Identifier: BSL-1.0
++//
++// Review 2026-10-21 (M11): the live-tuning files (frame-predict-ms, frame-passthrough, frame-stamp-lead-ms) sat in
++// world-writable /dev/shm, so any local user could steer the wearer's prediction horizon, stamp lead and passthrough
++// geometry, and the debug dumps were fopen("wb") on fixed /tmp names, which write through a planted symlink. Both now
++// live in the per-user runtime directory ($XDG_RUNTIME_DIR, else /run/user/<uid>; mode 0700). The old /dev/shm name is
++// still read as a fallback, but only when that file is a regular file owned by this user, so the frame-stream tooling
++// that writes it over ssh keeps working and nobody else's file is honoured.
++#pragma once
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++namespace frame_paths {
++
++// $XDG_RUNTIME_DIR, else /run/user/<uid> when it exists, else "" (the callers fall back to /dev/shm or /tmp).
++inline std::string RuntimeDir()
++{
++    if (const char* x = getenv("XDG_RUNTIME_DIR")) if (*x) return x;
++    const std::string p = "/run/user/" + std::to_string((unsigned long)getuid());
++    struct stat st;
++    if (stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return p;
++    return "";
++}
++
++// Where a live-tuning file called `name` is looked for first (where the tooling should write it).
++inline std::string TuningPath(const char* name)
++{
++    const std::string dir = RuntimeDir();
++    return (dir.empty() ? std::string("/dev/shm") : dir) + "/" + name;
++}
++
++// Open a live-tuning file for reading: <runtime dir>/<name>, else /dev/shm/<name>. Regular files owned by this user
++// only (O_NOFOLLOW + fstat), so a symlink or another user's file under either name is ignored. nullptr when absent.
++inline FILE* OpenTuning(const char* name)
++{
++    const std::string candidates[2] = {TuningPath(name), std::string("/dev/shm/") + name};
++    for (int i = 0; i < 2; i++) {
++        if (i == 1 && candidates[1] == candidates[0]) break;
++        const int fd = open(candidates[i].c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++        if (fd < 0) continue;
++        struct stat st;
++        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) { close(fd); continue; }
++        FILE* f = fdopen(fd, "r");
++        if (!f) close(fd);
++        return f;
++    }
++    return nullptr;
++}
++
++// Where a debug dump called `name` goes: the runtime directory, else /tmp.
++inline std::string DumpPath(const char* name)
++{
++    const std::string dir = RuntimeDir();
++    return (dir.empty() ? std::string("/tmp") : dir) + "/" + name;
++}
++
++// Create a dump file for writing at an explicit path: whatever carried the name is unlinked (a stale dump, or a
++// planted symlink - never written through), then a fresh regular file is created O_EXCL | O_NOFOLLOW, mode 0600.
++// nullptr with errno set when it cannot be created.
++inline FILE* CreateDump(const std::string& path)
++{
++    unlink(path.c_str());
++    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
++    if (fd < 0) return nullptr;
++    FILE* f = fdopen(fd, "wb");
++    if (!f) close(fd);
++    return f;
++}
++
++} // namespace frame_paths
+diff --git a/clients/steam-frame/src/stream_connection.cpp b/clients/steam-frame/src/stream_connection.cpp
+index dec1d41..91b8d55 100644
+--- a/clients/steam-frame/src/stream_connection.cpp
++++ b/clients/steam-frame/src/stream_connection.cpp
+@@ -35,15 +35,20 @@ void StreamConnection::SetPanelRefreshHz(uint32_t hz)
+     if (hz == 0 || hz == panelRefreshHz_) return;
+     panelRefreshHz_ = hz;
+     if (!connected_ || controlSocket_ < 0) return;
+-    lastConnect_.refreshRateHz = hz;
++    protocol::ClientConnect cc;
++    {
++        std::lock_guard<std::mutex> lk(connectMu_);
++        lastConnect_.refreshRateHz = hz;
++        cc = lastConnect_;
++    }
+     LOG_INF("panel refresh changed to %u Hz: re-sending ClientConnect so the server paces to it", hz);
+-    SendClientConnect(lastConnect_, 0);
++    SendClientConnect(cc, 0);
+ }
+ 
+ bool StreamConnection::SendClientConnect(const protocol::ClientConnect& cc, int attempt)
+ {
+-    if (testDropConnects_ > 0) {
+-        testDropConnects_--;
++    if (testDropConnects_.load() > 0) {
++        testDropConnects_.fetch_sub(1);
+         LOG_INF("ClientConnect send %d swallowed (FRAME_CLIENT_TEST_DROP_CONNECT)", attempt);
+         return true;
+     }
+@@ -54,35 +59,98 @@ bool StreamConnection::SendClientConnect(const protocol::ClientConnect& cc, int
+     return true;
+ }
+ 
+-bool StreamConnection::Connect(VideoDecoder* decoder, int timeoutMs)
++bool StreamConnection::StartReconnect(VideoDecoder* decoder)
+ {
++    if (connected_ || reconnecting_) { LOG_ERR("StartReconnect while %s; Disconnect first", connected_ ? "connected" : "already searching"); return false; }
++    if (!decoder) { LOG_ERR("StartReconnect without a decoder"); return false; }
+     if (connectRetry_.joinable()) { stopRetry_ = true; connectRetry_.join(); }
+     if (const char* s = getenv("FRAME_CLIENT_TEST_DROP_CONNECT")) testDropConnects_ = atoi(s);
++    lost_ = false;
++    {
++        std::lock_guard<std::mutex> lk(foundMu_);
++        found_ = false;
++        foundSrv_ = {};
++        memset(foundIp_, 0, sizeof(foundIp_));
++    }
++    pendingDecoder_ = decoder;
+     // Review 2026-10-21 (H7): the result is copied under a mutex and published after the copy, and StopDiscovery
+-    // now joins the thread, so nothing writes into this frame once Connect has returned.
+-    std::mutex foundMu;
+-    bool found = false;
+-    protocol::ServerAnnounce srv{};
+-    char ip[64] = {};
+-    auto isFound = [&]() { std::lock_guard<std::mutex> lk(foundMu); return found; };
+-
+-    if (!net_->StartDiscovery([&](const protocol::ServerAnnounce& s, const char* serverIp) {
+-            std::lock_guard<std::mutex> lk(foundMu);
+-            if (found) return;
+-            srv = s;
+-            strncpy(ip, serverIp, sizeof(ip) - 1);
+-            found = true;
++    // joins the thread, so nothing writes into these members once PollReconnect has consumed them.
++    net_->SetDiscoveryAskEvery(1);
++    if (!net_->StartDiscovery([this](const protocol::ServerAnnounce& s, const char* serverIp) {
++            if (connected_.load()) {
++                // Review M4: the server announces only while it has no client (it drops one after 3 s without
++                // tracking). Within 3 s of our connect it may still be its last few beacons; after that it forgot us.
++                const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                    std::chrono::steady_clock::now().time_since_epoch()).count();
++                if (now - connectedAtNs_.load() > 3000000000LL && !lost_.load()) {
++                    lostReason_ = "the server is announcing again (it restarted, or dropped us for 3 s without tracking)";
++                    lost_ = true;
++                }
++                return;
++            }
++            std::lock_guard<std::mutex> lk(foundMu_);
++            if (found_) return;
++            foundSrv_ = s;
++            strncpy(foundIp_, serverIp, sizeof(foundIp_) - 1);
++            found_ = true;
+         })) {
+         LOG_ERR("StartDiscovery failed");
+         return false;
+     }
++    reconnecting_ = true;
++    return true;
++}
++
++bool StreamConnection::PollReconnect()
++{
++    if (!reconnecting_) return connected_;
++    protocol::ServerAnnounce srv{};
++    char ip[64] = {};
++    {
++        std::lock_guard<std::mutex> lk(foundMu_);
++        if (!found_) return false;
++        srv = foundSrv_;
++        memcpy(ip, foundIp_, sizeof(ip));
++    }
++    reconnecting_ = false;   // discovery itself stays up: its next announce is the lost signal (review M4)
++    if (!WireUp(srv, ip, pendingDecoder_)) return false;
++    net_->SetDiscoveryAskEvery(5);
++    return true;
++}
+ 
+-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+-    while (!isFound() && std::chrono::steady_clock::now() < deadline)
++bool StreamConnection::Connect(VideoDecoder* decoder, int timeoutMs)
++{
++    if (!StartReconnect(decoder)) return false;
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
++    while (std::chrono::steady_clock::now() < deadline) {
++        if (PollReconnect()) return true;
++        if (!reconnecting_) return false;   // an announce arrived and the wiring failed (logged there)
+         std::this_thread::sleep_for(std::chrono::milliseconds(50));
++    }
+     net_->StopDiscovery();
+-    if (!isFound()) { LOG_ERR("no server found in %d ms", timeoutMs); return false; }
++    reconnecting_ = false;
++    LOG_ERR("no server found in %d ms", timeoutMs);
++    return false;
++}
++
++bool StreamConnection::Lost(double firstVideoS, const char** reason) const
++{
++    if (!connected_.load()) return false;
++    if (lost_.load()) { if (reason) *reason = lostReason_.load() ? lostReason_.load() : "lost"; return true; }
++    if (firstVideoS <= 0.0 || !net_) return false;
++    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++    const int64_t lastFrame = net_->GetLastCompletedFrameReceiveTimeNs();
++    if (lastFrame <= connectedAtNs_.load() && now - connectedAtNs_.load() > (int64_t)(firstVideoS * 1e9)) {
++        if (reason) *reason = "no video at all since the connect (the ClientConnect resends included)";
++        return true;
++    }
++    return false;
++}
+ 
++bool StreamConnection::WireUp(protocol::ServerAnnounce srv, const char* ip, VideoDecoder* decoder)
++{
++    srv.serverName[sizeof(srv.serverName) - 1] = 0;   // review L4: printed with %s below; the wire need not terminate it
+     serverIp_ = ip;
+     encodedW_ = srv.encodedWidth ? srv.encodedWidth : srv.renderWidth;
+     encodedH_ = srv.encodedHeight ? srv.encodedHeight : srv.renderHeight;
+@@ -125,10 +193,19 @@ bool StreamConnection::Connect(VideoDecoder* decoder, int timeoutMs)
+             srv.serverName, ip, srv.videoPort, srv.trackingPort,
+             encodedW_, encodedH_, srv.refreshRateHz);
+ 
+-    // Hardware decoders need the encoded size before the first NAL (see ReconfigureStream).
+-    if (!decoder->ReconfigureStream((int)encodedW_, (int)encodedH_))
+-        LOG_ERR("decoder reconfigure for %ux%u failed; continuing with the current decoder",
+-                encodedW_, encodedH_);
++    // Review 2026-10-21 (M5/M4): whatever the decoder still holds belongs to the previous server (or to nothing).
++    decoder->ResetStreamState();
++    // Hardware decoders need the encoded size before the first NAL (see ReconfigureStream). Review M10: a failed
++    // reconfigure has CLOSED the codec, so there is no decoder to continue with; a server that announces no size
++    // leaves the decoder as it was.
++    if (encodedW_ > 0 && encodedH_ > 0) {
++        if (!decoder->ReconfigureStream((int)encodedW_, (int)encodedH_)) {
++            LOG_ERR("decoder reconfigure for %ux%u failed; no decoder for this stream", encodedW_, encodedH_);
++            return false;
++        }
++    } else {
++        LOG_ERR("server announced no encoded size; the decoder keeps its current configuration");
++    }
+ 
+     // Start receiving BEFORE ClientConnect — the server encodes immediately on
+     // connect, and the first keyframe must not arrive before we're listening.
+@@ -137,30 +214,36 @@ bool StreamConnection::Connect(VideoDecoder* decoder, int timeoutMs)
+     net_->SetFecInterleaved(
+         (srv.serverFeatures & protocol::SERVER_FEATURE_FEC_INTERLEAVED) != 0);
+     bool ok = net_->StartReceiving(ip, srv.videoPort,
+-        [decoder](const uint8_t* data, size_t size, int64_t timestampNs, int64_t, uint8_t,
++        [decoder](const uint8_t* data, size_t size, int64_t timestampNs, int64_t, uint8_t flags,
+                   uint8_t) {
+             // Microseconds to match RenderPose.presentationTimeUs, so the decoded frame can
+-            // be paired with its own render pose and foveation centre.
+-            decoder->SubmitNal(data, size, timestampNs / 1000);
++            // be paired with its own render pose and foveation centre. The frame's own alpha
++            // flag rides along for the layer it is shown on (review L7).
++            decoder->SubmitNal(data, size, timestampNs / 1000,
++                               (flags & protocol::VIDEO_FLAG_ALPHA_BLEND) != 0);
+         },
+-        [](const char* reason) { LOG_ERR("connection lost: %s", reason); });
++        [this](const char* reason) { LOG_ERR("connection lost: %s", reason); lostReason_ = "the receiver reported the link lost"; lost_ = true; });
+     if (!ok) { LOG_ERR("StartReceiving failed"); return false; }
++    // Review 2026-10-21 (M10): from here a failure must not leave the receiver thread running against a half-wired
++    // connection; everything started so far is stopped before the false goes back.
++    auto fail = [this](const char* what) {
++        LOG_ERR("%s; connection torn down", what);
++        net_->Stop();
++        tracker_->Disconnect();
++        if (controlSocket_ >= 0) { close(controlSocket_); controlSocket_ = -1; }
++        return false;
++    };
+ 
+     // Control socket (UDP) for ClientConnect + NACKs.
+     controlSocket_ = socket(AF_INET, SOCK_DGRAM, 0);
+-    if (controlSocket_ < 0) { LOG_ERR("control socket failed"); return false; }
++    if (controlSocket_ < 0) return fail("control socket failed");
+     sockaddr_in addr{};
+     addr.sin_family = AF_INET;
+     addr.sin_port = htons(protocol::CONTROL_PORT);
+     inet_pton(AF_INET, ip, &addr.sin_addr);
+-    if (::connect(controlSocket_, (sockaddr*)&addr, sizeof(addr)) < 0) {
+-        LOG_ERR("control connect failed");
+-        close(controlSocket_);
+-        controlSocket_ = -1;
+-        return false;
+-    }
++    if (::connect(controlSocket_, (sockaddr*)&addr, sizeof(addr)) < 0) return fail("control connect failed");
+     net_->SetControlSocket(controlSocket_, ip);
+-    tracker_->Connect(ip, srv.trackingPort);
++    if (!tracker_->Connect(ip, srv.trackingPort)) return fail("tracking socket connect failed");
+ 
+     protocol::ClientConnect cc{};
+     cc.type = protocol::MessageType::ClientConnect;
+@@ -177,16 +260,19 @@ bool StreamConnection::Connect(VideoDecoder* decoder, int timeoutMs)
+     // gaze we report drives nothing.
+     cc.clientCapabilities = protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING |
+                             protocol::CLIENT_CAPABILITY_FOVEATION_CENTER |
+-                            protocol::CLIENT_CAPABILITY_FEC_INTERLEAVED;
++                            protocol::CLIENT_CAPABILITY_FEC_INTERLEAVED |
++                            protocol::CLIENT_CAPABILITY_PACING_LOCK;   // our LatencyReport ages suit the server's rate lock
+     // Passthrough (2026-10-19): tell the server we take alpha-blend frames (it flags them VIDEO_FLAG_ALPHA_BLEND and
+     // composes the app over black); FRAME_CLIENT_PASSTHROUGH=0 withholds the capability.
+     if (!(getenv("FRAME_CLIENT_PASSTHROUGH") && atoi(getenv("FRAME_CLIENT_PASSTHROUGH")) == 0))
+         cc.clientCapabilities |= protocol::CLIENT_CAPABILITY_MIXED_REALITY_PASSTHROUGH;
+     strncpy(cc.deviceName, "FrameClient", sizeof(cc.deviceName) - 1);
+-    lastConnect_ = cc;
+-    if (!SendClientConnect(cc, 1)) return false;
++    { std::lock_guard<std::mutex> lk(connectMu_); lastConnect_ = cc; }
++    if (!SendClientConnect(cc, 1)) return fail("ClientConnect send failed");
+ 
+     LOG_INF("connected — ClientConnect sent, receiving video");
++    connectedAtNs_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
+     connected_ = true;
+ 
+     // ClientConnect is a single UDP datagram and the server only starts encoding once it
+@@ -197,7 +283,7 @@ bool StreamConnection::Connect(VideoDecoder* decoder, int timeoutMs)
+     // answered costs a glitch: the arrival check runs right before each send, the first resend
+     // waits 500 ms (measured send -> first decoded frame: ~220 ms) and later ones back off.
+     stopRetry_ = false;
+-    connectRetry_ = std::thread([this, cc] {
++    connectRetry_ = std::thread([this] {
+         constexpr int kConnectSends = 5;
+         int waitMs = 500;
+         int sends = 1;
+@@ -220,6 +306,8 @@ bool StreamConnection::Connect(VideoDecoder* decoder, int timeoutMs)
+             }
+             LOG_INF("no video %d ms after ClientConnect send %d; resending (%d/%d)", waitMs,
+                     sends, sends + 1, kConnectSends);
++            protocol::ClientConnect cc;   // the CURRENT one: a panel-rate change since the first send rides along (review M9)
++            { std::lock_guard<std::mutex> lk(connectMu_); cc = lastConnect_; }
+             SendClientConnect(cc, ++sends);
+             waitMs += 250;
+         }
+@@ -315,9 +403,12 @@ void StreamConnection::SendKeyframeRequest(uint32_t reasonFlags, uint32_t detail
+ void StreamConnection::Disconnect()
+ {
+     connected_ = false;
++    reconnecting_ = false;
++    lost_ = false;
++    lostReason_ = nullptr;
+     stopRetry_ = true;
+     if (connectRetry_.joinable()) connectRetry_.join();
+-    if (net_) net_->Stop();
++    if (net_) net_->Stop();   // stops discovery too
+     if (tracker_) tracker_->Disconnect();
+     if (controlSocket_ >= 0) { close(controlSocket_); controlSocket_ = -1; }
+ }
+diff --git a/clients/steam-frame/src/stream_connection.h b/clients/steam-frame/src/stream_connection.h
+index 58429a1..7aa5f38 100644
+--- a/clients/steam-frame/src/stream_connection.h
++++ b/clients/steam-frame/src/stream_connection.h
+@@ -8,6 +8,7 @@
+ #pragma once
+ #include <atomic>
+ #include <cstdint>
++#include <mutex>
+ #include <string>
+ #include <thread>
+ 
+@@ -31,6 +32,20 @@ class StreamConnection {
+     // decoder must already be OpenStream()'d. Returns true once ClientConnect
+     // is sent. On success, the decoder receives NAL units on a background thread.
+     bool Connect(VideoDecoder* decoder, int timeoutMs = 10000);
++    // Review 2026-10-21 (M4): the non-blocking form for the frame loop. StartReconnect begins discovery on its own
++    // thread (after Disconnect); PollReconnect, once a loop, wires the pipeline when an announce has arrived and
++    // returns true once connected. Reconnecting() is true while the search is on; Disconnect ends it.
++    // Discovery stays up through the connection, as the sibling android-vr client does: the server broadcasts (and
++    // answers a direct ask) only while it has no client, and drops a client after 3 s without tracking, so an
++    // announce arriving while we have been connected for over 3 s means it restarted or forgot us.
++    bool StartReconnect(VideoDecoder* decoder);
++    bool PollReconnect();
++    bool Reconnecting() const { return reconnecting_; }
++    // True when the stream is gone: the server announced again (see above), the receiver reported the link lost
++    // (USB/TCP), or no video at all arrived within firstVideoS seconds of the connect (<= 0: never by that rule).
++    // A server that stays silent after sending video is NOT lost: that is an idle app, and the server would drop
++    // and re-announce if the link itself had died. reason names which.
++    bool Lost(double firstVideoS, const char** reason) const;
+ 
+     // Send a fully-built tracking packet upstream (V4: head + controllers + hands).
+     void SendTrackingPacket(const oxr::protocol::TrackingPacket& pkt);
+@@ -91,20 +106,36 @@ class StreamConnection {
+ 
+ private:
+     uint32_t panelRefreshHz_ = 0;
++    // The ClientConnect last sent. Written on the frame thread (Connect, SetPanelRefreshHz), read by the retry
++    // thread for its resends: under connectMu_, so a resend carries the current refresh rate (review M9).
++    std::mutex connectMu_;
+     oxr::protocol::ClientConnect lastConnect_{};
+     bool SendClientConnect(const oxr::protocol::ClientConnect& cc, int attempt);
++    // The part of Connect after discovery: decoder reconfigure, receiver, control socket, tracking, ClientConnect.
++    bool WireUp(oxr::protocol::ServerAnnounce srv, const char* ip, VideoDecoder* decoder);
+ 
+     oxr::NetworkReceiver* net_ = nullptr;
+     // ClientConnect resend until the server's first video packet / render pose arrives.
+     std::thread connectRetry_;
+     std::atomic<bool> stopRetry_{false};
+-    // FRAME_CLIENT_TEST_DROP_CONNECT=<n>: swallow the first n ClientConnect sends (test hook).
+-    int testDropConnects_ = 0;
++    // FRAME_CLIENT_TEST_DROP_CONNECT=<n>: swallow the first n ClientConnect sends (test hook). Atomic: the frame
++    // thread and the retry thread both send (review M9).
++    std::atomic<int> testDropConnects_{0};
++    // Discovery result, filled by the discovery thread under foundMu_, consumed by PollReconnect.
++    std::mutex foundMu_;
++    bool found_ = false;
++    oxr::protocol::ServerAnnounce foundSrv_{};
++    char foundIp_[64] = {};
++    VideoDecoder* pendingDecoder_ = nullptr;
++    bool reconnecting_ = false;
++    std::atomic<bool> lost_{false};            // set by the receiver's connection-lost callback / a re-announce
++    std::atomic<const char*> lostReason_{nullptr};
++    std::atomic<int64_t> connectedAtNs_{0};    // steady clock: the re-announce grace and the first-video rule
+     oxr::TrackingSender* tracker_ = nullptr;
+     int controlSocket_ = -1;
+     std::string serverIp_;
+     uint32_t encodedW_ = 0, encodedH_ = 0;
+     uint16_t trackingPort_ = 0;
+-    bool connected_ = false;
++    std::atomic<bool> connected_{false};   // read by the discovery thread (review M4)
+     Foveation foveation_;
+ };
+diff --git a/clients/steam-frame/src/video_decoder.cpp b/clients/steam-frame/src/video_decoder.cpp
+index a0b411b..04b26d6 100644
+--- a/clients/steam-frame/src/video_decoder.cpp
++++ b/clients/steam-frame/src/video_decoder.cpp
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: BSL-1.0
+ #include "video_decoder.h"
++#include "runtime_paths.h"
+ 
+ #include <chrono>
+ #include <thread>
+@@ -158,6 +159,13 @@ bool VideoDecoder::openCodecOnly(int avCodecId)
+ 
+ bool VideoDecoder::OpenStream(Codec codec)
+ {
++    if (codec == Codec::H264) {
++        // Review 2026-10-21 (M7): submitNalImpl assembles access units from HEVC NAL headers ((b >> 1) & 0x3f). An
++        // H.264 stream would never complete a slice there (an IDR 0x65 parses as type 50), so au_ would only grow.
++        LOG_ERR("H.264 streams are not supported by this client (HEVC only)");
++        return false;
++    }
++    ResetStreamState();
+     forceRgba_ = getenv("FRAME_CLIENT_RGBA") != nullptr;
+     if (const char* fr = getenv("FRAME_CLIENT_FULL_RANGE")) forceFullRange_ = atoi(fr) != 0 ? 1 : 0;
+     if (forceRgba_) LOG_INF("FRAME_CLIENT_RGBA set: CPU sws RGBA path forced");
+@@ -188,12 +196,29 @@ bool VideoDecoder::ReconfigureStream(int width, int height)
+     expectedW_ = width;
+     expectedH_ = height;
+     closeInternal();
++    ResetStreamState();   // review M5: a new codec must not see the old parameter sets, pts or ready frames
+     streamMode_ = true;
+     if (!openCodecOnly(streamCodecId_)) { closeInternal(); return false; }
+     LOG_INF("stream decoder reopened for %dx%d", width, height);
+     return true;
+ }
+ 
++void VideoDecoder::ResetStreamState()
++{
++    au_.clear();
++    for (PendingSubmit& p : pending_) p = PendingSubmit{};
++    pendingNext_ = 0;
++    pendingSlot_ = nullptr;
++    lastSubmitPtsUs_ = prevSubmitPtsUs_ = 0;
++    lastDecodedPtsUs_ = -1;
++    lastArrivalAt_ = {};
++    std::lock_guard<std::mutex> lk(latestMutex_);
++    ringHead_ = ringCount_ = 0;   // the buffers stay allocated for reuse
++    latestFresh_ = false;
++    latestPtsUs_ = 0;
++    arrival_ = ArrivalStats{};
++}
++
+ void VideoDecoder::convertToLatest()
+ {
+     if (decodedFrames_ == 0)
+@@ -221,11 +246,13 @@ void VideoDecoder::convertToLatest()
+             std::vector<uint8_t> rgba;
+             if (layout == PixelLayout::RGBA) rgba = scratch_;
+             else frameToRGBA(sws_, frame_, rgba);
+-            if (FILE* f = fopen(path, "wb")) {
++            if (FILE* f = frame_paths::CreateDump(path)) {   // review M11: a fresh 0600 file, never through a symlink
+                 fprintf(f, "P6\n%d %d\n255\n", frame_->width, frame_->height);
+                 for (size_t i = 0; i + 3 < rgba.size(); i += 4) fwrite(&rgba[i], 1, 3, f);
+                 fclose(f);
+                 LOG_INF("dumped decoded frame %d to %s", frame_->width, path);
++            } else {
++                LOG_ERR("FRAME_CLIENT_DUMP_DECODED: cannot create %s", path);
+             }
+         }
+     }
+@@ -256,6 +283,8 @@ void VideoDecoder::convertToLatest()
+         timing.receivedAt = p.receivedAt;
+         timing.receiveToSubmitMs = std::chrono::duration<double, std::milli>(p.submittedAt - p.receivedAt).count();
+         timing.decodeMs = std::chrono::duration<double, std::milli>(timing.outAt - p.submittedAt).count();
++        timing.alphaBlend = p.alpha;
++        timing.alphaKnown = true;
+         break;
+     }
+     if (lastDecodedPtsUs_ >= 0) { arrival_.ptsDeltaSumUs += ptsUs - lastDecodedPtsUs_; arrival_.decoded++; }
+@@ -310,7 +339,7 @@ bool VideoDecoder::WaitForNew(double ms)
+                               [this] { return queueDepth_ > 0 ? ringCount_ > 0 : latestFresh_; });
+ }
+ 
+-void VideoDecoder::SubmitNal(const uint8_t* data, size_t size, int64_t ptsUs)
++void VideoDecoder::SubmitNal(const uint8_t* data, size_t size, int64_t ptsUs, bool alphaBlend)
+ {
+     const auto t0 = std::chrono::steady_clock::now();
+     const uint64_t framesBefore = decodedFrames_;
+@@ -318,7 +347,7 @@ void VideoDecoder::SubmitNal(const uint8_t* data, size_t size, int64_t ptsUs)
+     // codec in this same call: receive -> submit is the parser's share of this call, measured
+     // where the codec takes the packet (submitNalImpl).
+     PendingSubmit& slot = pending_[pendingNext_++ % 32];
+-    slot.ptsUs = ptsUs; slot.receivedAt = t0; slot.submittedAt = t0;
++    slot.ptsUs = ptsUs; slot.receivedAt = t0; slot.submittedAt = t0; slot.alpha = alphaBlend;
+     pendingSlot_ = &slot;
+     if (lastArrivalAt_.time_since_epoch().count() != 0) {
+         const double gap = std::chrono::duration<double, std::milli>(t0 - lastArrivalAt_).count();
+@@ -380,7 +409,23 @@ void VideoDecoder::submitNalImpl(const uint8_t* data, size_t size, int64_t ptsUs
+         if (pts == ptsUs) sentInThisCall = true;
+         auto t0 = std::chrono::steady_clock::now();
+         if (pendingSlot_ != nullptr) pendingSlot_->submittedAt = t0;
+-        if (avcodec_send_packet(codec_, packet_) < 0) {
++        int sret = avcodec_send_packet(codec_, packet_);
++        if (sret == AVERROR(EAGAIN)) {
++            // Review 2026-10-21 (M6): the decoder's input queue is full (hevc_v4l2m2m after a burst). Take what it
++            // has finished, then offer the packet once more; only a second refusal drops the access unit.
++            sendEagain_++;
++            for (;;) {
++                const int r = avcodec_receive_frame(codec_, frame_);
++                if (r < 0) break;
++                width_ = frame_->width;
++                height_ = frame_->height;
++                convertToLatest();
++            }
++            sret = avcodec_send_packet(codec_, packet_);
++            if (sendEagain_ <= 5 || sendEagain_ % 100 == 0)
++                LOG_INF("decoder input full (EAGAIN) %u times; drained its output and resent: %s", sendEagain_, sret < 0 ? "REFUSED, access unit dropped" : "accepted");
++        }
++        if (sret < 0) {
+             std::lock_guard<std::mutex> lk(latestMutex_);
+             needKeyframe_ = true;
+             return;
+@@ -496,7 +541,9 @@ bool VideoDecoder::PeekLatestPts(int64_t* outPtsUs)
+     std::lock_guard<std::mutex> lk(latestMutex_);
+     if (queueDepth_ > 0) {
+         if (ringCount_ == 0) return false;
+-        if (outPtsUs != nullptr) *outPtsUs = ring_[(ringHead_ + ringCount_ - 1) % kRing].ptsUs;
++        // The same frame TakeLatest returns: after cutting a backlog to queueDepth_, the oldest left (review M8).
++        const int skip = ringCount_ > queueDepth_ ? ringCount_ - queueDepth_ : 0;
++        if (outPtsUs != nullptr) *outPtsUs = ring_[(ringHead_ + skip) % kRing].ptsUs;
+         return true;
+     }
+     if (!latestFresh_ || latest_.empty()) return false;
+@@ -521,6 +568,7 @@ void VideoDecoder::Close() { closeInternal(); }
+ 
+ double VideoDecoder::LastDecodeMs() const
+ {
++    std::lock_guard<std::mutex> lk(latestMutex_);   // written under it by the net thread (review L6)
+     return lastDecodeMs_;
+ }
+ 
+diff --git a/clients/steam-frame/src/video_decoder.h b/clients/steam-frame/src/video_decoder.h
+index aa14d07..52c6364 100644
+--- a/clients/steam-frame/src/video_decoder.h
++++ b/clients/steam-frame/src/video_decoder.h
+@@ -1,7 +1,7 @@
+ // Frame VR client — video decode layer
+ // SPDX-License-Identifier: BSL-1.0
+ //
+-// FFmpeg HEVC/H264 -> NV12 planes (stream mode) or RGBA (file mode), portable across
++// FFmpeg HEVC -> NV12 planes (stream mode; H.264 refused, review 2026-10-21 M7) or RGBA (file mode), portable across
+ // Mac (dev) and Linux (Frame). Stream mode hands the decoder's planes to the renderer
+ // untouched (1.5 bytes/px, no CPU colour conversion) and the fragment shader converts;
+ // the old sws_scale RGBA path (4 bytes/px, ~ms of CPU per frame on the Frame) stays
+@@ -44,15 +44,24 @@ class VideoDecoder {
+     bool NextFrameRGBA(std::vector<uint8_t>& out, int& width, int& height);
+ 
+     // ---- Stream mode ----
+-    bool OpenStream(Codec codec);
++    bool OpenStream(Codec codec);   // Codec::H264 is refused: the access-unit assembly reads HEVC NAL headers (review M7)
+     bool ReconfigureStream(int width, int height);
++    // Forget the stream so far: the access unit being assembled, the submit bookkeeping, the ready frames and the pts
++    // history. Called by OpenStream and ReconfigureStream, and by the connection before it wires a (new) server, so a
++    // reconnect never feeds the fresh decoder the old parameter sets or matches the old pts (review 2026-10-21, M5).
++    // Safe against the render thread taking frames; the net thread must not be inside SubmitNal.
++    void ResetStreamState();
++    // Bytes of the access unit still being assembled (parameter sets waiting for their slice); for the tests.
++    size_t PendingAccessUnitBytes() const { return au_.size(); }
+     int expectedW_ = 0, expectedH_ = 0;
+     int streamCodecId_ = 0;
+     // Called from the network thread with a complete encoded access unit. ptsUs is the
+     // frame's presentation timestamp; it rides through parser and codec delays so the
+     // decoded output can be matched to its per-frame metadata (render pose, foveation
+     // centre) rather than to whatever arrived most recently.
+-    void SubmitNal(const uint8_t* data, size_t size, int64_t ptsUs);
++    // alphaBlend is the frame's own VIDEO_FLAG_ALPHA_BLEND, carried through to FrameTiming so the layer the frame is
++    // shown on blends the way THIS frame was composed, not the way the latest received one was (review L7).
++    void SubmitNal(const uint8_t* data, size_t size, int64_t ptsUs, bool alphaBlend = false);
+     void submitNalImpl(const uint8_t* data, size_t size, int64_t ptsUs);
+     uint64_t decodedFrames_ = 0, decodedFramesAtLog_ = 0, decodeCalls_ = 0;
+     double decodeMsSum_ = 0, decodeMsMax_ = 0;
+@@ -68,12 +77,15 @@ class VideoDecoder {
+         double receiveToSubmitMs = 0.0;
+         double decodeMs = 0.0;
+         bool fullRange = false;   // the stream's signalled range (or FRAME_CLIENT_FULL_RANGE)
++        bool alphaBlend = false;  // this frame was composed for alpha blending (passthrough); valid when alphaKnown
++        bool alphaKnown = false;  // false when the frame's submit record was not found (pts relabelled by the decoder)
+     };
+     bool TakeLatest(std::vector<uint8_t>& out, int& width, int& height, PixelLayout& layout,
+                     int64_t* outPtsUs = nullptr, FrameTiming* outTiming = nullptr);
+-    // Presentation timestamp of the newest decoded frame while it is still untaken. Does not
+-    // take it and copies no pixels: lets the hidden-session path run the render-pose match
+-    // (the shake metric) when the runtime is not letting us render.
++    // Presentation timestamp of the frame TakeLatest would hand out next (queue mode: the oldest after the
++    // catch-up TakeLatest applies; latest-only mode: the fresh frame) while it is still untaken. Does not take it
++    // and copies no pixels. Review 2026-10-21 (M8): it returned the NEWEST ring entry, so a peek-driven pose match
++    // would have erased the poses the displayed (older) frame still needed.
+     bool PeekLatestPts(int64_t* outPtsUs);
+     // Block up to ms for a fresh frame (returns at once if one is waiting). The render loop
+     // uses it to give a late frame a few ms instead of repainting the previous one.
+@@ -128,7 +140,7 @@ class VideoDecoder {
+     struct AVPacket* packet_ = nullptr;
+ 
+     // Stream mode: latest decoded frame handed net thread -> render thread.
+-    std::mutex latestMutex_;
++    mutable std::mutex latestMutex_;   // mutable: LastDecodeMs() is const and reads under it (review L6)
+     std::condition_variable latestCv_;
+     std::vector<uint8_t> latest_;
+     PixelLayout latestLayout_ = PixelLayout::RGBA;
+@@ -146,11 +158,12 @@ class VideoDecoder {
+     std::vector<uint8_t> au_;          // the access unit being assembled (parameter sets + the slice)
+     static constexpr size_t kMaxAccessUnitBytes = 2u << 20;   // review 2026-10-21 (H4)
+     uint32_t auOverflows_ = 0;
++    uint32_t sendEagain_ = 0;          // review M6: send_packet back-pressure events (drained and resent, not dropped)
+     int parserHold_ = -1;              // -1 unread; 1 = old path through av_parser (FRAME_CLIENT_PARSER_HOLD)   // parser: did this call's AU go to the decoder in this call?
+     bool latestFresh_ = false;
+     FrameTiming latestTiming_;
+     // Submit times of the access units still inside the decoder, keyed by pts (net thread only).
+-    struct PendingSubmit { int64_t ptsUs = -1; std::chrono::steady_clock::time_point receivedAt{}, submittedAt{}; };
++    struct PendingSubmit { int64_t ptsUs = -1; std::chrono::steady_clock::time_point receivedAt{}, submittedAt{}; bool alpha = false; };
+     PendingSubmit pending_[32];
+     unsigned pendingNext_ = 0;
+     PendingSubmit* pendingSlot_ = nullptr;   // the slot of the access unit being submitted
+diff --git a/clients/steam-frame/tests/test_client_state.cpp b/clients/steam-frame/tests/test_client_state.cpp
+new file mode 100644
+index 0000000..16c0732
+--- /dev/null
++++ b/clients/steam-frame/tests/test_client_state.cpp
+@@ -0,0 +1,193 @@
++// SPDX-License-Identifier: BSL-1.0
++// Review 2026-10-21 close-out (patch 0016): the stream-mode decoder's state machine and the runtime-dir paths.
++//   - OpenStream refuses H.264 (M7)
++//   - the test clip, fed NAL by NAL as the network path does, decodes in stream mode
++//   - PeekLatestPts names the frame TakeLatest hands out next (M8)
++//   - ReconfigureStream / ResetStreamState forget the access unit and the ready frames, and decoding resumes (M5)
++//   - live-tuning files come from the runtime dir, never through a symlink; dumps never write through one (M11)
++#include "test_util.h"
++#include "video_decoder.h"
++#include "runtime_paths.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <string>
++#include <vector>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#ifndef TEST_ASSET_DIR
++#define TEST_ASSET_DIR "assets"
++#endif
++
++// Split an Annex-B elementary stream into NAL units, each with its own start code (as the server sends them).
++static std::vector<std::vector<uint8_t>> splitNals(const std::vector<uint8_t>& es)
++{
++    std::vector<size_t> starts;
++    for (size_t i = 0; i + 3 < es.size(); i++) {
++        if (es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1) { starts.push_back(i >= 1 && es[i - 1] == 0 ? i - 1 : i); i += 2; }
++    }
++    std::vector<std::vector<uint8_t>> nals;
++    for (size_t k = 0; k < starts.size(); k++) {
++        const size_t end = k + 1 < starts.size() ? starts[k + 1] : es.size();
++        nals.emplace_back(es.begin() + starts[k], es.begin() + end);
++    }
++    return nals;
++}
++
++static int hevcNalType(const std::vector<uint8_t>& nal)
++{
++    size_t sc = (nal.size() >= 4 && nal[2] == 0) ? 4 : 3;
++    return nal.size() > sc ? (nal[sc] >> 1) & 0x3f : -1;
++}
++
++// Feed NALs from `from`; returns the index after the n-th slice fed (each slice completes an access unit).
++static size_t feedFrames(VideoDecoder& dec, const std::vector<std::vector<uint8_t>>& nals, size_t from, int frames, int64_t& pts)
++{
++    int slices = 0;
++    size_t i = from;
++    for (; i < nals.size() && slices < frames; i++) {
++        dec.SubmitNal(nals[i].data(), nals[i].size(), pts);
++        if (hevcNalType(nals[i]) < 32) { slices++; pts += 13889; }
++    }
++    return i;
++}
++
++static void test_stream_decoder_state()
++{
++    SECTION("video_decoder: stream mode refuses H.264 (review M7)");
++    {
++        VideoDecoder h264;
++        CHECK(!h264.OpenStream(VideoDecoder::Codec::H264));
++    }
++
++    SECTION("video_decoder: stream mode decodes the clip NAL by NAL; peek == take; reconfigure resets (M5, M8)");
++    std::ifstream f(std::string(TEST_ASSET_DIR) + "/stereo_test.hevc", std::ios::binary);
++    std::vector<uint8_t> es((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++    CHECK(es.size() > 1000);
++    const auto nals = splitNals(es);
++    CHECK(nals.size() > 20);
++    int paramSets = 0; for (const auto& n : nals) if (hevcNalType(n) >= 32) paramSets++;
++    CHECK(paramSets >= 3);   // VPS, SPS, PPS at least
++
++    setenv("FRAME_CLIENT_DECODE_POLL_MS", "0", 0);   // the software decoder needs no poll; keep the test quick
++    VideoDecoder dec;
++    CHECK(dec.OpenStream(VideoDecoder::Codec::H265));
++    CHECK(dec.QueueDepth() == 2);
++
++    // Feed until frames come out (x265 reorders, so a few access units go in before the first comes out).
++    int64_t pts = 1000000;
++    size_t at = 0;
++    std::vector<uint8_t> buf; int w = 0, h = 0; VideoDecoder::PixelLayout pl = VideoDecoder::PixelLayout::RGBA;
++    int64_t peekPts = -1, takePts = -1;
++    bool peeked = false, taken = false;
++    for (int round = 0; round < 12 && !taken; round++) {
++        at = feedFrames(dec, nals, at, 2, pts);
++        peeked = dec.PeekLatestPts(&peekPts);
++        if (peeked) { VideoDecoder::FrameTiming t; taken = dec.TakeLatest(buf, w, h, pl, &takePts, &t); }
++    }
++    CHECK(taken);
++    CHECK(peeked && peekPts == takePts);   // M8: the peek names the frame the take returns
++    CHECK(w == 1920 && h == 1080);
++    CHECK(pl == VideoDecoder::PixelLayout::NV12);
++    CHECK(buf.size() == (size_t)w * h * 3 / 2);
++
++    // Fill the ring past the queue depth without taking: the peek must still agree with the take (after catch-up).
++    at = feedFrames(dec, nals, at, 6, pts);
++    peeked = dec.PeekLatestPts(&peekPts);
++    VideoDecoder::FrameTiming t2;
++    taken = dec.TakeLatest(buf, w, h, pl, &takePts, &t2);
++    CHECK(peeked && taken && peekPts == takePts);
++    CHECK(t2.alphaKnown && !t2.alphaBlend);   // the submit record was found; this clip is opaque
++
++    // A lone parameter set waits for its slice in the access unit...
++    size_t vps = 0; while (vps < nals.size() && hevcNalType(nals[vps]) < 32) vps++;
++    dec.SubmitNal(nals[vps].data(), nals[vps].size(), pts);
++    CHECK(dec.PendingAccessUnitBytes() > 0);
++    // ...and a reconfigure forgets it along with the ready frames (M5).
++    CHECK(dec.ReconfigureStream(1920, 1080));
++    CHECK(dec.PendingAccessUnitBytes() == 0);
++    CHECK(!dec.PeekLatestPts(&peekPts));
++    CHECK(!dec.TakeLatest(buf, w, h, pl, &takePts, nullptr));
++    // The reopened decoder decodes from the start of the stream (parameter sets + IDR) again.
++    pts = 5000000; at = 0; taken = false;
++    for (int round = 0; round < 12 && !taken; round++) {
++        at = feedFrames(dec, nals, at, 2, pts);
++        taken = dec.TakeLatest(buf, w, h, pl, &takePts, nullptr);
++    }
++    CHECK(taken);
++    CHECK(takePts >= 5000000);   // no pts from before the reset leaks out
++    // ResetStreamState alone (the reconnect path) clears the ready frames too.
++    at = feedFrames(dec, nals, at, 4, pts);
++    dec.ResetStreamState();
++    CHECK(!dec.TakeLatest(buf, w, h, pl, &takePts, nullptr));
++    CHECK(dec.PendingAccessUnitBytes() == 0);
++    dec.Close();
++}
++
++static bool isSymlink(const std::string& p) { struct stat st; return lstat(p.c_str(), &st) == 0 && S_ISLNK(st.st_mode); }
++static bool isRegular(const std::string& p) { struct stat st; return lstat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode); }
++static std::string slurp(const std::string& p) { std::ifstream f(p); return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()); }
++
++static void test_runtime_paths()
++{
++    SECTION("runtime_paths: tuning files from the runtime dir, no symlinks; dumps never through a symlink (review M11)");
++    char tmpl[] = "/tmp/frame-client-test-XXXXXX";
++    char* dir = mkdtemp(tmpl);
++    CHECK(dir != nullptr);
++    if (!dir) return;
++    const std::string d = dir;
++    setenv("XDG_RUNTIME_DIR", dir, 1);
++    CHECK(frame_paths::RuntimeDir() == d);
++    CHECK(frame_paths::TuningPath("frame-predict-ms") == d + "/frame-predict-ms");
++    CHECK(frame_paths::DumpPath("frame-dump.bin") == d + "/frame-dump.bin");
++
++    // A tuning file in the runtime dir is read.
++    { std::ofstream o(d + "/frame-predict-ms"); o << "33.5\n"; }
++    FILE* tf = frame_paths::OpenTuning("frame-predict-ms");
++    CHECK(tf != nullptr);
++    if (tf) { float v = 0; CHECK(fscanf(tf, "%f", &v) == 1 && v > 33.4f && v < 33.6f); fclose(tf); }
++    // A symlink under the name is not followed.
++    { std::ofstream o(d + "/target"); o << "99\n"; }
++    CHECK(symlink((d + "/target").c_str(), (d + "/frame-stamp-lead-ms").c_str()) == 0);
++    CHECK(frame_paths::OpenTuning("frame-stamp-lead-ms") == nullptr);
++    // Absent in the runtime dir: our own /dev/shm file is the fallback (the frame-stream tooling's path).
++    const std::string shmName = "frame-client-test-" + std::to_string((long)getpid());
++    const std::string shmPath = "/dev/shm/" + shmName;
++    { std::ofstream o(shmPath); o << "off\n"; }
++    FILE* sf = frame_paths::OpenTuning(shmName.c_str());
++    CHECK(sf != nullptr);
++    if (sf) { char line[16] = {0}; CHECK(fgets(line, sizeof line, sf) && strncmp(line, "off", 3) == 0); fclose(sf); }
++    unlink(shmPath.c_str());
++    CHECK(frame_paths::OpenTuning(shmName.c_str()) == nullptr);
++
++    // A dump at a name that is a symlink: the link goes, a fresh regular file takes its place, the target is untouched.
++    const std::string dumpLink = d + "/frame_client_eye0.rgba";
++    CHECK(symlink((d + "/target").c_str(), dumpLink.c_str()) == 0);
++    CHECK(isSymlink(dumpLink));
++    FILE* df = frame_paths::CreateDump(dumpLink);
++    CHECK(df != nullptr);
++    if (df) { fputs("dump", df); fclose(df); }
++    CHECK(isRegular(dumpLink) && !isSymlink(dumpLink));
++    CHECK(slurp(d + "/target") == "99\n");
++    CHECK(slurp(dumpLink) == "dump");
++    struct stat st; CHECK(stat(dumpLink.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600);
++    // A second dump at the same name replaces it (a stale dump is not an obstacle).
++    df = frame_paths::CreateDump(dumpLink);
++    CHECK(df != nullptr);
++    if (df) { fputs("again", df); fclose(df); }
++    CHECK(slurp(dumpLink) == "again");
++
++    unlink((d + "/frame-predict-ms").c_str()); unlink((d + "/frame-stamp-lead-ms").c_str());
++    unlink((d + "/target").c_str()); unlink(dumpLink.c_str()); rmdir(dir);
++    unsetenv("XDG_RUNTIME_DIR");
++}
++
++void test_client_state()
++{
++    test_stream_decoder_state();
++    test_runtime_paths();
++}
+diff --git a/clients/steam-frame/tests/test_main.cpp b/clients/steam-frame/tests/test_main.cpp
+index fe37fc4..a1d891f 100644
+--- a/clients/steam-frame/tests/test_main.cpp
++++ b/clients/steam-frame/tests/test_main.cpp
+@@ -10,6 +10,7 @@ void test_video_decoder();
+ void test_protocol_fec();
+ void test_foveation();
+ void test_yuv();
++void test_client_state();
+ 
+ int main()
+ {
+@@ -17,6 +18,7 @@ int main()
+     test_protocol_fec();
+     test_foveation();
+     test_yuv();
++    test_client_state();
+     printf("\n%d checks, %d failures\n", g_checks, g_failures);
+     return g_failures == 0 ? 0 : 1;
+ }
+diff --git a/common/protocol/include/oxrsys/protocol/Protocol.h b/common/protocol/include/oxrsys/protocol/Protocol.h
+index 1734edf..b934a98 100644
+--- a/common/protocol/include/oxrsys/protocol/Protocol.h
++++ b/common/protocol/include/oxrsys/protocol/Protocol.h
+@@ -147,6 +147,12 @@ enum ClientCapabilityFlags : uint32_t
+     // wrong group and produces plausible garbage rather than failing cleanly.
+     // 0x00000800 is claimed by CLIENT_CAPABILITY_FOVEATION_CENTER (gaze foveation PR).
+     CLIENT_CAPABILITY_FEC_INTERLEAVED = 0x00001000,
++    // The client's LatencyReport ages are fit for the server's rate lock (pacing_lock_wait_ms); the runtime
++    // gates the lock on this bit (Mac-side review close-out, 2026-10-21). The Mac tree defines it as 0x00000800,
++    // which on this branch is CLIENT_CAPABILITY_FOVEATION_CENTER (sent by the Steam Frame client already, so the
++    // Mac gate opens for it either way); 0x00002000 is the first bit free in both trees - the Mac definition
++    // should move here.
++    CLIENT_CAPABILITY_PACING_LOCK = 0x00002000,
+ };
+ 
+ enum ClientCodecCapabilityFlags : uint32_t
+-- 
+2.44.0
+

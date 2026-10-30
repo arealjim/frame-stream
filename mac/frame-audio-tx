@@ -1,0 +1,37 @@
+#!/bin/bash
+# frame-audio-tx - the Mac half of game audio into the headset: BlackHole 2ch (point the game or Wine at it) captured
+# and sent as raw 48 kHz s16le stereo over UDP to frame-audio-rx on the headset. Usage: frame-audio-tx [frame-ip] [port]  (frame-ip: else $FRAME_STREAM_FRAME_IP, else the headset's end of the USB-C tether:
+# the DHCP server of the Mac's interface on $FRAME_STREAM_USB_NET, as frame-stream finds it, or the first host of that /29.
+# Over Wi-Fi give the headset's Wi-Fi address)
+# Capturing any input needs macOS's microphone permission, so start it from Terminal (frame-audio-tx.command) once and
+# allow it; started over bare ssh it captures silence without an error.
+# Capture is sox's CoreAudio reader: ffmpeg's avfoundation input delivered only 43,000 of 48,000 samples a second with
+# Wine loading the Mac (measured on the headset, 2026-10-22), and every missing buffer is a click. The send is the
+# system nc, one datagram per 1152-byte read: ffmpeg's UDP output bunched the same stream into 85 ms bursts, and a
+# fresh Python binary's first send sat behind macOS's local-network permission prompt.
+export PATH=/opt/homebrew/bin:$HOME/.local/bin:$PATH
+# It sends from the port it sends to: over Wi-Fi the headset only lets the sound in as the reply to its own hello
+# (frame-audio-rx start <mac-ip>).
+USB_NET=${FRAME_STREAM_USB_NET:-10.86.200}   # the tether's first three octets; 10.86.200 on the headset we measured
+usb_peer(){
+  local i a s
+  for i in $(ifconfig -l); do
+    a=$(ipconfig getifaddr "$i" 2>/dev/null) || continue
+    case $a in "$USB_NET".*) ;; *) continue;; esac
+    s=$(ipconfig getoption "$i" server_identifier 2>/dev/null || true)
+    case $s in "$USB_NET".*) echo "$s";; *) echo "$USB_NET.$(( (${a##*.} & ~7) + 1 ))";; esac
+    return 0
+  done
+  return 1
+}
+HOST=${1:-${FRAME_STREAM_FRAME_IP:-$(usb_peer || true)}}
+[ -n "$HOST" ] || { echo "frame-audio-tx: no USB-C tether on $USB_NET.x (set FRAME_STREAM_USB_NET); give the headset's address: frame-audio-tx <frame-ip>" >&2; exit 2; }
+echo "frame-audio-tx: sending to $HOST:${2:-9950}" >&2
+PATH=$PATH:/opt/homebrew/bin:/usr/local/bin   # Homebrew's sox, also when started from a non-login shell
+command -v sox >/dev/null || { echo "frame-audio-tx: needs sox (brew install sox)" >&2; exit 2; }
+# A send error (the receiver restarting, a link blip) ends the pipe, so it is restarted rather than left dead.
+while :; do
+  sox -q --buffer 1152 -t coreaudio "BlackHole 2ch" -r 48000 -c 2 -b 16 -e signed-integer -t raw - \
+    | /usr/bin/nc -u -p "${2:-9950}" "$HOST" "${2:-9950}"
+  echo "frame-audio-tx: capture exited, restarting in 1 s" >&2; sleep 1
+done

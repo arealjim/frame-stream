@@ -1,0 +1,79 @@
+From 0283c2819c84fae02bf35aa056f6485d19d83bf5 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 17:27:55 +0000
+Subject: [PATCH] runtime: hold the interaction profile through a tracking loss
+ while a client is connected
+
+With a client connected, a controller that stops tracking (an unworn headset, a hand out of the cameras' view, a
+Wi-Fi stall) made xrGetCurrentInteractionProfile return XR_NULL_PATH and pushed INTERACTION_PROFILE_CHANGED to "no
+controller". Half-Life: Alyx under OpenComposite stopped submitting frames within a second of that event, worn.
+SteamVR keeps a bound profile through tracking loss; actions still read inactive, and a different profile still
+changes it.
+
+---
+ runtime/src/EntryPoint.cpp | 35 +++++++++++++++++++++++++++++------
+ 1 file changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/runtime/src/EntryPoint.cpp b/runtime/src/EntryPoint.cpp
+index 1233d1f..25fd12e 100644
+--- a/runtime/src/EntryPoint.cpp
++++ b/runtime/src/EntryPoint.cpp
+@@ -2301,6 +2301,27 @@ static std::string SelectCurrentInteractionProfileForInstance(
+     return "";
+ }
+ 
++// Hold the last reported profile through a tracking loss while a client is connected (2026-10-22). An unworn
++// headset, a controller out of the cameras' view or a Wi-Fi stall clears the tracking flags for a moment; reporting
++// XR_NULL_PATH then sends the app an INTERACTION_PROFILE_CHANGED to "no controller" mid-game. Half-Life: Alyx under
++// OpenComposite stopped submitting frames within a second of that event, worn. SteamVR keeps a profile bound through
++// tracking loss; actions still read inactive (ApplySyncState skips inactive devices), and a different profile, or
++// the client disconnecting, still changes it.
++static std::string HeldInteractionProfile(XrSession session, const InputManager& inputManager,
++                                          InputManager::Hand hand, std::string selected)
++{
++    if (!selected.empty() || !inputManager.IsStreaming())
++    {
++        return selected;
++    }
++    auto it = gReportedInteractionProfiles.find(reinterpret_cast<uint64_t>(session));
++    if (it == gReportedInteractionProfiles.end())
++    {
++        return selected;
++    }
++    return it->second[hand == InputManager::Hand::Right ? 1 : 0];
++}
++
+ static XRAPI_ATTR XrResult XRAPI_CALL OxrGetCurrentInteractionProfile(
+     XrSession session, XrPath topLevelUserPath,
+     XrInteractionProfileState* interactionProfile)
+@@ -2331,8 +2352,8 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrGetCurrentInteractionProfile(
+         InputManager::Hand hand = (pathStr == "/user/hand/right")
+                                       ? InputManager::Hand::Right
+                                       : InputManager::Hand::Left;
+-        std::string profilePath = SelectCurrentInteractionProfileForInstance(
+-            sess->GetInstance(), sess->GetInputManager(), hand);
++        std::string profilePath = HeldInteractionProfile(session, sess->GetInputManager(), hand,
++            SelectCurrentInteractionProfileForInstance(sess->GetInstance(), sess->GetInputManager(), hand));
+         if (profilePath.empty())
+         {
+             interactionProfile->interactionProfile = XR_NULL_PATH;
+@@ -2434,10 +2455,12 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrSyncActions(
+     // app caches the startup value (XR_NULL_PATH before any client connects) and never binds the
+     // controllers that appear later.
+     std::array<std::string, 2> current = {
+-        SelectCurrentInteractionProfileForInstance(
+-            sess->GetInstance(), inputManager, InputManager::Hand::Left),
+-        SelectCurrentInteractionProfileForInstance(
+-            sess->GetInstance(), inputManager, InputManager::Hand::Right)};
++        HeldInteractionProfile(session, inputManager, InputManager::Hand::Left,
++            SelectCurrentInteractionProfileForInstance(
++                sess->GetInstance(), inputManager, InputManager::Hand::Left)),
++        HeldInteractionProfile(session, inputManager, InputManager::Hand::Right,
++            SelectCurrentInteractionProfileForInstance(
++                sess->GetInstance(), inputManager, InputManager::Hand::Right))};
+     std::array<std::string, 2>& reported =
+         gReportedInteractionProfiles[reinterpret_cast<uint64_t>(session)];
+     if (current != reported)
+-- 
+2.50.1 (Apple Git-155)
+

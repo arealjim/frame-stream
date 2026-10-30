@@ -1,0 +1,126 @@
+From 4539871c62c1acd9c523d35c1f976e2f73b8d575 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 12:07:22 +0000
+Subject: [PATCH] runtime: log the bytes of the config file it read, at start
+ and on every reload
+
+The runtime reads exactly one oxrsys-runtime.toml: the Application
+Support override when it exists, wholesale, else the file beside the
+library. Its start line already names the path ("OXRSys Runtime
+starting (config from <path>)") and a reload names it again, but
+neither says what the file held. A stand that swaps the override
+between arms, or a session that edits it mid-run, leaves no record
+of which bytes a measurement ran on, and the effective settings
+(file plus defaults) cannot be recovered from the path alone.
+
+Every read now also logs one line:
+
+  OXRSys: config read <path> exists=<0|1> bytes=<n> fnv1a64=<16 hex>
+
+FNV-1a 64 of exactly the bytes parsed, so no crypto dependency on
+either platform. With the library's own hash this pins the effective
+configuration: the parser is in the library, the defaults are in the
+library, and the file is these bytes. frame-lab's frame-stamp reads
+the line to prove the toml on disk is still the one the runtime used.
+
+The file is read once into memory and parsed from there, so the hash
+and the parse see the same bytes even if the file is rewritten during
+the read. Nothing is sent anywhere; it is one log line per read.
+---
+ runtime/src/Config.cpp | 26 ++++++++++++++++++++++++--
+ runtime/src/Config.h   |  5 +++++
+ 2 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index ee327c5..d66846c 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -13,6 +13,7 @@
+ #include <algorithm>
+ #include <cstdlib>
+ #include <filesystem>
++#include <sstream>
+ #include <thread>
+ 
+ #include <fcntl.h>
+@@ -686,12 +687,23 @@ bool Config::ReloadIfChangedLocked(bool force)
+ 
+     ConfigValues oldValues = values_;
+     ConfigValues newValues;
++    size_t bytes = 0;
++    uint64_t fnv = 0xcbf29ce484222325ull;   // FNV-1a 64 of exactly the bytes parsed (no crypto dependency)
+     if (fileExists)
+     {
+-        std::ifstream file(resolvedPath);
++        std::ifstream file(resolvedPath, std::ios::binary);
+         if (file.is_open())
+         {
+-            newValues = ParseConfigToml(file);
++            std::ostringstream buffer;
++            buffer << file.rdbuf();
++            const std::string text = buffer.str();
++            for (const unsigned char ch : text)
++            {
++                fnv = (fnv ^ ch) * 0x100000001b3ull;
++            }
++            bytes = text.size();
++            std::istringstream input(text);
++            newValues = ParseConfigToml(input);
+         }
+     }
+ 
+@@ -699,6 +711,8 @@ bool Config::ReloadIfChangedLocked(bool force)
+     snapshot_ = std::make_shared<const ConfigValues>(values_);
+     configFilePath = resolvedPath;
+     hasConfigFile_ = fileExists;
++    configFileBytes_ = bytes;
++    configFileFnv1a64_ = fnv;
+     hasKnownWriteTime_ = fileExists && hasWriteTime;
+     if (hasKnownWriteTime_)
+     {
+@@ -750,11 +764,18 @@ bool Config::ReloadIfChangedLocked(bool force)
+             newValues.spatialPersistence,
+             newValues.headsetAudio,
+             newValues.questLogcat);
++        LogConfigRead();
+     }
+ 
+     return true;
+ }
+ 
++void Config::LogConfigRead() const
++{
++    spdlog::info("OXRSys: config read {} exists={} bytes={} fnv1a64={:016x}",
++                 configFilePath, hasConfigFile_ ? 1 : 0, configFileBytes_, configFileFnv1a64_);
++}
++
+ void Config::RefreshIfNeeded()
+ {
+     std::lock_guard<std::mutex> lock(mutex_);
+@@ -891,6 +912,7 @@ void Config::SetupLogging()
+                   values_.appAlphaBlendPassthrough, values_.occlusionMode,
+                   values_.spatialEnabled, values_.spatialAnchors, values_.spatialScene,
+                   values_.spatialPersistence, values_.headsetAudio);
++    LogConfigRead();
+ }
+ 
+ // ─── Quest logcat capture ────────────────────────────────────────────────────
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index a834ae3..6a2f818 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -206,6 +206,11 @@ class Config
+     std::shared_ptr<const ConfigValues> snapshot_;
+     std::filesystem::file_time_type lastConfigWriteTime_ = {};
+     bool hasConfigFile_ = false;
++    // What the last read parsed, logged at start and on every reload so a test can prove which bytes the
++    // runtime ran on: "OXRSys: config read <path> exists=<0|1> bytes=<n> fnv1a64=<16 hex>".
++    size_t configFileBytes_ = 0;
++    uint64_t configFileFnv1a64_ = 0;
++    void LogConfigRead() const;
+     bool hasKnownWriteTime_ = false;
+     std::chrono::steady_clock::time_point lastReloadCheck_ = std::chrono::steady_clock::time_point::min();
+     FILE* logcatPipe_ = nullptr;
+-- 
+2.43.0
+

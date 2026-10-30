@@ -1,0 +1,195 @@
+From 8400cf9e0e78bf4049264820e821369258efa678 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 02:15:27 +0000
+Subject: [PATCH 09/23] runtime: WaitFrame pacing diagnostics, pacing_spin_ms,
+ pacing_thread (qos | realtime)
+
+The absolute-deadline grid in Session::WaitFrame sleeps with sleep_until on the app thread that called it. On an M5 (macOS 26, Godot 4.7 Vulkan via MoltenVK) that sleep overshoots by 3.0 ms mean and 6 ms max - the app is never late - so the frame cadence has a 2-2.5 ms standard deviation and the stream lands two frames in one headset period whenever the receiver loop is in phase with it (measured 2026-10-18, 12-28 pct dropped frames in that phase with a latest-only client slot).
+
+The pacing log now separates sleep overshoot (mean, max, count) from app lateness. Two knobs: pacing_spin_ms (default 0) wakes n ms early and spins to the deadline - overshoot 1.2 ms mean, 3.2 max. pacing_thread (default "default"): "qos" sets USER_INTERACTIVE on the thread (no effect measured: 2.6-3.0 ms); "realtime" sets a Mach time-constraint policy (period = one frame, computation 2 ms, constraint 5 ms, preemptible) - overshoot 0.01 ms mean, 0.02 max, cadence sd 0.00 ms over 100 s. Applied once, on the first WaitFrame.
+
+---
+ runtime/oxrsys-runtime.toml |  8 ++++
+ runtime/src/Config.cpp      |  9 +++++
+ runtime/src/Config.h        |  5 +++
+ runtime/src/Session.cpp     | 78 +++++++++++++++++++++++++++++++++++--
+ 4 files changed, 97 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/oxrsys-runtime.toml b/runtime/oxrsys-runtime.toml
+index 5a43cba..aea87a8 100644
+--- a/runtime/oxrsys-runtime.toml
++++ b/runtime/oxrsys-runtime.toml
+@@ -47,6 +47,14 @@ video_codec = "h265"
+ # balanced = default, good mix
+ # quality  = best visual quality, slightly higher latency
+ encoder_preset = "balanced"
++# WaitFrame pacing: sleep until (deadline - pacing_spin_ms) and spin the rest, for a tighter
++# 72 Hz cadence at the cost of that much CPU on the app's render thread. 0 = plain sleep.
++pacing_spin_ms = 0
++
++# The app thread that calls WaitFrame: "default", "qos" (USER_INTERACTIVE), or "realtime"
++# (Mach time-constraint policy, period = one frame). Tighter wakeups without spinning.
++pacing_thread = "default"
++
+ 
+ # VideoToolbox low-latency rate control for the hardware encoder: no look-ahead and no
+ # periodic keyframes (clients request them on loss). Cuts the encode callback from ~12.6 ms
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index 08dd9cf..51868c1 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -399,6 +399,15 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             {
+                 values.encoder10Bit = ParseBool(value);
+             }
++            else if (key == "pacing_thread")
++            {
++                value = ParseString(value);
++                values.pacingThread = (value == "qos" || value == "realtime") ? value : "default";
++            }
++            else if (key == "pacing_spin_ms")
++            {
++                values.pacingSpinMs = std::max(0.0f, std::min(8.0f, std::stof(value)));
++            }
+             else if (key == "encoder_low_latency")
+             {
+                 values.encoderLowLatency = ParseBool(value);
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index bd30b98..b182d7c 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -29,6 +29,11 @@ struct ConfigValues
+     // no periodic IDR (keyframes come from ForceKeyFrame, i.e. client requests).
+     // Measured 2026-10-17, M5 Pro, 2272x1264 HEVC @72: encode callback 12.6 -> 8.0 ms.
+     bool encoderLowLatency = true;
++    // pacing_spin_ms: WaitFrame sleeps until (deadline - this) and spins the rest. 0 = sleep to the deadline.
++    float pacingSpinMs = 0.0f;
++    // pacing_thread: "default" | "qos" (USER_INTERACTIVE QoS on the app thread that calls WaitFrame)
++    // | "realtime" (Mach time-constraint policy: period = frame, computation 2 ms, constraint 5 ms).
++    std::string pacingThread = "default";
+     // Feed the low-latency (rtvc) or software session the BGRA surface directly
+     // instead of a BT.709 video-range 4:2:0 conversion of each frame (about 1 ms
+     // of submit per frame, measured 2026-10-17). Those sessions then write a
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index e5fd8b5..c7fb6d6 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -19,11 +19,22 @@
+ #include <exception>
+ #include <numeric>
+ #include <thread>
++#include <pthread.h>
++#include <mach/mach.h>
++#include <mach/mach_time.h>
++#include <mach/thread_policy.h>
+ #include <utility>
+ 
+ #include <glm/glm.hpp>
+ #include <glm/gtc/quaternion.hpp>
+ 
++namespace {
++struct PacingDiag {
++    double overshootSum = 0, overshootMax = 0, lateSum = 0;
++    uint32_t slept = 0, appLate = 0;
++};
++}
++
+ namespace
+ {
+ glm::quat ToGlmQuat(const XrQuaternionf& q) { return glm::quat(q.w, q.x, q.y, q.z); }
+@@ -482,6 +493,38 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+     // absorbed by the next and the cadence locks to the panel period with low
+     // variance. targetFrameTime comes from the client-reported (negotiated) refresh.
+     auto targetFrameTime = std::chrono::nanoseconds(1000000000ll / targetRefreshHz);
++    static PacingDiag pacing;
++    // pacing_thread: the app's render thread is what sleeps here. On an M5 a default-QoS
++    // thread's sleep_until overshoots by 3 ms mean / 6 ms max (timer slack, measured
++    // 2026-10-18); a QoS or time-constraint thread gets tighter timers without spinning.
++    {
++        static bool applied = false;
++        if (!applied)
++        {
++            applied = true;
++            const std::string& mode = Config::Get().GetValues().pacingThread;
++            if (mode == "qos")
++            {
++                const int rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++                spdlog::info("OXRSys: Session::WaitFrame pacing_thread=qos USER_INTERACTIVE rc={}", rc);
++            }
++            else if (mode == "realtime")
++            {
++                mach_timebase_info_data_t tb{};
++                mach_timebase_info(&tb);
++                const double nsPerAbs = (double)tb.numer / (double)tb.denom;
++                thread_time_constraint_policy_data_t policy{};
++                policy.period = (uint32_t)(targetFrameTime.count() / nsPerAbs);
++                policy.computation = (uint32_t)(2'000'000 / nsPerAbs);
++                policy.constraint = (uint32_t)(5'000'000 / nsPerAbs);
++                policy.preemptible = 1;
++                const kern_return_t kr = thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY,
++                                                           (thread_policy_t)&policy, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
++                spdlog::info("OXRSys: Session::WaitFrame pacing_thread=realtime period={}us computation=2ms constraint=5ms kr={}",
++                             targetFrameTime.count() / 1000, (int)kr);
++            }
++        }
++    }
+     auto now = std::chrono::steady_clock::now();
+ 
+     if (nextFrameDeadline_.time_since_epoch().count() == 0 || pacingPeriod_ != targetFrameTime)
+@@ -492,10 +535,34 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+     }
+     else
+     {
++        // Measured 2026-10-18 (M5, Godot at 72 Hz): sleep_until alone paces with a 1-2 ms
++        // standard deviation and 5 ms overshoots, enough for two frames to land in one
++        // headset period and one of them to be dropped. pacing_spin_ms wakes early and spins
++        // the remainder; the diagnostic below separates sleep overshoot from a late app.
+         if (now < nextFrameDeadline_)
+         {
+-            std::this_thread::sleep_until(nextFrameDeadline_);
++            const float spinMs = Config::Get().GetValues().pacingSpinMs;
++            if (spinMs > 0.0f)
++            {
++                const auto spinStart = nextFrameDeadline_ - std::chrono::duration_cast<std::chrono::nanoseconds>(
++                    std::chrono::duration<double, std::milli>(spinMs));
++                if (now < spinStart) std::this_thread::sleep_until(spinStart);
++                while (std::chrono::steady_clock::now() < nextFrameDeadline_) { std::this_thread::yield(); }
++            }
++            else
++            {
++                std::this_thread::sleep_until(nextFrameDeadline_);
++            }
+             now = std::chrono::steady_clock::now();
++            const double overshootMs = std::chrono::duration<double, std::milli>(now - nextFrameDeadline_).count();
++            pacing.overshootSum += overshootMs;
++            pacing.overshootMax = std::max(pacing.overshootMax, overshootMs);
++            pacing.slept++;
++        }
++        else
++        {
++            pacing.appLate++;
++            pacing.lateSum += std::chrono::duration<double, std::milli>(now - nextFrameDeadline_).count();
+         }
+         nextFrameDeadline_ += targetFrameTime;
+ 
+@@ -528,10 +595,15 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+             double stddev = std::sqrt(variance);
+             auto mm = std::minmax_element(intervalSamplesMs.begin(), intervalSamplesMs.end());
+             spdlog::info("OXRSys: Session::WaitFrame pacing target={}Hz ({:.2f}ms) "
+-                         "actual mean={:.2f}ms stddev={:.2f}ms min/max={:.2f}/{:.2f}ms (n={})",
++                         "actual mean={:.2f}ms stddev={:.2f}ms min/max={:.2f}/{:.2f}ms (n={}) "
++                         "sleep overshoot mean={:.2f}ms max={:.2f}ms ({} slept) app late {} (mean {:.2f}ms) spin={:.1f}ms",
+                          targetRefreshHz,
+                          std::chrono::duration<double, std::milli>(targetFrameTime).count(),
+-                         mean, stddev, *mm.first, *mm.second, intervalSamplesMs.size());
++                         mean, stddev, *mm.first, *mm.second, intervalSamplesMs.size(),
++                         pacing.slept ? pacing.overshootSum / pacing.slept : 0.0, pacing.overshootMax, pacing.slept,
++                         pacing.appLate, pacing.appLate ? pacing.lateSum / pacing.appLate : 0.0,
++                         Config::Get().GetValues().pacingSpinMs);
++            pacing = PacingDiag{};
+             intervalSamplesMs.clear();
+             lastPacingLog = now;
+         }
+-- 
+2.43.0
+

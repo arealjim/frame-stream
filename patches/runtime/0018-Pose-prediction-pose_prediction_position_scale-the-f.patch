@@ -1,0 +1,123 @@
+From 72e71eb3d75f081d632efe90df43b90dde70f408 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:12:22 +0000
+Subject: [PATCH 18/23] Pose prediction: pose_prediction_position_scale, the
+ fraction of the horizon the head position is predicted over
+
+The head position was always predicted over half the horizon (positionHorizonSeconds = total * 0.5), rotation
+over the whole of it. Worn on the Steam Frame at 90 Hz with the measured 34-53 ms horizon (2026-10-18) that
+left the position 17-27 ms behind the rotation, which the wearer saw as the scene moving with extra parallax on
+lateral head moves while the compositor-drawn panels held still. New toml key pose_prediction_position_scale
+(0-2, default 0.5 = the old behaviour), applied with the horizon; the rotation-coupling floor still scales it
+down during brisk turns.
+
+---
+ runtime/src/Config.cpp           | 4 ++++
+ runtime/src/Config.h             | 5 +++++
+ runtime/src/StreamingServer.cpp  | 2 ++
+ runtime/src/StreamingServer.h    | 1 +
+ runtime/src/TrackingReceiver.cpp | 2 +-
+ runtime/src/TrackingReceiver.h   | 4 ++++
+ 6 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index 83795a5..0b2a377 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -417,6 +417,10 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             {
+                 values.posePredictionHorizonMs = std::max(0.0f, std::min(80.0f, std::stof(value)));
+             }
++            else if (key == "pose_prediction_position_scale")
++            {
++                values.posePredictionPositionScale = std::max(0.0f, std::min(2.0f, std::stof(value)));
++            }
+             else if (key == "pacing_spin_ms")
+             {
+                 values.pacingSpinMs = std::max(0.0f, std::min(8.0f, std::stof(value)));
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index 9941a53..0b30d44 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -65,6 +65,11 @@ struct ConfigValues
+     std::string posePrediction = "fixed";
+     // pose_prediction_horizon_ms: > 0 forces this horizon in either mode (0-80); 0 = off.
+     float posePredictionHorizonMs = 0.0f;
++    // pose_prediction_position_scale: the fraction of the horizon the HEAD POSITION is predicted
++    // over (0-2; default 0.5 = the historical half-horizon, which read as extra parallax on
++    // lateral head moves, 2026-10-18). Rotation always uses the full horizon. The
++    // rotation-coupling floor still scales this down during brisk turns.
++    float posePredictionPositionScale = 0.5f;
+     // Feed the low-latency (rtvc) or software session the BGRA surface directly
+     // instead of a BT.709 video-range 4:2:0 conversion of each frame (about 1 ms
+     // of submit per frame, measured 2026-10-17). Those sessions then write a
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index ba58536..ded32e5 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -622,6 +622,7 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
+     refreshRateHz_ = config.refreshRateHz;
+     posePredictionMeasured_ = config.posePrediction == "measured";
+     posePredictionOverrideMs_ = config.posePredictionHorizonMs;
++    posePredictionPositionScale_ = config.posePredictionPositionScale;
+     spdlog::info("StreamingServer: pose_prediction={}{}", config.posePrediction,
+                  posePredictionOverrideMs_ > 0.0f
+                      ? " (pose_prediction_horizon_ms override " +
+@@ -2807,6 +2808,7 @@ void StreamingServer::UpdatePredictionHorizon()
+         horizonMs = posePredictionOverrideMs_;
+     }
+     trackingReceiver_->SetPredictionHorizonMs(horizonMs);
++    trackingReceiver_->SetPositionHorizonScale(posePredictionPositionScale_);
+ 
+     // What a pose pays after the app fetches it: the uplink + downlink (one RTT: the sample came
+     // up, the frame goes down), the app's render, encode + send, and the client's receive -> eye
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index c54b604..5c5388e 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -257,6 +257,7 @@ class StreamingServer
+     std::atomic<int64_t> lastMeasuredLatencyLogNs_{0};
+     bool posePredictionMeasured_ = false;
+     float posePredictionOverrideMs_ = 0.0f;
++    float posePredictionPositionScale_ = 0.5f;
+     RttProbe rttProbe_;
+ 
+     // Adaptive bitrate state
+diff --git a/runtime/src/TrackingReceiver.cpp b/runtime/src/TrackingReceiver.cpp
+index 83b552b..12c33cd 100644
+--- a/runtime/src/TrackingReceiver.cpp
++++ b/runtime/src/TrackingReceiver.cpp
+@@ -320,7 +320,7 @@ bool TrackingReceiver::GetPredictedPose(oxr::protocol::TrackingPacket& outPacket
+         ? totalHorizonSeconds
+         : totalHorizonSeconds * 0.5f;
+     float controllerRotationHorizonSeconds = totalHorizonSeconds;
+-    float positionHorizonSeconds = totalHorizonSeconds * 0.5f;
++    float positionHorizonSeconds = totalHorizonSeconds * positionHorizonScale_.load();
+ 
+     // Issue: "look-down-moves-forward" (rotation -> translation coupling).
+     // The client-reported head linear velocity during a head rotation is the
+diff --git a/runtime/src/TrackingReceiver.h b/runtime/src/TrackingReceiver.h
+index af3d113..a76ba48 100644
+--- a/runtime/src/TrackingReceiver.h
++++ b/runtime/src/TrackingReceiver.h
+@@ -42,6 +42,9 @@ class TrackingReceiver
+     void InjectPacket(const uint8_t* data, size_t size);
+ 
+     void SetPredictionHorizonMs(float predictionHorizonMs);
++    // Fraction of the horizon the head position is predicted over (pose_prediction_position_scale).
++    void SetPositionHorizonScale(float scale) { positionHorizonScale_.store(std::clamp(scale, 0.0f, 2.0f)); }
++    float GetPositionHorizonScale() const { return positionHorizonScale_.load(); }
+     float GetPredictionHorizonMs() const { return predictionHorizonMs_.load(); }
+ 
+     // Measured prediction (pose_prediction = "measured"). The server measures what a pose pays
+@@ -106,6 +109,7 @@ class TrackingReceiver
+     oxr::protocol::TrackingPacket latestPacket_ = {};
+     std::deque<HistorySample> history_;
+     std::atomic<float> predictionHorizonMs_{0.0f};
++    std::atomic<float> positionHorizonScale_{0.5f};
+     mutable std::atomic<int64_t> lastPredictionDiagnosticNs_{0};
+ 
+     std::atomic<bool> measuredPrediction_{false};
+-- 
+2.43.0
+

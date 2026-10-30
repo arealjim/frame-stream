@@ -1,0 +1,1445 @@
+From 387be34dd722c74e6576d6e94d92ae2bffe14660 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:01:34 +0000
+Subject: [PATCH 47/48] runtime: stream the app's depth to the client as a
+ small grid (positional reprojection)
+
+With depth_grid > 0 (default 64) the runtime advertises
+XR_KHR_composition_layer_depth. When a Vulkan depth swapchain image is
+released, depth_grid evenly spaced full-width rows are copied to a host
+buffer (a ring of fenced slots). xrEndFrame picks up each view's
+XrCompositionLayerDepthInfoKHR; the encode thread reduces the captured rows
+to a grid x grid inverse-distance image per eye (q = 255 * 0.25 m / z, 0 =
+infinitely far; standard, reversed and infinite Z), waiting at most 4 ms for
+the copy. Grids go only to a client that set CLIENT_CAPABILITY_DEPTH_GRID:
+on Wi-Fi as datagrams flagged as render poses whose payload starts with a
+DepthGridHeader, on USB as TcpRecordType::DepthGrid records.
+---
+ CMakeLists.txt                                |   2 +
+ .../include/oxrsys/protocol/Protocol.h        |  23 +
+ runtime/CMakeLists.txt                        |   1 +
+ runtime/src/Config.cpp                        |   5 +
+ runtime/src/Config.h                          |   5 +
+ runtime/src/DepthGrid.cpp                     |  99 +++++
+ runtime/src/DepthGrid.h                       |  79 ++++
+ runtime/src/EntryPoint.cpp                    |   6 +
+ runtime/src/GraphicsTypes.h                   |  19 +
+ runtime/src/Session.cpp                       |  42 ++
+ runtime/src/Session.h                         |   2 +
+ runtime/src/StreamingServer.cpp               | 161 +++++++
+ runtime/src/StreamingServer.h                 |  13 +
+ runtime/src/Swapchain.h                       |  54 +++
+ runtime/src/SwapchainCommon.cpp               |  19 +
+ runtime/src/SwapchainVulkan.cpp               | 409 +++++++++++++++++-
+ tests/TestDepthGrid.cpp                       | 100 +++++
+ tests/TestProtocolLayout.cpp                  |   4 +
+ 18 files changed, 1042 insertions(+), 1 deletion(-)
+ create mode 100644 runtime/src/DepthGrid.cpp
+ create mode 100644 runtime/src/DepthGrid.h
+ create mode 100644 tests/TestDepthGrid.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6c6bb69..a746f8a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -170,6 +170,7 @@ set(OXRSYS_LOGCAT_TEST_ENV
+ 
+ add_executable(oxrsys_runtime_tests
+     tests/TestBoundedDrain.cpp
++    tests/TestDepthGrid.cpp
+     tests/TestClientAdmission.cpp
+     tests/TestSourcePinning.cpp
+     tests/TestClientLiveness.cpp
+@@ -209,6 +210,7 @@ add_executable(oxrsys_runtime_tests
+     runtime/src/VideoCodecSelection.cpp
+     runtime/src/EncoderPathPolicy.cpp
+     runtime/src/VulkanDispatch.cpp
++    runtime/src/DepthGrid.cpp
+ )
+ target_include_directories(oxrsys_runtime_tests PRIVATE
+     runtime/src
+diff --git a/common/protocol/include/oxrsys/protocol/Protocol.h b/common/protocol/include/oxrsys/protocol/Protocol.h
+index 281ec5e..cac4c0e 100644
+--- a/common/protocol/include/oxrsys/protocol/Protocol.h
++++ b/common/protocol/include/oxrsys/protocol/Protocol.h
+@@ -50,6 +50,7 @@ enum class TcpRecordType : uint16_t
+     Disconnect = 0x0007,
+     Audio = 0x0008,
+     Spatial = 0x0009,
++    DepthGrid = 0x000A, // DepthGridHeader + rows * grid bytes
+ };
+ 
+ struct TcpRecordHeader
+@@ -130,6 +131,7 @@ enum ClientCapabilityFlags : uint32_t
+     CLIENT_CAPABILITY_TEN_BIT_ENCODING = 0x00000400, // client can decode HEVC Main10
+     // 0x00000800 is CLIENT_CAPABILITY_FOVEATION_CENTER on the Steam Frame client branch; 0x1000 left free for it.
+     CLIENT_CAPABILITY_PACING_LOCK = 0x00002000,      // LatencyReport ages fit for the server rate lock (pacing_lock_wait_ms)
++    CLIENT_CAPABILITY_DEPTH_GRID = 0x00004000,       // client submits a depth layer from DepthGrid chunks (positional reprojection)
+ };
+ 
+ enum ClientCodecCapabilityFlags : uint32_t
+@@ -263,6 +265,27 @@ enum VideoFlags : uint8_t
+     VIDEO_FLAG_STREAM_END = 0x80,  // The server's session ended: a bare header, totalPackets 0, no payload
+ };
+ 
++// ─── Depth grid (positional reprojection) ────────────────────────────────
++// The app's submitted depth (XR_KHR_composition_layer_depth), reduced to a grid x grid inverse-depth image per eye,
++// sent only to a client that set CLIENT_CAPABILITY_DEPTH_GRID. Value q (0-255) = round(255 * nearMm / z), clamped:
++// 255 = at or nearer than nearMm, 0 = infinitely far. Rows run top to bottom in the eye's image space, the same space
++// as that eye's colour (before foveation). Wi-Fi: a VideoPacketHeader with VIDEO_FLAG_RENDER_POSE and totalPackets 0
++// whose payload starts with this header (a render pose is 28 bytes and has no magic); USB: TcpRecordType::DepthGrid.
++constexpr uint32_t DEPTH_GRID_MAGIC = 0x44475244; // "DRGD" little-endian
++constexpr uint32_t DEPTH_GRID_MAX_SIZE = 128;
++
++struct DepthGridHeader
++{
++    uint32_t magic = DEPTH_GRID_MAGIC;
++    uint32_t frameIndex = 0;  // the server's frame counter at capture (diagnostic; the client uses the newest)
++    uint8_t eye = 0;          // 0 left, 1 right
++    uint8_t grid = 0;         // columns = rows of the full grid
++    uint8_t row0 = 0;         // first row in this chunk
++    uint8_t rows = 0;         // rows in this chunk; payload after the header is rows * grid bytes
++    uint16_t nearMm = 250;    // the distance q = 255 stands for
++    uint16_t reserved = 0;
++};
++
+ struct AudioPacketHeader
+ {
+     int64_t presentationTimeNs = 0;
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index ad7bb25..e06655b 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -6,6 +6,7 @@ endif()
+ 
+ add_library(oxrsys_runtime SHARED
+     src/Config.cpp
++    src/DepthGrid.cpp
+     src/EntryPoint.cpp
+     src/Runtime.cpp
+     src/RuntimeStatus.cpp
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index 2576ba0..2e8ea4a 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -485,6 +485,10 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             {
+                 values.foveationBoxFilter = ParseBool(value);
+             }
++            else if (key == "depth_grid")
++            {
++                values.depthGrid = static_cast<uint32_t>(std::max(0, std::min(128, std::stoi(value))));
++            }
+             else if (key == "encoder_min_qp")
+             {
+                 values.encoderMinQp = static_cast<uint32_t>(std::max(0, std::min(51, std::stoi(value))));
+@@ -921,6 +925,7 @@ void Config::SetupLogging()
+                   values_.appAlphaBlendPassthrough, values_.occlusionMode,
+                   values_.spatialEnabled, values_.spatialAnchors, values_.spatialScene,
+                   values_.spatialPersistence, values_.headsetAudio);
++    spdlog::info("  depth_grid={}", values_.depthGrid);
+     LogConfigRead();
+ }
+ 
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index f6f074f..d74246b 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -39,6 +39,11 @@ struct ConfigValues
+     // scenes. Measured 2026-10-18, M5 Pro, 2560x1120 HEVC, bench "smooth" scene at 50 Mbps:
+     // 38.2 -> 49.8 Mbps actual, callback p50 9.6 -> 10.1 ms.
+     uint32_t encoderMinQp = 0;
++    // depth_grid: positional reprojection. When the app submits depth (XR_KHR_composition_layer_depth)
++    // and the client advertises CLIENT_CAPABILITY_DEPTH_GRID, each frame's depth goes to the client as a
++    // depth_grid x depth_grid inverse-depth image per eye, which it submits to its compositor so the warp
++    // corrects head translation per pixel. 0 = off (the extension is then not advertised). Max 128.
++    uint32_t depthGrid = 64;
+     // foveation_box_filter: the foveation kernel averages each output pixel's source footprint with
+     // round(footprint) bilinear taps per axis (up to 4x4) instead of one centre tap. Measured 2026-10-19
+     // on the 512-texel test card (centre of the eye): bit-identical at native size (footprint 1); at a
+diff --git a/runtime/src/DepthGrid.cpp b/runtime/src/DepthGrid.cpp
+new file mode 100644
+index 0000000..e25f106
+--- /dev/null
++++ b/runtime/src/DepthGrid.cpp
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include "DepthGrid.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++
++namespace oxrsys::depthgrid
++{
++
++float InverseDistance(float depth, const DepthRange& range)
++{
++    const float span = range.maxDepth - range.minDepth;
++    if (!std::isfinite(depth) || !(span > 0.0f) || !(range.nearZ > 0.0f) || !(range.farZ > 0.0f) ||
++        range.nearZ == range.farZ)
++    {
++        return -1.0f;
++    }
++    const float n = std::clamp((depth - range.minDepth) / span, 0.0f, 1.0f);
++    // Perspective depth is linear in 1/z between the two planes; an infinite plane is 1/z = 0.
++    // Reversed Z puts the infinite plane at minDepth (nearZ = +inf).
++    const float invNear = std::isinf(range.nearZ) ? 0.0f : 1.0f / range.nearZ;
++    const float invFar = std::isinf(range.farZ) ? 0.0f : 1.0f / range.farZ;
++    return (1.0f - n) * invNear + n * invFar;
++}
++
++float ReadTexel(const RowsView& rows, uint32_t row, uint32_t x)
++{
++    const uint8_t* p = rows.data + (static_cast<size_t>(row) * rows.width + x) * rows.bytesPerTexel;
++    switch (rows.kind)
++    {
++    case TexelKind::Float32:
++    {
++        float v;
++        std::memcpy(&v, p, sizeof(v));
++        return v;
++    }
++    case TexelKind::Unorm16:
++    {
++        uint16_t v;
++        std::memcpy(&v, p, sizeof(v));
++        return static_cast<float>(v) / 65535.0f;
++    }
++    case TexelKind::Unorm24:
++    {
++        uint32_t v;
++        std::memcpy(&v, p, sizeof(v));
++        return static_cast<float>(v & 0x00ffffffu) / 16777215.0f;
++    }
++    }
++    return 0.0f;
++}
++
++bool Reduce(const RowsView& rows, uint32_t rectX, uint32_t rectY, uint32_t rectW, uint32_t rectH,
++            const DepthRange& range, uint32_t grid, float nearM, std::vector<uint8_t>& out)
++{
++    if (rows.data == nullptr || rows.width == 0 || rows.imageHeight == 0 || rows.capturedRows == 0 ||
++        grid == 0 || rectW == 0 || rectH == 0 || rectX + rectW > rows.width ||
++        rectY + rectH > rows.imageHeight || !(nearM > 0.0f) || InverseDistance(range.minDepth, range) < 0.0f)
++    {
++        return false;
++    }
++
++    std::vector<uint8_t> result(static_cast<size_t>(grid) * grid, 0);
++    for (uint32_t gy = 0; gy < grid; ++gy)
++    {
++        // The image row at this cell's centre, then the captured row nearest to it.
++        const double cy = rectY + (gy + 0.5) * rectH / grid;
++        uint32_t best = 0;
++        double bestDist = 1e30;
++        for (uint32_t i = 0; i < rows.capturedRows; ++i)
++        {
++            const double d = std::fabs(RowForCapture(i, rows.capturedRows, rows.imageHeight) + 0.5 - cy);
++            if (d < bestDist)
++            {
++                bestDist = d;
++                best = i;
++            }
++        }
++        for (uint32_t gx = 0; gx < grid; ++gx)
++        {
++            const uint32_t x0 = rectX + static_cast<uint32_t>(static_cast<uint64_t>(gx) * rectW / grid);
++            uint32_t x1 = rectX + static_cast<uint32_t>(static_cast<uint64_t>(gx + 1) * rectW / grid);
++            x1 = std::max(x1, x0 + 1);
++            float nearest = 0.0f; // 1/m; 0 = infinitely far
++            for (uint32_t x = x0; x < x1; ++x)
++            {
++                nearest = std::max(nearest, InverseDistance(ReadTexel(rows, best, x), range));
++            }
++            const float q = std::round(255.0f * nearM * nearest);
++            result[static_cast<size_t>(gy) * grid + gx] = static_cast<uint8_t>(std::clamp(q, 0.0f, 255.0f));
++        }
++    }
++    out = std::move(result);
++    return true;
++}
++
++} // namespace oxrsys::depthgrid
+diff --git a/runtime/src/DepthGrid.h b/runtime/src/DepthGrid.h
+new file mode 100644
+index 0000000..c240c80
+--- /dev/null
++++ b/runtime/src/DepthGrid.h
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#pragma once
++
++// Positional reprojection: the app's submitted depth (XR_KHR_composition_layer_depth) reduced to a
++// small inverse-depth grid per eye for a client whose compositor warps per pixel from depth.
++// The swapchain copies a few evenly spaced full-width rows of the released depth image to host
++// memory (one copy per release, no full readback); this file turns those rows into the grid.
++
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <vector>
++
++namespace oxrsys::depthgrid
++{
++
++enum class TexelKind : uint8_t
++{
++    Float32,   // VK_FORMAT_D32_SFLOAT, D32_SFLOAT_S8 (depth aspect), MTLPixelFormatDepth32Float
++    Unorm16,   // VK_FORMAT_D16_UNORM
++    Unorm24,   // VK_FORMAT_D24_UNORM_S8 / X8_D24 (depth aspect: low 24 bits of a 32-bit word)
++};
++
++// Captured rows of one array layer of a depth image. Row i holds image row RowForCapture(i, ...).
++struct RowsView
++{
++    const uint8_t* data = nullptr;
++    uint32_t width = 0;          // image width = texels per captured row
++    uint32_t imageHeight = 0;
++    uint32_t capturedRows = 0;
++    uint32_t bytesPerTexel = 4;
++    TexelKind kind = TexelKind::Float32;
++};
++
++// A release-time row capture still in flight. waitRows blocks up to timeoutNs for the GPU copy and
++// then points the view at host memory that stays valid while this source (its lifetime) is held.
++struct RowsSource
++{
++    std::shared_ptr<void> lifetime = {};
++    std::function<bool(uint64_t timeoutNs, RowsView& rows)> waitRows = {};
++
++    bool IsValid() const { return lifetime != nullptr && static_cast<bool>(waitRows); }
++};
++
++// XrCompositionLayerDepthInfoKHR's mapping from a depth value to distance.
++struct DepthRange
++{
++    float minDepth = 0.0f;
++    float maxDepth = 1.0f;
++    float nearZ = 0.1f;   // distance (m) at minDepth; may exceed farZ (reversed Z)
++    float farZ = 100.0f;  // distance (m) at maxDepth; may be +inf
++};
++
++// The image row the i-th captured row comes from (evenly spaced, cell centres).
++inline uint32_t RowForCapture(uint32_t i, uint32_t capturedRows, uint32_t imageHeight)
++{
++    if (capturedRows == 0 || imageHeight == 0)
++    {
++        return 0;
++    }
++    const uint64_t y = (2ull * i + 1ull) * imageHeight / (2ull * capturedRows);
++    return static_cast<uint32_t>(y < imageHeight ? y : imageHeight - 1);
++}
++
++// 1 / distance (1/m) for a raw depth value, or a negative number when it is not usable.
++float InverseDistance(float depth, const DepthRange& range);
++
++// Normalised depth of texel x in a captured row.
++float ReadTexel(const RowsView& rows, uint32_t row, uint32_t x);
++
++// grid x grid bytes, row-major top to bottom, q = round(255 * nearM / distance) clamped to 0..255,
++// over the sub-rectangle (x, y, w, h) of the image. Each cell takes the NEAREST depth found along
++// the captured row closest to its centre (a foreground edge keeps its own depth). Returns false
++// (out untouched) when the view, rect or range is unusable.
++bool Reduce(const RowsView& rows, uint32_t rectX, uint32_t rectY, uint32_t rectW, uint32_t rectH,
++            const DepthRange& range, uint32_t grid, float nearM, std::vector<uint8_t>& out);
++
++} // namespace oxrsys::depthgrid
+diff --git a/runtime/src/EntryPoint.cpp b/runtime/src/EntryPoint.cpp
+index ff255f4..f0aeb65 100644
+--- a/runtime/src/EntryPoint.cpp
++++ b/runtime/src/EntryPoint.cpp
+@@ -263,6 +263,12 @@ static std::vector<ExtensionInfo> GetSupportedExtensionInfos()
+     extensions.push_back({XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_vulkan_enable_SPEC_VERSION});
+     extensions.push_back({XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, XR_KHR_vulkan_enable2_SPEC_VERSION});
+ #endif
++    // Positional reprojection: the app's depth reaches the client as a grid (Config.h depth_grid).
++    if (Config::Get().GetValues().depthGrid > 0)
++    {
++        extensions.push_back(
++            {XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME, XR_KHR_composition_layer_depth_SPEC_VERSION});
++    }
+     return extensions;
+ }
+ 
+diff --git a/runtime/src/GraphicsTypes.h b/runtime/src/GraphicsTypes.h
+index 7a6bbac..50555ca 100644
+--- a/runtime/src/GraphicsTypes.h
++++ b/runtime/src/GraphicsTypes.h
+@@ -2,6 +2,8 @@
+ 
+ #pragma once
+ 
++#include "DepthGrid.h"
++
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -154,12 +156,27 @@ struct FrameOverlayLayer
+                                       // showing through where the projection's alpha is below 1
+ };
+ 
++// One eye's submitted depth (XR_KHR_composition_layer_depth): the swapchain's row capture, the
++// view's subImage rect in that depth image, and the app's depth-to-distance mapping.
++struct FrameDepthSource
++{
++    oxrsys::depthgrid::RowsSource rows = {};
++    uint32_t rectX = 0;
++    uint32_t rectY = 0;
++    uint32_t rectWidth = 0;
++    uint32_t rectHeight = 0;
++    oxrsys::depthgrid::DepthRange range = {};
++
++    bool IsValid() const { return rows.IsValid(); }
++};
++
+ struct FrameSource
+ {
+     FrameImageSource left = {};
+     FrameImageSource right = {};
+     bool alphaBlend = false;
+     std::vector<FrameOverlayLayer> overlays = {}; // back to front in submit order; underlays first
++    FrameDepthSource depth[2] = {};                // per eye; invalid unless the app submitted depth
+ 
+     bool IsStereoValid() const
+     {
+@@ -172,5 +189,7 @@ struct FrameSource
+         right.Reset();
+         alphaBlend = false;
+         overlays.clear();
++        depth[0] = {};
++        depth[1] = {};
+     }
+ };
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index b652742..66439cc 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -1028,6 +1028,7 @@ XrResult Session::ValidateProjectionLayer(const XrCompositionLayerProjection& la
+         imageSource.sourceY = static_cast<uint32_t>(view.subImage.imageRect.offset.y);
+         imageSource.sourceWidth = static_cast<uint32_t>(view.subImage.imageRect.extent.width);
+         imageSource.sourceHeight = static_cast<uint32_t>(view.subImage.imageRect.extent.height);
++        CollectProjectionDepth(view, frameSource.depth[viewIndex]);
+         if (viewIndex == 0)
+         {
+             frameSource.left = std::move(imageSource);
+@@ -1041,6 +1042,47 @@ XrResult Session::ValidateProjectionLayer(const XrCompositionLayerProjection& la
+     return XR_SUCCESS;
+ }
+ 
++// XR_KHR_composition_layer_depth on a projection view: the depth swapchain's release-time row
++// capture plus its mapping, for positional reprojection on the client. Depth the runtime cannot use
++// (no capture, bad rect or range) is ignored rather than failing the app's frame.
++void Session::CollectProjectionDepth(const XrCompositionLayerProjectionView& view,
++                                     FrameDepthSource& depth) const
++{
++    depth = {};
++    for (auto* next = reinterpret_cast<const XrBaseInStructure*>(view.next); next != nullptr;
++         next = next->next)
++    {
++        if (next->type != XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR)
++        {
++            continue;
++        }
++        const auto& info = *reinterpret_cast<const XrCompositionLayerDepthInfoKHR*>(next);
++        auto* swapchain =
++            Runtime::Get().FromHandle<Swapchain>(reinterpret_cast<uint64_t>(info.subImage.swapchain));
++        const XrRect2Di& rect = info.subImage.imageRect;
++        if (swapchain == nullptr || rect.offset.x < 0 || rect.offset.y < 0 ||
++            rect.extent.width <= 0 || rect.extent.height <= 0)
++        {
++            return;
++        }
++        depth.rows = swapchain->GetLastReleasedDepthRows(info.subImage.imageArrayIndex);
++        depth.rectX = static_cast<uint32_t>(rect.offset.x);
++        depth.rectY = static_cast<uint32_t>(rect.offset.y);
++        depth.rectWidth = static_cast<uint32_t>(rect.extent.width);
++        depth.rectHeight = static_cast<uint32_t>(rect.extent.height);
++        depth.range = {info.minDepth, info.maxDepth, info.nearZ, info.farZ};
++        static std::atomic_bool loggedFirstDepth{false};
++        if (!loggedFirstDepth.exchange(true))
++        {
++            spdlog::info("OXRSys: app submits depth: {}x{} at {},{} layer {} min={} max={} nearZ={} farZ={} rows={}",
++                         rect.extent.width, rect.extent.height, rect.offset.x, rect.offset.y,
++                         info.subImage.imageArrayIndex, info.minDepth, info.maxDepth, info.nearZ,
++                         info.farZ, depth.rows.IsValid() ? "captured" : "none");
++        }
++        return;
++    }
++}
++
+ XrResult Session::ValidateQuadLayer(const XrCompositionLayerQuad& layer) const
+ {
+     auto* space = Runtime::Get().FromHandle<Space>(reinterpret_cast<uint64_t>(layer.space));
+diff --git a/runtime/src/Session.h b/runtime/src/Session.h
+index 551c8e7..3bcb647 100644
+--- a/runtime/src/Session.h
++++ b/runtime/src/Session.h
+@@ -120,6 +120,8 @@ class Session
+     XrResult ValidateSwapchainSubImage(const XrSwapchainSubImage& subImage) const;
+     XrResult ValidateProjectionLayer(const XrCompositionLayerProjection& layer,
+                                      FrameSource& frameSource) const;
++    void CollectProjectionDepth(const XrCompositionLayerProjectionView& view,
++                                FrameDepthSource& depth) const;
+     XrResult ValidateQuadLayer(const XrCompositionLayerQuad& layer) const;
+     XrResult ValidateCylinderLayer(const XrCompositionLayerCylinderKHR& layer) const;
+     // Turns the quad and cylinder layers into overlays drawn into each eye before
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index 50eb990..07e7fe3 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -1539,6 +1539,14 @@ void StreamingServer::EncodeThread()
+             memcpy(encodedFrame->headOrientation, frame.headOrientation, sizeof(float) * 4);
+         }
+ 
++        if (config->depthGrid > 0 && clientSupportsDepthGrid_.load() &&
++            (frame.source.depth[0].IsValid() || frame.source.depth[1].IsValid()))
++        {
++            ReduceFrameDepth(frame.source, config->depthGrid, *encodedFrame);
++        }
++        frame.source.depth[0] = {};
++        frame.source.depth[1] = {};
++
+         const uint32_t submittedFrameIndex = frame.frameIndex;
+         bool encoded = encoder->EncodeStereo(
+             std::move(frame.source),
+@@ -1880,6 +1888,8 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
+     submitToSentMs_.store(0.0f);
+     clientSupportsPacingLock_.store(
+         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_PACING_LOCK));
++    clientSupportsDepthGrid_.store(
++        HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_DEPTH_GRID));
+     clientSupportsStreamReconfigure_.store(
+         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_STREAM_RECONFIGURE));
+     const bool clientSupportsPassthrough =
+@@ -2149,6 +2159,8 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
+     submitToSentMs_.store(0.0f);
+     clientSupportsPacingLock_.store(
+         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_PACING_LOCK));
++    clientSupportsDepthGrid_.store(
++        HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_DEPTH_GRID));
+     clientSupportsStreamReconfigure_.store(
+         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_STREAM_RECONFIGURE));
+     const bool clientSupportsPassthrough =
+@@ -3232,6 +3244,10 @@ void StreamingServer::SendEncodedVideoFrame(const EncodedVideoFrame& frame)
+     {
+         SendRenderPosePacket(frame);
+     }
++    if (frame.depthGrid > 0)
++    {
++        SendDepthGrid(frame);
++    }
+ 
+     // Packet pacing: the frame's datagrams (data + FEC parity, over all its NALs)
+     // spread evenly over send_pacing_ms. Config is re-read about once a second so
+@@ -3401,6 +3417,151 @@ void StreamingServer::SendRenderPosePacket(const EncodedVideoFrame& frame)
+                                    sizeof(destAddr));
+ }
+ 
++void StreamingServer::ReduceFrameDepth(const FrameSource& source, uint32_t grid,
++                                       EncodedVideoFrame& out)
++{
++    // The depth copy was submitted at the depth image's release, before the colour image's, so it
++    // is normally done by now; never hold the encoder for long on it.
++    constexpr uint64_t kDepthWaitNs = 4'000'000;
++    constexpr float kNearM = 0.25f; // DepthGridHeader::nearMm default
++    const int64_t startNs = SteadyClockNowNs();
++    bool any = false;
++    for (int eye = 0; eye < 2; ++eye)
++    {
++        const FrameDepthSource& depth = source.depth[eye];
++        oxrsys::depthgrid::RowsView rows;
++        if (depth.IsValid() && depth.rows.waitRows(kDepthWaitNs, rows) &&
++            oxrsys::depthgrid::Reduce(rows, depth.rectX, depth.rectY, depth.rectWidth,
++                                      depth.rectHeight, depth.range, grid, kNearM, out.depth[eye]))
++        {
++            any = true;
++        }
++        else
++        {
++            out.depth[eye].clear();
++        }
++    }
++    out.depthGrid = any ? grid : 0;
++
++    const int64_t nowNs = SteadyClockNowNs();
++    const double ms = static_cast<double>(nowNs - startNs) / 1.0e6;
++    if (any)
++    {
++        ++depthGridFrames_;
++        depthGridMsSum_ += ms;
++        depthGridMsMax_ = std::max(depthGridMsMax_, ms);
++    }
++    else
++    {
++        ++depthGridMisses_;
++    }
++    if (nowNs - depthGridLogNs_ >= 1'000'000'000)
++    {
++        spdlog::info("StreamingServer: depth grid {}x{} frames={} misses={} reduce avg={:.2f}ms max={:.2f}ms",
++                     grid, grid, depthGridFrames_, depthGridMisses_,
++                     depthGridFrames_ ? depthGridMsSum_ / depthGridFrames_ : 0.0, depthGridMsMax_);
++        depthGridFrames_ = 0;
++        depthGridMisses_ = 0;
++        depthGridMsSum_ = 0.0;
++        depthGridMsMax_ = 0.0;
++        depthGridLogNs_ = nowNs;
++    }
++}
++
++void StreamingServer::SendDepthGrid(const EncodedVideoFrame& frame)
++{
++    std::string clientIp;
++    SocketHandle videoSocket = oxrsys::runtime_socket::InvalidSocket;
++    bool videoUsesTcp = false;
++    {
++        std::lock_guard<std::mutex> lock(packetDispatchState_->mutex);
++        if (!packetDispatchState_->acceptingPackets)
++        {
++            return;
++        }
++        clientIp = packetDispatchState_->clientIp;
++        videoSocket = packetDispatchState_->videoSocket;
++        videoUsesTcp = packetDispatchState_->videoUsesTcp;
++    }
++    if (!oxrsys::runtime_socket::IsValid(videoSocket) || (!videoUsesTcp && clientIp.empty()))
++    {
++        return;
++    }
++
++    const uint32_t grid = frame.depthGrid;
++    // Rows per datagram: the whole chunk under one MTU-sized payload.
++    const uint32_t rowsPerChunk = std::max<uint32_t>(
++        1, static_cast<uint32_t>((oxr::protocol::MAX_PACKET_PAYLOAD - sizeof(oxr::protocol::DepthGridHeader)) / grid));
++    sockaddr_in destAddr = {};
++    destAddr.sin_family = AF_INET;
++    destAddr.sin_port = htons(oxr::protocol::VIDEO_PORT);
++    if (!videoUsesTcp)
++    {
++        inet_pton(AF_INET, clientIp.c_str(), &destAddr.sin_addr);
++    }
++
++    std::vector<uint8_t> buf;
++    for (uint8_t eye = 0; eye < 2; ++eye)
++    {
++        const std::vector<uint8_t>& data = frame.depth[eye];
++        if (data.size() != static_cast<size_t>(grid) * grid)
++        {
++            continue;
++        }
++        if (videoUsesTcp)
++        {
++            // One record per eye: the TCP record carries the whole grid.
++            oxr::protocol::DepthGridHeader header = {};
++            header.frameIndex = frame.frameIndex;
++            header.eye = eye;
++            header.grid = static_cast<uint8_t>(grid);
++            header.row0 = 0;
++            header.rows = static_cast<uint8_t>(grid);
++            buf.resize(sizeof(header) + data.size());
++            memcpy(buf.data(), &header, sizeof(header));
++            memcpy(buf.data() + sizeof(header), data.data(), data.size());
++            std::lock_guard<std::mutex> sendLock(packetDispatchState_->sendMutex);
++            if (!SendTcpRecord(videoSocket, oxr::protocol::TcpRecordType::DepthGrid,
++                               buf.data(), buf.size()))
++            {
++                videoTcpSendFailures_.fetch_add(1);
++                MarkTcpVideoSendFailed(packetDispatchState_, videoSocket);
++                return;
++            }
++            continue;
++        }
++        for (uint32_t row0 = 0; row0 < grid; row0 += rowsPerChunk)
++        {
++            const uint32_t rows = std::min(rowsPerChunk, grid - row0);
++            oxr::protocol::DepthGridHeader header = {};
++            header.frameIndex = frame.frameIndex;
++            header.eye = eye;
++            header.grid = static_cast<uint8_t>(grid);
++            header.row0 = static_cast<uint8_t>(row0);
++            header.rows = static_cast<uint8_t>(rows);
++            // A render-pose-flagged datagram with no video packets: a client without the depth
++            // capability never gets one (the grid is only sent to a client that advertised it).
++            oxr::protocol::VideoPacketHeader packet = {};
++            packet.frameIndex = frame.frameIndex;
++            packet.packetIndex = 0;
++            packet.totalPackets = 0;
++            packet.payloadSize = static_cast<uint16_t>(sizeof(header) + rows * grid);
++            packet.flags = oxr::protocol::VIDEO_FLAG_RENDER_POSE;
++            packet.codec = static_cast<uint8_t>(frame.codec);
++            packet.presentationTimeNs = frame.timestampNs;
++            buf.resize(sizeof(packet) + sizeof(header) + rows * grid);
++            memcpy(buf.data(), &packet, sizeof(packet));
++            memcpy(buf.data() + sizeof(packet), &header, sizeof(header));
++            memcpy(buf.data() + sizeof(packet) + sizeof(header), data.data() + row0 * grid, rows * grid);
++            if (oxrsys::runtime_socket::SendTo(videoSocket, buf.data(), buf.size(), kBestEffortSendFlags,
++                                               (sockaddr*)&destAddr, sizeof(destAddr)) < 0)
++            {
++                videoUdpSendFailures_.fetch_add(1);
++            }
++        }
++    }
++}
++
+ void StreamingServer::SendNalUnit(const std::shared_ptr<PacketDispatchState>& dispatchState,
+                                   uint32_t frameIndex, const uint8_t* data, size_t size,
+                                   bool isKeyframe, bool alphaBlend, int64_t timestampNs,
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index dc822ca..45f4409 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -147,6 +147,9 @@ class StreamingServer
+         float headPosition[3] = {};
+         float headOrientation[4] = {0, 0, 0, 1};
+         std::vector<EncodedNalUnit> nals;
++        // Positional reprojection: grid x grid inverse-depth bytes per eye (DepthGridHeader), empty = none.
++        uint32_t depthGrid = 0;
++        std::vector<uint8_t> depth[2];
+     };
+ 
+     struct CallbackAccess
+@@ -232,6 +235,9 @@ class StreamingServer
+     void ClearVideoSendQueue();
+     void SendEncodedVideoFrame(const EncodedVideoFrame& frame);
+     void SendRenderPosePacket(const EncodedVideoFrame& frame);
++    void SendDepthGrid(const EncodedVideoFrame& frame);
++    // Waits (bounded) for the frame's depth-row copies and reduces them to the client's grids.
++    void ReduceFrameDepth(const FrameSource& source, uint32_t grid, EncodedVideoFrame& out);
+     bool StartUsbTcpListeners();
+     void SendUsbDisconnectBestEffort();
+     void SendStreamEndBestEffort();
+@@ -252,6 +258,13 @@ class StreamingServer
+     std::atomic_bool clientSupportsMixedRealityPassthrough_{false};
+     std::atomic_bool clientSupportsSpatialEntity_{false};
+     std::atomic_bool clientSupportsPacingLock_{false};
++    std::atomic_bool clientSupportsDepthGrid_{false};
++    // Depth grid telemetry, logged once a second by the encode thread.
++    uint32_t depthGridFrames_ = 0;
++    uint32_t depthGridMisses_ = 0;
++    double depthGridMsSum_ = 0.0;
++    double depthGridMsMax_ = 0.0;
++    int64_t depthGridLogNs_ = 0;
+     // LatencyReports with a non-finite or absurd field are dropped (they fed atomics the rate
+     // lock and the prediction horizon read); logged at most once per 5 s.
+     std::atomic<int64_t> lastRejectedLatencyReportLogNs_{0};
+diff --git a/runtime/src/Swapchain.h b/runtime/src/Swapchain.h
+index f41a033..9b06d73 100644
+--- a/runtime/src/Swapchain.h
++++ b/runtime/src/Swapchain.h
+@@ -36,6 +36,13 @@ struct VulkanDeviceFunctions
+     PFN_vkResetFences resetFences = nullptr;
+     PFN_vkWaitForFences waitForFences = nullptr;
+     PFN_vkGetDeviceQueue getDeviceQueue = nullptr;
++    // Depth rows for positional reprojection (DepthGrid.h)
++    PFN_vkCreateBuffer createBuffer = nullptr;
++    PFN_vkDestroyBuffer destroyBuffer = nullptr;
++    PFN_vkGetBufferMemoryRequirements getBufferMemoryRequirements = nullptr;
++    PFN_vkBindBufferMemory bindBufferMemory = nullptr;
++    PFN_vkMapMemory mapMemory = nullptr;
++    PFN_vkCmdCopyImageToBuffer cmdCopyImageToBuffer = nullptr;
+ };
+ #endif
+ #include <vector>
+@@ -47,6 +54,7 @@ struct VulkanDeviceFunctions
+ #include <chrono>
+ #include <cstddef>
+ 
++#include "DepthGrid.h"
+ #include "SnapshotLeasePool.h"
+ 
+ struct SwapchainStagingSlotState
+@@ -113,6 +121,10 @@ class Swapchain
+     // release-time snapshots so encoding can wait/read outside xrEndFrame.
+     FrameImageSource GetLastReleasedFrameImageSource(uint32_t arrayIndex) const;
+ 
++    // A depth swapchain's release-time row capture for one array layer (positional reprojection);
++    // invalid unless this is a Vulkan depth swapchain, depth_grid > 0 and a client is streaming.
++    oxrsys::depthgrid::RowsSource GetLastReleasedDepthRows(uint32_t arrayIndex) const;
++
+     uint32_t GetArraySize() const
+     {
+         return arraySize_;
+@@ -160,6 +172,42 @@ class Swapchain
+         // Existing waits retain a lease and are covered by the bounded drain.
+         std::atomic_bool stopping{false};
+     };
++
++    // Host-visible buffers that each receive a few full-width rows of every array layer of a
++    // released depth image (DepthGrid.h). Same lease + fence discipline as the snapshot pool.
++    struct VulkanDepthSlot
++    {
++        VkBuffer buffer = VK_NULL_HANDLE;
++        VkDeviceMemory memory = VK_NULL_HANDLE;
++        void* mapped = nullptr;
++        VkCommandPool commandPool = VK_NULL_HANDLE;
++        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
++        VkFence fence = VK_NULL_HANDLE;
++        bool fenceSubmitted = false;
++    };
++
++    struct VulkanDepthPool
++    {
++        explicit VulkanDepthPool(size_t slotCount)
++            : leases(slotCount), slots(slotCount)
++        {
++        }
++
++        SnapshotLeasePool leases;
++        std::vector<VulkanDepthSlot> slots;
++        VulkanGraphicsContext context = {};
++        PFN_vkDestroyCommandPool destroyCommandPool = nullptr;
++        PFN_vkDestroyBuffer destroyBuffer = nullptr;
++        PFN_vkFreeMemory freeMemory = nullptr;
++        PFN_vkDestroyFence destroyFence = nullptr;
++        PFN_vkWaitForFences waitForFences = nullptr;
++        uint32_t capturedRows = 0;
++        uint32_t width = 0;
++        uint32_t imageHeight = 0;
++        uint32_t bytesPerTexel = 4;
++        oxrsys::depthgrid::TexelKind kind = oxrsys::depthgrid::TexelKind::Float32;
++        std::atomic_bool stopping{false};
++    };
+ #endif
+ 
+ private:
+@@ -189,6 +237,10 @@ class Swapchain
+     bool DestroyVulkanResources();
+     void SnapshotVulkanReleasedImage(bool requested);
+     bool InitVulkanSnapshotPool();
++    bool InitVulkanDepthPool(uint32_t capturedRows);
++    void CaptureVulkanDepthRows(bool requested);
++    bool DrainVulkanDepthPool(std::chrono::nanoseconds timeout);
++    void DestroyVulkanDepthPoolResources();
+     bool DrainVulkanSnapshotPool(std::chrono::nanoseconds timeout);
+     void DestroyVulkanSnapshotPoolResources();
+ #endif
+@@ -228,6 +280,8 @@ class Swapchain
+     std::vector<uint64_t> vkMemories_; // VkDeviceMemory handles
+     std::vector<FrameImageSource> lastVulkanSnapshots_;
+     std::shared_ptr<VulkanSnapshotPool> vulkanSnapshotPool_ = {};
++    std::vector<oxrsys::depthgrid::RowsSource> lastVulkanDepthRows_;
++    std::shared_ptr<VulkanDepthPool> vulkanDepthPool_ = {};
+     bool resourcesDestroyed_ = false;
+     std::mutex teardownMutex_;
+ 
+diff --git a/runtime/src/SwapchainCommon.cpp b/runtime/src/SwapchainCommon.cpp
+index 66d717a..18a9996 100644
+--- a/runtime/src/SwapchainCommon.cpp
++++ b/runtime/src/SwapchainCommon.cpp
+@@ -238,11 +238,30 @@ XrResult Swapchain::ReleaseImage(const XrSwapchainImageReleaseInfo* releaseInfo)
+     if (graphicsApi_ == GraphicsApi::Vulkan)
+     {
+         SnapshotVulkanReleasedImage(snapshotRequested);
++        if (vulkanDepthPool_ != nullptr)
++        {
++            CaptureVulkanDepthRows(snapshotRequested);
++        }
+     }
+ #endif
+     return XR_SUCCESS;
+ }
+ 
++oxrsys::depthgrid::RowsSource Swapchain::GetLastReleasedDepthRows(uint32_t arrayIndex) const
++{
++#ifdef XR_USE_GRAPHICS_API_VULKAN
++    std::scoped_lock lock(stateMutex_);
++    if (graphicsApi_ == GraphicsApi::Vulkan && hasReleasedImage_ &&
++        arrayIndex < lastVulkanDepthRows_.size())
++    {
++        return lastVulkanDepthRows_[arrayIndex];
++    }
++#else
++    (void)arrayIndex;
++#endif
++    return {};
++}
++
+ void* Swapchain::GetLastReleasedTexture() const
+ {
+ #ifdef XR_USE_GRAPHICS_API_METAL
+diff --git a/runtime/src/SwapchainVulkan.cpp b/runtime/src/SwapchainVulkan.cpp
+index 6c61e07..d2dbb91 100644
+--- a/runtime/src/SwapchainVulkan.cpp
++++ b/runtime/src/SwapchainVulkan.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ #include "Swapchain.h"
++#include "Config.h"
+ #include "Runtime.h"
+ #include "SwapchainCreateValidation.h"
+ #include "VulkanDispatch.h"
+@@ -73,6 +74,14 @@ std::shared_ptr<const VulkanDeviceFunctions> LoadDeviceFunctions(VkDevice device
+     functions->resetFences = reinterpret_cast<PFN_vkResetFences>(get("vkResetFences"));
+     functions->waitForFences = reinterpret_cast<PFN_vkWaitForFences>(get("vkWaitForFences"));
+     functions->getDeviceQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(get("vkGetDeviceQueue"));
++    functions->createBuffer = reinterpret_cast<PFN_vkCreateBuffer>(get("vkCreateBuffer"));
++    functions->destroyBuffer = reinterpret_cast<PFN_vkDestroyBuffer>(get("vkDestroyBuffer"));
++    functions->getBufferMemoryRequirements =
++        reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(get("vkGetBufferMemoryRequirements"));
++    functions->bindBufferMemory = reinterpret_cast<PFN_vkBindBufferMemory>(get("vkBindBufferMemory"));
++    functions->mapMemory = reinterpret_cast<PFN_vkMapMemory>(get("vkMapMemory"));
++    functions->cmdCopyImageToBuffer =
++        reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(get("vkCmdCopyImageToBuffer"));
+     return functions;
+ }
+ 
+@@ -110,6 +119,44 @@ bool IsVulkanDepthFormat(int64_t format)
+            vkFormat == VK_FORMAT_D32_SFLOAT_S8_UINT;
+ }
+ 
++bool RequiredVulkanDepthRowFunctionsAvailable(const VulkanDeviceFunctions& functions)
++{
++    return functions.createBuffer && functions.destroyBuffer &&
++           functions.getBufferMemoryRequirements && functions.bindBufferMemory &&
++           functions.mapMemory && functions.cmdCopyImageToBuffer &&
++           functions.allocateMemory && functions.freeMemory &&
++           functions.createCommandPool && functions.destroyCommandPool &&
++           functions.resetCommandPool && functions.allocateCommandBuffers &&
++           functions.beginCommandBuffer && functions.endCommandBuffer &&
++           functions.cmdPipelineBarrier && functions.queueSubmit &&
++           functions.createFence && functions.destroyFence && functions.getFenceStatus &&
++           functions.resetFences && functions.waitForFences;
++}
++
++// The depth aspect as vkCmdCopyImageToBuffer writes it: D24 formats pack into 32-bit words.
++bool DepthTexelLayout(VkFormat format, uint32_t& bytesPerTexel, oxrsys::depthgrid::TexelKind& kind)
++{
++    switch (format)
++    {
++    case VK_FORMAT_D16_UNORM:
++        bytesPerTexel = 2;
++        kind = oxrsys::depthgrid::TexelKind::Unorm16;
++        return true;
++    case VK_FORMAT_D24_UNORM_S8_UINT:
++    case VK_FORMAT_X8_D24_UNORM_PACK32:
++        bytesPerTexel = 4;
++        kind = oxrsys::depthgrid::TexelKind::Unorm24;
++        return true;
++    case VK_FORMAT_D32_SFLOAT:
++    case VK_FORMAT_D32_SFLOAT_S8_UINT:
++        bytesPerTexel = 4;
++        kind = oxrsys::depthgrid::TexelKind::Float32;
++        return true;
++    default:
++        return false;
++    }
++}
++
+ bool IsVulkanSnapshotFormatSupported(VkFormat format)
+ {
+     return format == VK_FORMAT_R8G8B8A8_UNORM ||
+@@ -212,8 +259,10 @@ void Swapchain::InitVulkan(void* /*metalDevice*/, const VulkanGraphicsContext& v
+     imageCI.arrayLayers = arraySize_;
+     imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
+     imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
++    // TRANSFER_SRC on depth: the release-time row capture for positional reprojection reads it.
+     imageCI.usage = isDepth
+-        ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
++        ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++           VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+         : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+            VK_IMAGE_USAGE_SAMPLED_BIT);
+     imageCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+@@ -308,6 +357,11 @@ void Swapchain::InitVulkan(void* /*metalDevice*/, const VulkanGraphicsContext& v
+         // a complete bounded snapshot pool can be created.
+         spdlog::warn("OXRSys: Vulkan streaming snapshots are unavailable for this swapchain");
+     }
++    const uint32_t depthGrid = Config::Get().GetValues().depthGrid;
++    if (isDepth && depthGrid > 0 && !InitVulkanDepthPool(depthGrid))
++    {
++        spdlog::warn("OXRSys: depth rows for positional reprojection are unavailable for this swapchain");
++    }
+ 
+     Runtime::Get().RegisterHandle(handle_, this);
+     spdlog::info("OXRSys: Vulkan swapchain created {}x{} format={} arraySize={} images={}",
+@@ -487,6 +541,19 @@ bool Swapchain::DestroyVulkanResources()
+         vulkanSnapshotPool_.reset();
+     }
+ 
++    lastVulkanDepthRows_.clear();
++    if (vulkanDepthPool_ != nullptr)
++    {
++        if (!DrainVulkanDepthPool(kVulkanDestroyDrainTimeout))
++        {
++            spdlog::warn(
++                "OXRSys: Vulkan depth-row drain timed out; destruction must be retried");
++            return false;
++        }
++        DestroyVulkanDepthPoolResources();
++        vulkanDepthPool_.reset();
++    }
++
+     VkDevice device = reinterpret_cast<VkDevice>(vkDevice_);
+     const auto functions = vulkanDeviceFunctions_;
+     for (uint32_t i = 0; i < imageCount_; i++)
+@@ -790,3 +857,343 @@ void Swapchain::SnapshotVulkanReleasedImage(bool requested)
+         lastVulkanSnapshots_[arrayIndex] = std::move(frameSource);
+     }
+ }
++
++bool Swapchain::InitVulkanDepthPool(uint32_t capturedRows)
++{
++    VkDevice device = reinterpret_cast<VkDevice>(vulkanContext_.device);
++    VkPhysicalDevice physicalDevice =
++        reinterpret_cast<VkPhysicalDevice>(vulkanContext_.physicalDevice);
++    uint32_t bytesPerTexel = 0;
++    oxrsys::depthgrid::TexelKind kind = oxrsys::depthgrid::TexelKind::Float32;
++    if (device == VK_NULL_HANDLE || physicalDevice == VK_NULL_HANDLE ||
++        vulkanDeviceFunctions_ == nullptr ||
++        !RequiredVulkanDepthRowFunctionsAvailable(*vulkanDeviceFunctions_) ||
++        !DepthTexelLayout(static_cast<VkFormat>(format_), bytesPerTexel, kind) ||
++        width_ == 0 || height_ == 0)
++    {
++        return false;
++    }
++    const VulkanDeviceFunctions& functions = *vulkanDeviceFunctions_;
++    capturedRows = std::min(capturedRows, height_);
++
++    auto pool = std::make_shared<VulkanDepthPool>(kVulkanSnapshotSlotCount);
++    pool->context = vulkanContext_;
++    pool->destroyCommandPool = functions.destroyCommandPool;
++    pool->destroyBuffer = functions.destroyBuffer;
++    pool->freeMemory = functions.freeMemory;
++    pool->destroyFence = functions.destroyFence;
++    pool->waitForFences = functions.waitForFences;
++    pool->capturedRows = capturedRows;
++    pool->width = width_;
++    pool->imageHeight = height_;
++    pool->bytesPerTexel = bytesPerTexel;
++    pool->kind = kind;
++    vulkanDepthPool_ = pool;
++
++    const VkDeviceSize layerBytes =
++        static_cast<VkDeviceSize>(capturedRows) * width_ * bytesPerTexel;
++    auto fail = [this]() {
++        DestroyVulkanDepthPoolResources();
++        vulkanDepthPool_.reset();
++        return false;
++    };
++    for (auto& slot : pool->slots)
++    {
++        VkBufferCreateInfo bufferInfo{};
++        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++        bufferInfo.size = layerBytes * arraySize_;
++        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++        if (functions.createBuffer(device, &bufferInfo, nullptr, &slot.buffer) != VK_SUCCESS)
++        {
++            return fail();
++        }
++        VkMemoryRequirements requirements{};
++        functions.getBufferMemoryRequirements(device, slot.buffer, &requirements);
++        const uint32_t memoryType = FindMemoryType(
++            physicalDevice, requirements.memoryTypeBits,
++            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++        if (memoryType == std::numeric_limits<uint32_t>::max())
++        {
++            return fail();
++        }
++        VkMemoryAllocateInfo allocInfo{};
++        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++        allocInfo.allocationSize = requirements.size;
++        allocInfo.memoryTypeIndex = memoryType;
++        if (functions.allocateMemory(device, &allocInfo, nullptr, &slot.memory) != VK_SUCCESS ||
++            functions.bindBufferMemory(device, slot.buffer, slot.memory, 0) != VK_SUCCESS ||
++            functions.mapMemory(device, slot.memory, 0, VK_WHOLE_SIZE, 0, &slot.mapped) != VK_SUCCESS)
++        {
++            return fail();
++        }
++
++        VkCommandPoolCreateInfo poolInfo{};
++        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++        poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
++        poolInfo.queueFamilyIndex = vulkanContext_.queueFamilyIndex;
++        VkCommandBufferAllocateInfo commandInfo{};
++        commandInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++        commandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        commandInfo.commandBufferCount = 1;
++        VkFenceCreateInfo fenceInfo{};
++        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
++        if (functions.createCommandPool(device, &poolInfo, nullptr, &slot.commandPool) != VK_SUCCESS)
++        {
++            return fail();
++        }
++        commandInfo.commandPool = slot.commandPool;
++        if (functions.allocateCommandBuffers(device, &commandInfo, &slot.commandBuffer) != VK_SUCCESS ||
++            functions.createFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS)
++        {
++            return fail();
++        }
++    }
++
++    lastVulkanDepthRows_.assign(arraySize_, {});
++    spdlog::info("OXRSys: depth rows for positional reprojection: {} rows x {} px x {} layers, {} B/texel",
++                 capturedRows, width_, arraySize_, bytesPerTexel);
++    return true;
++}
++
++void Swapchain::CaptureVulkanDepthRows(bool requested)
++{
++    const auto pool = vulkanDepthPool_;
++    {
++        std::scoped_lock lock(stateMutex_);
++        lastVulkanDepthRows_.assign(arraySize_, {});
++    }
++    if (!requested || pool == nullptr || vkImages_.empty() ||
++        pool->stopping.load(std::memory_order_acquire))
++    {
++        return;
++    }
++    VkDevice device = reinterpret_cast<VkDevice>(vulkanContext_.device);
++    VkImage image = reinterpret_cast<VkImage>(vkImages_[lastReleasedIndex_]);
++    const auto functions = vulkanDeviceFunctions_;
++    if (device == VK_NULL_HANDLE || image == VK_NULL_HANDLE || functions == nullptr)
++    {
++        return;
++    }
++    VkQueue queue = reinterpret_cast<VkQueue>(vulkanContext_.queue);
++    if (queue == VK_NULL_HANDLE && functions->getDeviceQueue != nullptr)
++    {
++        functions->getDeviceQueue(
++            device, vulkanContext_.queueFamilyIndex, vulkanContext_.queueIndex, &queue);
++    }
++    if (queue == VK_NULL_HANDLE)
++    {
++        return;
++    }
++
++    const SnapshotLeasePool::Lease lease = pool->leases.TryAcquire([&](size_t index) {
++        const auto& candidate = pool->slots[index];
++        return !candidate.fenceSubmitted ||
++               functions->getFenceStatus(device, candidate.fence) == VK_SUCCESS;
++    });
++    if (!lease)
++    {
++        return;
++    }
++    VulkanDepthSlot& slot = pool->slots[lease.index];
++    if (functions->resetFences(device, 1, &slot.fence) != VK_SUCCESS ||
++        functions->resetCommandPool(device, slot.commandPool, 0) != VK_SUCCESS)
++    {
++        slot.fenceSubmitted = false;
++        return;
++    }
++    slot.fenceSubmitted = false;
++
++    VkCommandBufferBeginInfo beginInfo{};
++    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    if (functions->beginCommandBuffer(slot.commandBuffer, &beginInfo) != VK_SUCCESS)
++    {
++        return;
++    }
++
++    // A released depth image is in DEPTH_STENCIL_ATTACHMENT_OPTIMAL (XR_KHR_vulkan_enable).
++    const bool hasStencil = format_ == VK_FORMAT_D24_UNORM_S8_UINT ||
++                            format_ == VK_FORMAT_D32_SFLOAT_S8_UINT;
++    VkImageMemoryBarrier toTransfer{};
++    toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++    toTransfer.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++    toTransfer.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    toTransfer.image = image;
++    toTransfer.subresourceRange.aspectMask =
++        VK_IMAGE_ASPECT_DEPTH_BIT | (hasStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
++    toTransfer.subresourceRange.levelCount = 1;
++    toTransfer.subresourceRange.layerCount = arraySize_;
++    functions->cmdPipelineBarrier(
++        slot.commandBuffer,
++        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransfer);
++
++    std::vector<VkBufferImageCopy> regions;
++    regions.reserve(static_cast<size_t>(pool->capturedRows) * arraySize_);
++    const VkDeviceSize rowBytes = static_cast<VkDeviceSize>(pool->width) * pool->bytesPerTexel;
++    for (uint32_t layer = 0; layer < arraySize_; ++layer)
++    {
++        for (uint32_t i = 0; i < pool->capturedRows; ++i)
++        {
++            VkBufferImageCopy region{};
++            region.bufferOffset = (static_cast<VkDeviceSize>(layer) * pool->capturedRows + i) * rowBytes;
++            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
++            region.imageSubresource.baseArrayLayer = layer;
++            region.imageSubresource.layerCount = 1;
++            region.imageOffset = {
++                0, static_cast<int32_t>(oxrsys::depthgrid::RowForCapture(i, pool->capturedRows, height_)), 0};
++            region.imageExtent = {width_, 1, 1};
++            regions.push_back(region);
++        }
++    }
++    functions->cmdCopyImageToBuffer(
++        slot.commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.buffer,
++        static_cast<uint32_t>(regions.size()), regions.data());
++
++    VkImageMemoryBarrier back = toTransfer;
++    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++    back.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
++                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    back.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++    VkBufferMemoryBarrier toHost{};
++    toHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
++    toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++    toHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    toHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    toHost.buffer = slot.buffer;
++    toHost.size = VK_WHOLE_SIZE;
++    functions->cmdPipelineBarrier(
++        slot.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
++        0, 0, nullptr, 1, &toHost, 1, &back);
++
++    if (functions->endCommandBuffer(slot.commandBuffer) != VK_SUCCESS)
++    {
++        return;
++    }
++    VkSubmitInfo submitInfo{};
++    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++    submitInfo.commandBufferCount = 1;
++    submitInfo.pCommandBuffers = &slot.commandBuffer;
++    if (functions->queueSubmit(queue, 1, &submitInfo, slot.fence) != VK_SUCCESS)
++    {
++        return;
++    }
++    slot.fenceSubmitted = true;
++
++    std::vector<oxrsys::depthgrid::RowsSource> sources(arraySize_);
++    for (uint32_t layer = 0; layer < arraySize_; ++layer)
++    {
++        sources[layer].lifetime = lease.lifetime;
++        sources[layer].waitRows = [pool, slotIndex = lease.index, layer](
++                                      uint64_t timeoutNs, oxrsys::depthgrid::RowsView& rows) {
++            if (pool->stopping.load(std::memory_order_acquire) || slotIndex >= pool->slots.size())
++            {
++                return false;
++            }
++            const auto& depthSlot = pool->slots[slotIndex];
++            VkDevice slotDevice = reinterpret_cast<VkDevice>(pool->context.device);
++            if (slotDevice == VK_NULL_HANDLE || !depthSlot.fenceSubmitted ||
++                depthSlot.mapped == nullptr || pool->waitForFences == nullptr ||
++                pool->waitForFences(slotDevice, 1, &depthSlot.fence, VK_TRUE, timeoutNs) != VK_SUCCESS)
++            {
++                return false;
++            }
++            rows.data = static_cast<const uint8_t*>(depthSlot.mapped) +
++                        static_cast<size_t>(layer) * pool->capturedRows * pool->width * pool->bytesPerTexel;
++            rows.width = pool->width;
++            rows.imageHeight = pool->imageHeight;
++            rows.capturedRows = pool->capturedRows;
++            rows.bytesPerTexel = pool->bytesPerTexel;
++            rows.kind = pool->kind;
++            return true;
++        };
++    }
++    std::scoped_lock lock(stateMutex_);
++    lastVulkanDepthRows_ = std::move(sources);
++}
++
++bool Swapchain::DrainVulkanDepthPool(std::chrono::nanoseconds timeout)
++{
++    const auto pool = vulkanDepthPool_;
++    if (pool == nullptr)
++    {
++        return true;
++    }
++    const auto deadline = std::chrono::steady_clock::now() + timeout;
++    pool->stopping.store(true, std::memory_order_release);
++    if (!pool->leases.StopAndWaitForLeases(timeout))
++    {
++        return false;
++    }
++    std::vector<VkFence> submitted;
++    for (const auto& slot : pool->slots)
++    {
++        if (slot.fenceSubmitted && slot.fence != VK_NULL_HANDLE)
++        {
++            submitted.push_back(slot.fence);
++        }
++    }
++    if (submitted.empty())
++    {
++        return true;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    const VkDevice device = reinterpret_cast<VkDevice>(pool->context.device);
++    if (now >= deadline || pool->waitForFences == nullptr || device == VK_NULL_HANDLE)
++    {
++        return false;
++    }
++    const uint64_t remainingNs = static_cast<uint64_t>(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count());
++    return pool->waitForFences(device, static_cast<uint32_t>(submitted.size()), submitted.data(),
++                               VK_TRUE, remainingNs) == VK_SUCCESS;
++}
++
++void Swapchain::DestroyVulkanDepthPoolResources()
++{
++    const auto pool = vulkanDepthPool_;
++    if (pool == nullptr)
++    {
++        return;
++    }
++    const VkDevice device = reinterpret_cast<VkDevice>(pool->context.device);
++    if (device == VK_NULL_HANDLE)
++    {
++        return;
++    }
++    for (auto& slot : pool->slots)
++    {
++        if (slot.fence != VK_NULL_HANDLE && pool->destroyFence != nullptr)
++        {
++            pool->destroyFence(device, slot.fence, nullptr);
++            slot.fence = VK_NULL_HANDLE;
++        }
++        if (slot.commandPool != VK_NULL_HANDLE && pool->destroyCommandPool != nullptr)
++        {
++            pool->destroyCommandPool(device, slot.commandPool, nullptr);
++            slot.commandPool = VK_NULL_HANDLE;
++            slot.commandBuffer = VK_NULL_HANDLE;
++        }
++        if (slot.buffer != VK_NULL_HANDLE && pool->destroyBuffer != nullptr)
++        {
++            pool->destroyBuffer(device, slot.buffer, nullptr);
++            slot.buffer = VK_NULL_HANDLE;
++        }
++        if (slot.memory != VK_NULL_HANDLE && pool->freeMemory != nullptr)
++        {
++            // Freeing mapped memory implicitly unmaps it.
++            pool->freeMemory(device, slot.memory, nullptr);
++            slot.memory = VK_NULL_HANDLE;
++            slot.mapped = nullptr;
++        }
++    }
++}
+diff --git a/tests/TestDepthGrid.cpp b/tests/TestDepthGrid.cpp
+new file mode 100644
+index 0000000..5e050f6
+--- /dev/null
++++ b/tests/TestDepthGrid.cpp
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include <catch2/catch_test_macros.hpp>
++
++#include "DepthGrid.h"
++
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <vector>
++
++using namespace oxrsys::depthgrid;
++
++namespace
++{
++// Standard perspective depth (0 at nearZ, 1 at farZ) for a distance, written independently of the
++// code under test from the projection: d = (1/n - 1/z) / (1/n - 1/f).
++float StandardDepth(float z, float n, float f) { return (1.0f / n - 1.0f / z) / (1.0f / n - 1.0f / f); }
++
++std::vector<uint8_t> Rows(uint32_t width, uint32_t rows, const std::vector<float>& depthPerTexel)
++{
++    std::vector<uint8_t> data(static_cast<size_t>(width) * rows * 4);
++    std::memcpy(data.data(), depthPerTexel.data(), data.size());
++    return data;
++}
++} // namespace
++
++TEST_CASE("Depth grid: standard Z maps distance to q = 255 * near / z", "[depthgrid]")
++{
++    const DepthRange range{0.0f, 1.0f, 0.1f, 100.0f};
++    // 1 m and 2 m: q = 255 * 0.25 / z = 63.75 -> 64, 31.875 -> 32.
++    REQUIRE(std::lround(255.0f * 0.25f * InverseDistance(StandardDepth(1.0f, 0.1f, 100.0f), range)) == 64);
++    REQUIRE(std::lround(255.0f * 0.25f * InverseDistance(StandardDepth(2.0f, 0.1f, 100.0f), range)) == 32);
++    REQUIRE(std::fabs(InverseDistance(1.0f, range) - 0.01f) < 1e-6f); // far plane: 1/100
++}
++
++TEST_CASE("Depth grid: reversed and infinite Z give the same distances", "[depthgrid]")
++{
++    const float inf = std::numeric_limits<float>::infinity();
++    // Reversed infinite: d = near / z, minDepth (0) is at infinity.
++    const DepthRange reversed{0.0f, 1.0f, inf, 0.1f};
++    REQUIRE(std::fabs(InverseDistance(0.1f / 0.5f, reversed) - 2.0f) < 1e-4f);
++    REQUIRE(InverseDistance(0.0f, reversed) == 0.0f);
++    // Standard infinite: d = 1 - near / z.
++    const DepthRange standardInf{0.0f, 1.0f, 0.1f, inf};
++    REQUIRE(std::fabs(InverseDistance(1.0f - 0.1f / 4.0f, standardInf) - 0.25f) < 1e-4f);
++    // A sub-range: minDepth 0.5 .. maxDepth 1 holds the full near..far mapping.
++    const DepthRange half{0.5f, 1.0f, 0.1f, inf};
++    REQUIRE(std::fabs(InverseDistance(0.5f + 0.5f * (1.0f - 0.1f / 4.0f), half) - 0.25f) < 1e-4f);
++}
++
++TEST_CASE("Depth grid: unusable ranges are refused", "[depthgrid]")
++{
++    REQUIRE(InverseDistance(0.5f, DepthRange{1.0f, 1.0f, 0.1f, 100.0f}) < 0.0f);
++    REQUIRE(InverseDistance(0.5f, DepthRange{0.0f, 1.0f, 0.0f, 100.0f}) < 0.0f);
++    REQUIRE(InverseDistance(0.5f, DepthRange{0.0f, 1.0f, 1.0f, 1.0f}) < 0.0f);
++    std::vector<uint8_t> out;
++    RowsView none{};
++    REQUIRE_FALSE(Reduce(none, 0, 0, 1, 1, DepthRange{}, 4, 0.25f, out));
++}
++
++TEST_CASE("Depth grid: a cell keeps the nearest depth on its row, inside the sub-rect", "[depthgrid]")
++{
++    // 8 x 8 image, 4 captured rows (image rows 1, 3, 5, 7); everything at 2 m except one texel at
++    // 1 m on image row 5, column 6 (right half). Side-by-side: the right eye is x = 4..7.
++    const uint32_t w = 8, h = 8, cap = 4;
++    REQUIRE(RowForCapture(0, cap, h) == 1);
++    REQUIRE(RowForCapture(2, cap, h) == 5);
++    std::vector<float> d(w * cap, StandardDepth(2.0f, 0.1f, 100.0f));
++    d[2 * w + 6] = StandardDepth(1.0f, 0.1f, 100.0f);
++    const auto data = Rows(w, cap, d);
++    RowsView rows{data.data(), w, h, cap, 4, TexelKind::Float32};
++    std::vector<uint8_t> out;
++    REQUIRE(Reduce(rows, 4, 0, 4, 8, DepthRange{0.0f, 1.0f, 0.1f, 100.0f}, 2, 0.25f, out));
++    REQUIRE(out.size() == 4);
++    // Cell (row 1, col 1) of the right eye covers x 6..7; its centre y = 6 is nearest captured image
++    // row 5 (centre 5.5), so it sees the 1 m texel.
++    REQUIRE(out[0] == 32);
++    REQUIRE(out[1] == 32);
++    REQUIRE(out[2] == 32);
++    REQUIRE(out[3] == 64);
++    // The left eye never sees it.
++    REQUIRE(Reduce(rows, 0, 0, 4, 8, DepthRange{0.0f, 1.0f, 0.1f, 100.0f}, 2, 0.25f, out));
++    REQUIRE(out == std::vector<uint8_t>{32, 32, 32, 32});
++    // A rect outside the image is refused.
++    REQUIRE_FALSE(Reduce(rows, 5, 0, 4, 8, DepthRange{}, 2, 0.25f, out));
++}
++
++TEST_CASE("Depth grid: 16- and 24-bit texels", "[depthgrid]")
++{
++    std::vector<uint8_t> data(4);
++    const uint16_t half = 32768;
++    std::memcpy(data.data(), &half, 2);
++    RowsView rows16{data.data(), 2, 1, 1, 2, TexelKind::Unorm16};
++    REQUIRE(std::fabs(ReadTexel(rows16, 0, 0) - 0.5f) < 1e-4f);
++    const uint32_t d24 = 0xAB800000u; // stencil byte set, depth 0x800000
++    std::memcpy(data.data(), &d24, 4);
++    RowsView rows24{data.data(), 1, 1, 1, 4, TexelKind::Unorm24};
++    REQUIRE(std::fabs(ReadTexel(rows24, 0, 0) - 0.5f) < 1e-4f);
++}
+diff --git a/tests/TestProtocolLayout.cpp b/tests/TestProtocolLayout.cpp
+index 4a43664..20f8be6 100644
+--- a/tests/TestProtocolLayout.cpp
++++ b/tests/TestProtocolLayout.cpp
+@@ -31,6 +31,10 @@ TEST_CASE("C++ protocol layouts match the documented wire format", "[protocol]")
+     STATIC_REQUIRE(sizeof(TcpVideoNalHeader) == 24);
+     STATIC_REQUIRE(sizeof(TcpRenderPose) == 48);
+     STATIC_REQUIRE(sizeof(TcpAudioHeader) == 24);
++    STATIC_REQUIRE(sizeof(DepthGridHeader) == 16);
++    STATIC_REQUIRE(sizeof(DepthGridHeader) + DEPTH_GRID_MAX_SIZE * 8 <= MAX_PACKET_PAYLOAD);
++    STATIC_REQUIRE(CLIENT_CAPABILITY_DEPTH_GRID == 0x00004000);
++    STATIC_REQUIRE(static_cast<uint16_t>(TcpRecordType::DepthGrid) == 0x000A);
+     STATIC_REQUIRE(sizeof(AudioPacketHeader) == 32);
+     STATIC_REQUIRE(TCP_RECORD_MAGIC == 0x4f585255);
+     STATIC_REQUIRE(STREAMING_MIN_BITRATE_MBPS == 1);
+-- 
+2.43.0
+

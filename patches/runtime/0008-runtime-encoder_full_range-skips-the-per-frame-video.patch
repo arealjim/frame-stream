@@ -1,0 +1,143 @@
+From 4d523f8a8bc5c0100982955216f539dc085b13ca Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 19:00:06 +0000
+Subject: [PATCH 08/23] runtime: encoder_full_range skips the per-frame
+ video-range conversion
+
+Config encoder_full_range (default false): the low-latency rtvc or software
+VideoToolbox session is fed the compose BGRA surface directly instead of a
+BT.709 video-range 4:2:0 conversion of each frame, which costs about 1 ms of
+submit per frame (measured 2026-10-17, M5 Pro, 2272x1264). Those sessions
+then write a full-range stream and signal it in the VUI, so only clients that
+honour the signalled range may use it (the Steam Frame client does since
+2026-10-17). The .ave. hardware session writes video range from BGRA either
+way and is unaffected.
+
+---
+ CHANGES.md                  |  4 ++++
+ runtime/oxrsys-runtime.toml |  6 ++++++
+ runtime/src/Config.cpp      | 11 ++++++++---
+ runtime/src/Config.h        |  7 +++++++
+ runtime/src/VideoEncoder.mm | 10 +++++++++-
+ 5 files changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 017e806..4d9aeba 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -46,6 +46,10 @@ ### Added
+ 
+ ### Changed
+ 
++- New config `encoder_full_range` (default false): feed the low-latency / software VideoToolbox session the
++  BGRA surface directly instead of the per-frame BT.709 video-range conversion (about 1 ms of submit per
++  frame). The stream is then full range and signals it in the VUI; only for clients that honour the signalled
++  range.
+ - Low-latency sessions are no longer mislabelled as software. With low-latency rate
+   control VideoToolbox serves the session from its real-time hardware encoder
+   (`…videoencoder.hevc.rtvc`), whose session returns `kVTPropertyNotSupportedErr` for
+diff --git a/runtime/oxrsys-runtime.toml b/runtime/oxrsys-runtime.toml
+index b9400f5..5a43cba 100644
+--- a/runtime/oxrsys-runtime.toml
++++ b/runtime/oxrsys-runtime.toml
+@@ -53,6 +53,12 @@ encoder_preset = "balanced"
+ # to ~8.0 ms at 2272x1264 H.265 (M5 Pro, 2026-10-17). Set false to compare.
+ encoder_low_latency = true
+ 
++# Skip the per-frame BT.709 video-range conversion in front of the low-latency (or software)
++# encoder session (about 1 ms of submit per frame): the stream is then FULL range and its VUI
++# says so. Only for clients that honour the signalled range (Steam Frame client, 2026-10-17);
++# a client that assumes limited range shows lifted blacks and clipped highlights.
++encoder_full_range = false
++
+ # Encode HEVC Main10 for H.265 clients that advertise 10-bit decode support.
+ # H.264 and clients without the capability continue to receive 8-bit video.
+ encoder_10bit = false
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index 083de58..08dd9cf 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -403,6 +403,10 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             {
+                 values.encoderLowLatency = ParseBool(value);
+             }
++            else if (key == "encoder_full_range")
++            {
++                values.encoderFullRange = ParseBool(value);
++            }
+             else if (key == "encoder_helper")
+             {
+                 // Tri-state: "auto" (decide from the measured hardware-encoder
+@@ -630,7 +634,7 @@ bool Config::ReloadIfChangedLocked(bool force)
+     if (!force)
+     {
+         spdlog::info(
+-            "OXRSys: Reloaded config from {} (runtime_enabled={} bitrate={}Mbps fov={} refresh={}Hz res_scale={:.2f} render_device={} dyn_min={:.2f} keyframe={}s codec={} preset={} low_latency={} transport={} ffe={} client_ffr={} upscaling={} sharpen={:.2f} reprojection={} abr={} passthrough={} app_alpha_blend={} occlusion={} spatial={}/{}/{}/{} audio={} quest_logcat={})",
++            "OXRSys: Reloaded config from {} (runtime_enabled={} bitrate={}Mbps fov={} refresh={}Hz res_scale={:.2f} render_device={} dyn_min={:.2f} keyframe={}s codec={} preset={} low_latency={} full_range={} transport={} ffe={} client_ffr={} upscaling={} sharpen={:.2f} reprojection={} abr={} passthrough={} app_alpha_blend={} occlusion={} spatial={}/{}/{}/{} audio={} quest_logcat={})",
+             configFilePath,
+             newValues.runtimeEnabled,
+             newValues.bitrateMbps,
+@@ -643,6 +647,7 @@ bool Config::ReloadIfChangedLocked(bool force)
+             newValues.videoCodec,
+             newValues.encoderPreset,
+             newValues.encoderLowLatency,
++            newValues.encoderFullRange,
+             newValues.streamingTransport,
+             newValues.foveatedEncodingPreset,
+             newValues.clientFoveationPreset,
+@@ -756,11 +761,11 @@ void Config::SetupLogging()
+     spdlog::info("OXRSys Runtime starting (config from {})", configFilePath);
+     spdlog::info("  runtime_enabled={} file_logging={} quest_logcat={}",
+                   values_.runtimeEnabled, values_.fileLogging, values_.questLogcat);
+-    spdlog::info("  bitrate={}Mbps fov={}° refresh={}Hz res_scale={:.2f} dyn_min={:.2f} keyframe={}s preset={} low_latency={} transport={} ffe={} client_ffr={} upscaling={} sharpen={:.2f} reprojection={} abr={} passthrough={} app_alpha_blend={} occlusion={} spatial={}/{}/{}/{} audio={}",
++    spdlog::info("  bitrate={}Mbps fov={}° refresh={}Hz res_scale={:.2f} dyn_min={:.2f} keyframe={}s preset={} low_latency={} full_range={} transport={} ffe={} client_ffr={} upscaling={} sharpen={:.2f} reprojection={} abr={} passthrough={} app_alpha_blend={} occlusion={} spatial={}/{}/{}/{} audio={}",
+                   values_.bitrateMbps, values_.fovDegrees, values_.refreshRateHz,
+                   values_.resolutionScale, values_.dynamicResolutionMinScale,
+                   values_.keyframeIntervalSec,
+-                  values_.encoderPreset, values_.encoderLowLatency, values_.streamingTransport,
++                  values_.encoderPreset, values_.encoderLowLatency, values_.encoderFullRange, values_.streamingTransport,
+                   values_.foveatedEncodingPreset, values_.clientFoveationPreset,
+                   values_.clientUpscaling, values_.clientSharpening, values_.clientReprojectionMode,
+                   values_.abrMode, values_.passthroughEnabled,
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index e8ba995..bd30b98 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -29,6 +29,13 @@ struct ConfigValues
+     // no periodic IDR (keyframes come from ForceKeyFrame, i.e. client requests).
+     // Measured 2026-10-17, M5 Pro, 2272x1264 HEVC @72: encode callback 12.6 -> 8.0 ms.
+     bool encoderLowLatency = true;
++    // Feed the low-latency (rtvc) or software session the BGRA surface directly
++    // instead of a BT.709 video-range 4:2:0 conversion of each frame (about 1 ms
++    // of submit per frame, measured 2026-10-17). Those sessions then write a
++    // FULL-range stream and say so in the VUI; a client must honour the signalled
++    // range (the Steam Frame client does since 2026-10-17). The .ave. hardware
++    // session writes video range from BGRA either way, so this changes nothing there.
++    bool encoderFullRange = false;
+ 
+     // Out-of-process native-arm64 hardware encoder helper. When the runtime
+     // dylib is loaded by an x86_64/Rosetta host it cannot reach VideoToolbox's
+diff --git a/runtime/src/VideoEncoder.mm b/runtime/src/VideoEncoder.mm
+index dc912bc..ce6aa3f 100644
+--- a/runtime/src/VideoEncoder.mm
++++ b/runtime/src/VideoEncoder.mm
+@@ -1208,7 +1208,15 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+     // and this session takes over mid-stream. Hand it an explicitly video-range
+     // 4:2:0 conversion of each frame instead; see EncoderSessionColor.h. Set up
+     // now, not on helper death, so the fallback never allocates on the frame path.
+-    if (!inProcessSessionKeepsVideoRange_ && !CreateVideoRangeConversion(width, height))
++    if (!inProcessSessionKeepsVideoRange_ && initialConfig.encoderFullRange)
++    {
++        spdlog::info("VideoEncoder: {} {} session is fed the BGRA surface directly "
++                     "(encoder_full_range): the stream is FULL range and its VUI says so - "
++                     "the client must honour the signalled range",
++                     inProcessSessionHardware_ ? "low-latency hardware" : "software",
++                     VideoCodecName(codec_));
++    }
++    else if (!inProcessSessionKeepsVideoRange_ && !CreateVideoRangeConversion(width, height))
+     {
+         spdlog::warn("VideoEncoder: could not set up the video-range conversion for the software "
+                      "{} session - its stream may signal full range",
+-- 
+2.43.0
+

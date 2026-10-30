@@ -1,0 +1,211 @@
+From 7a9d8485189c645378a5636bf8db163f1e829bb5 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:41:34 +0000
+Subject: [PATCH] steam-frame client: closed-form foveation inverse instead of
+ the 16-step bisection
+
+compressAxis is linear in the centre and quadratic on each edge, so it inverts
+exactly: one sqrt per axis per pixel instead of 16 forward evaluations. On the
+Frame at swapchain 1.25 and 90 Hz, foveation off took the client's GPU time from
+9.6 to 3.1 ms, and the bisection is the
+per-pixel part of that. Shader and CPU mirror change together; the test now
+checks the inverse against an independent double-precision 60-step bisection,
+per preset and over a parameter sweep, with a control the oracle must reject.
+Worst error 0.0014 px at 2700 px per eye; a sign mutation fails 159 checks.
+---
+ clients/steam-frame/shaders/sample.frag      | 32 +++++++----
+ clients/steam-frame/tests/foveation_warp.h   | 36 ++++++++++---
+ clients/steam-frame/tests/test_foveation.cpp | 57 ++++++++++++++++++++
+ 3 files changed, 107 insertions(+), 18 deletions(-)
+
+diff --git a/clients/steam-frame/shaders/sample.frag b/clients/steam-frame/shaders/sample.frag
+index e287f43..dedf776 100644
+--- a/clients/steam-frame/shaders/sample.frag
++++ b/clients/steam-frame/shaders/sample.frag
+@@ -47,18 +47,30 @@ float compressAxis(float eyeUv, float centerSize, float centerShift, float edgeR
+     return center;
+ }
+ 
+-// Binary-search inverse of compressAxis. 16 iterations: the periphery amplifies
+-// the inverse error by up to edgeRatio (~7 at High), so 10 left ~5px of
+-// reconstruction error at 2160px/eye; 16 keeps it sub-pixel. See
+-// tests/test_foveation.cpp.
++// Closed-form inverse of compressAxis: linear in the centre, a quadratic root on
++// each edge (cancellation-free form). It replaced a 16-step bisection whose 16
++// forward evaluations per axis per pixel cost ~6.5 ms of Frame GPU a frame at
++// swapchain 1.25. CPU mirror + test: tests/foveation_warp.h, tests/test_foveation.cpp.
+ float decompressAxis(float targetUv, float centerSize, float centerShift, float edgeRatio) {
+-    float lo = 0.0, hi = 1.0, mid = 0.5;
+-    for (int i = 0; i < 16; ++i) {
+-        mid = (lo + hi) * 0.5;
+-        if (compressAxis(mid, centerSize, centerShift, edgeRatio) < targetUv) lo = mid;
+-        else hi = mid;
++    float c0 = (1.0 - centerSize) * 0.5;
++    float c1 = (edgeRatio - 1.0) * c0 * (centerShift + 1.0) / edgeRatio;
++    float c2 = (edgeRatio - 1.0) * centerSize + 1.0;
++    float a = c2 / edgeRatio;
++    float loBound = c0 * (centerShift + 1.0) / c2;
++    float hiBound = c0 * (centerShift - 1.0) / c2 + 1.0;
++    if (loBound > 0.0 && targetUv < loBound * a + c1) {
++        float A = (a - c2) / loBound;
++        float B = c2 + c1 / loBound;
++        return 2.0 * targetUv / (B + sqrt(max(B * B + 4.0 * A * targetUv, 0.0)));
++    }
++    float h = 1.0 - hiBound;
++    if (h > 0.0 && targetUv > hiBound * a + c1) {
++        float s = 1.0 - targetUv;
++        float A = (a - c2) / h;
++        float B = c2 - (a + c1 - 1.0) / h;
++        return 1.0 - 2.0 * s / (B + sqrt(max(B * B + 4.0 * A * s, 0.0)));
+     }
+-    return (lo + hi) * 0.5;
++    return (targetUv - c1) / a;
+ }
+ 
+ // NV12 -> RGB, BT.709 limited range: what the stream's VUI says it is (the server
+diff --git a/clients/steam-frame/tests/foveation_warp.h b/clients/steam-frame/tests/foveation_warp.h
+index 285ca8b..6272313 100644
+--- a/clients/steam-frame/tests/foveation_warp.h
++++ b/clients/steam-frame/tests/foveation_warp.h
+@@ -1,11 +1,13 @@
+ // SPDX-License-Identifier: BSL-1.0
+ #pragma once
+ 
++#include <cmath>
++
+ // CPU mirror of the axis-aligned foveation warp in shaders/sample.frag, used as
+ // a test oracle. GLSL cannot be shared with C++, so these two copies must stay
+ // in sync by hand: if compressAxis/decompressAxis change here, change the shader
+ // and vice versa. Kept float (not double) so the numeric behavior matches the
+-// shader's 10-iteration bisection inverse.
++// shader's closed-form inverse.
+ 
+ namespace fov_oracle {
+ 
+@@ -30,16 +32,34 @@ inline float compressAxis(float eyeUv, float centerSize, float centerShift, floa
+     return center;
+ }
+ 
+-// Binary-search inverse (matches the shader: 16 iterations).
++// Closed-form inverse (matches the shader). compressAxis is linear in the centre
++// and quadratic on each edge, so each piece inverts exactly: one sqrt instead of
++// the 16-step bisection's 16 forward evaluations per axis per pixel, which cost
++// the Frame's GPU ~6.5 ms a frame at swapchain 1.25.
++// The quadratic roots use the cancellation-free form 2t / (B + sqrt(B^2 + 4At)).
+ inline float decompressAxis(float targetUv, float centerSize, float centerShift, float edgeRatio)
+ {
+-    float lo = 0.0f, hi = 1.0f, mid = 0.5f;
+-    for (int i = 0; i < 16; ++i) {
+-        mid = (lo + hi) * 0.5f;
+-        if (compressAxis(mid, centerSize, centerShift, edgeRatio) < targetUv) lo = mid;
+-        else hi = mid;
++    float c0 = (1.0f - centerSize) * 0.5f;
++    float c1 = (edgeRatio - 1.0f) * c0 * (centerShift + 1.0f) / edgeRatio;
++    float c2 = (edgeRatio - 1.0f) * centerSize + 1.0f;
++    float a = c2 / edgeRatio;  // centre slope
++    float loBound = c0 * (centerShift + 1.0f) / c2;
++    float hiBound = c0 * (centerShift - 1.0f) / c2 + 1.0f;
++    if (loBound > 0.0f && targetUv < loBound * a + c1) {
++        // left edge: A u^2 + B u = t
++        float A = (a - c2) / loBound;
++        float B = c2 + c1 / loBound;
++        return 2.0f * targetUv / (B + std::sqrt(std::fmax(B * B + 4.0f * A * targetUv, 0.0f)));
++    }
++    float h = 1.0f - hiBound;
++    if (h > 0.0f && targetUv > hiBound * a + c1) {
++        // right edge, in v = 1 - u and s = 1 - t: A v^2 + B v = s
++        float s = 1.0f - targetUv;
++        float A = (a - c2) / h;
++        float B = c2 - (a + c1 - 1.0f) / h;
++        return 1.0f - 2.0f * s / (B + std::sqrt(std::fmax(B * B + 4.0f * A * s, 0.0f)));
+     }
+-    return (lo + hi) * 0.5f;
++    return (targetUv - c1) / a;
+ }
+ 
+ } // namespace fov_oracle
+diff --git a/clients/steam-frame/tests/test_foveation.cpp b/clients/steam-frame/tests/test_foveation.cpp
+index 4a9aaa6..c2da8de 100644
+--- a/clients/steam-frame/tests/test_foveation.cpp
++++ b/clients/steam-frame/tests/test_foveation.cpp
+@@ -23,6 +23,39 @@ using fov_oracle::decompressAxis;
+ 
+ namespace {
+ 
++// Independent oracle for the closed-form inverse: the forward map in double,
++// inverted by a 60-step bisection. It shares no algebra with decompressAxis.
++double compressAxisD(double u, double cs, double sh, double e)
++{
++    double c0 = (1 - cs) * 0.5, c1 = (e - 1) * c0 * (sh + 1) / e, c2 = (e - 1) * cs + 1;
++    double lo = c0 * (sh + 1) / c2, hi = c0 * (sh - 1) / c2 + 1;
++    double center = u * c2 / e + c1;
++    double g1 = lo > 0 ? u / lo : 1, g2 = (1 - hi) > 0 ? (1 - u) / (1 - hi) : 1;
++    if (u < lo) return g1 * center + (1 - g1) * u * c2;
++    if (u > hi) return g2 * center + (1 - g2) * ((u - 1) * c2 + 1);
++    return center;
++}
++
++double bisectInverseD(double t, double cs, double sh, double e)
++{
++    double lo = 0, hi = 1;
++    for (int i = 0; i < 60; ++i) {
++        double m = (lo + hi) / 2;
++        if (compressAxisD(m, cs, sh, e) < t) lo = m; else hi = m;
++    }
++    return (lo + hi) / 2;
++}
++
++float maxOracleErrorPx(float cs, float sh, float e, uint32_t targetPx)
++{
++    double worst = 0;
++    for (int i = 0; i <= 4096; ++i) {
++        float t = (float)i / 4096.0f;
++        worst = std::fmax(worst, std::fabs(decompressAxis(t, cs, sh, e) - bisectInverseD(t, cs, sh, e)));
++    }
++    return (float)(worst * targetPx);
++}
++
+ struct AxisResult {
+     float maxRoundTripPx = 0.0f;  // |compress(decompress(u)) - u| * targetPx
+     float maxInversePx = 0.0f;    // |decompress(compress(u)) - u| * targetPx
+@@ -84,6 +117,12 @@ void checkPreset(const char* name, protocol::FoveationPreset preset, uint32_t ey
+     // The bisection is a true inverse both ways to sub-pixel accuracy.
+     CHECK(x.maxInversePx < 1.0f);
+     CHECK(y.maxInversePx < 1.0f);
++    // The closed form matches an independent double-precision bisection.
++    float ox = maxOracleErrorPx(p.centerSizeX, p.centerShiftX, p.edgeRatioX, eyePx);
++    float oy = maxOracleErrorPx(p.centerSizeY, p.centerShiftY, p.edgeRatioY, eyePx);
++    printf("          closed form vs oracle: X<=%.4fpx Y<=%.4fpx\n", ox, oy);
++    CHECK(ox < 0.05f);
++    CHECK(oy < 0.05f);
+     // A foveated preset must actually warp (otherwise it saves no bandwidth).
+     CHECK(x.maxDeviation > 0.01f);
+     CHECK(y.maxDeviation > 0.01f);
+@@ -157,6 +196,24 @@ void test_foveation()
+     CHECK(!protocol::IsFoveatedEncodingLayoutUsable(off, eyePx, eyePx));
+     CHECK(off.optimizedEyeWidth == eyePx && off.optimizedEyeHeight == eyePx);
+ 
++    SECTION("foveation: closed-form inverse against an independent oracle (parameter sweep)");
++    {
++        float worst = 0.0f;
++        for (float cs = 0.15f; cs <= 0.951f; cs += 0.1f)
++            for (float sh = -0.6f; sh <= 0.601f; sh += 0.2f)
++                for (float e = 1.0f; e <= 9.01f; e += 0.5f)
++                    worst = std::fmax(worst, maxOracleErrorPx(cs, sh, e, 2700));
++        printf("  sweep: worst %.4fpx at 2700 px/eye\n", worst);
++        CHECK(worst < 0.05f);
++        // Control: the identity is not an inverse, and the oracle must say so.
++        double bad = 0;
++        for (int i = 0; i <= 4096; ++i) {
++            float t = (float)i / 4096.0f;
++            bad = std::fmax(bad, std::fabs(t - bisectInverseD(t, 0.5, 0.0, 4.0)) * 2700.0);
++        }
++        CHECK(bad > 10.0);
++    }
++
+     SECTION("foveation: gaze-driven centre (server/client agreement, stable encoded size)");
+     const float sweep[] = {-1.0f, -0.6f, -0.25f, 0.0f, 0.25f, 0.6f, 1.0f};
+     for (float gx : sweep)
+-- 
+2.43.0
+

@@ -1,0 +1,35 @@
+From ce0fe58ffa857b6ef0e0bce49a53580add8f7db7 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 18:42:00 +0000
+Subject: [PATCH] steam-frame client: FRAME_CLIENT_STAMP_LIVE stamps the layers
+ with the displayed view pose so the compositor warps nothing (A/B for the
+ exaggerated-parallax report)
+
+---
+ clients/steam-frame/src/main.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 7389612..923fa25 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -1601,8 +1601,15 @@ static void RenderFrame(App& app)
+             static const float kStampYM = getenv("FRAME_CLIENT_STAMP_Y_M") ? atof(getenv("FRAME_CLIENT_STAMP_Y_M")) : 0.0f;
+             static bool stampYLogged = false;
+             if (kStampYM != 0.0f && !stampYLogged) { stampYLogged = true; LOG_INFO("stamp-position test: layer pose raised %.3f m (FRAME_CLIENT_STAMP_Y_M)", kStampYM); }
++            // Stamp-live test (2026-10-19, worn: parallax still a bit exaggerated against the terminals with the per-eye
++            // stamps): FRAME_CLIENT_STAMP_LIVE=1 stamps each layer with the DISPLAYED view pose, so the compositor
++            // warps nothing and the eye sees the server's prediction error alone. If the exaggeration goes, the
++            // compositor's positional warp (its assumed layer depth) is the cause; if it stays, it is upstream.
++            static const bool kStampLive = getenv("FRAME_CLIENT_STAMP_LIVE") && atoi(getenv("FRAME_CLIENT_STAMP_LIVE")) != 0;
++            static bool stampLiveLogged = false;
++            if (kStampLive && !stampLiveLogged) { stampLiveLogged = true; LOG_INFO("stamp-live test: layers stamped with the displayed view pose (FRAME_CLIENT_STAMP_LIVE), compositor warps nothing"); }
+             for (uint32_t eye = 0; eye < VIEW_COUNT; eye++) {
+-                if (haveRenderPose) {
++                if (haveRenderPose && !kStampLive) {
+                     // The server renders eye e at head + right * (+-ipd/2) with the head's orientation (InputManager::
+                     // GetEyeViews); stamp each eye with THAT position, not the head centre, so the compositor's
+                     // per-eye reprojection (if any) starts from where the pixels were really rendered.
+-- 
+2.44.0
+

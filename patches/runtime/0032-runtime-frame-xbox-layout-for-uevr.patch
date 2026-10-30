@@ -1,0 +1,243 @@
+From de3d2941f25ebb4ab5f17b02cafa2f93cdf4fbab Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 21:50:48 +0000
+Subject: [PATCH 32/32] runtime: OXRSYS_FRAME_XBOX lays the Frame's controllers
+ out for Touch-to-Xbox apps (UEVR)
+
+UEVR turns Touch into an Xbox pad (right a = A, left x = B, right b = X,
+left y = Y, squeeze = LB/RB, menu = Start). SteamVR's Frame-to-Touch remap
+folds right B, X and Y into one Touch button, the d-pad into two, and drops
+the bumpers and the right menu. With OXRSYS_FRAME_XBOX set, the Touch A/B/X/Y
+bits are rebuilt from the Frame client's per-input bits so each Frame letter
+lands on the Xbox button of the same letter; the bumpers press the grips and
+the right menu is MENU. A packet with no Frame bits is left alone, and the
+Frame bits stay, so Frame-profile bindings still read their own inputs.
+The left d-pad also reads under a non-Frame profile (dpad_*/click), which
+UEVR binds through its own profile JSON.
+
+First written for and worn in Sifu under UEVR, 2026-10-26.
+Test: InputManager, OXRSYS_FRAME_XBOX puts each Frame letter on the same
+Xbox letter under Touch.
+
+---
+ runtime/src/InputManager.cpp | 67 +++++++++++++++++++++++++++++++----
+ runtime/src/InputManager.h   |  4 +++
+ tests/TestInputManager.cpp   | 68 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 132 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/InputManager.cpp b/runtime/src/InputManager.cpp
+index 5525de5..f34edb0 100644
+--- a/runtime/src/InputManager.cpp
++++ b/runtime/src/InputManager.cpp
+@@ -6,6 +6,7 @@
+ #include "TrackingReceiver.h"
+ #include <glm/gtc/quaternion.hpp>
+ #include <algorithm>
++#include <cstdlib>
+ #include <cctype>
+ #include <cmath>
+ #include <initializer_list>
+@@ -167,7 +168,10 @@ XrPosef MakePose(const glm::vec3& position, const glm::quat& orientation)
+ 
+ } // namespace
+ 
+-InputManager::InputManager() = default;
++InputManager::InputManager()
++    : frameXboxLayout_(std::getenv("OXRSYS_FRAME_XBOX") != nullptr)
++{
++}
+ 
+ void InputManager::SetTrackingReceiver(TrackingReceiver* receiver)
+ {
+@@ -299,18 +303,25 @@ void InputManager::UpdateFromStreaming()
+     }
+ 
+     // Apply button/trigger states
+-    buttonState_ = packet.buttonState;
++    uint32_t buttons = packet.buttonState;
++    float leftGrip = packet.leftGrip;
++    float rightGrip = packet.rightGrip;
++    if (frameXboxLayout_)
++    {
++        ApplyFrameXboxLayout(buttons, leftGrip, rightGrip);
++    }
++    buttonState_ = buttons;
+     controllerProfile_ = packet.controllerProfile;
+     touchState_ = packet.touchState;
+     leftTrigger_ = packet.leftTrigger;
+     rightTrigger_ = packet.rightTrigger;
+-    leftGripValue_ = packet.leftGrip;
+-    rightGripValue_ = packet.rightGrip;
++    leftGripValue_ = leftGrip;
++    rightGripValue_ = rightGrip;
+     leftThumbstick_ = {packet.leftThumbstick[0], packet.leftThumbstick[1]};
+     rightThumbstick_ = {packet.rightThumbstick[0], packet.rightThumbstick[1]};
+-    leftGrab_ = packet.leftGrip > 0.5f;
+-    rightGrab_ = packet.rightGrip > 0.5f;
+-    menuClick_ = (packet.buttonState & oxr::protocol::BUTTON_MENU) != 0;
++    leftGrab_ = leftGrip > 0.5f;
++    rightGrab_ = rightGrip > 0.5f;
++    menuClick_ = (buttons & oxr::protocol::BUTTON_MENU) != 0;
+     streamingIpd_ = packet.ipd;
+     streamingFov_[0] = packet.eyeFov[0];
+     streamingFov_[1] = packet.eyeFov[1];
+@@ -377,6 +388,36 @@ void InputManager::UpdateFromStreaming()
+     }
+ }
+ 
++// OXRSYS_FRAME_XBOX=1: lay the Frame's controllers out for an app that turns Touch into an Xbox pad (UEVR: right a =
++// A, left x = B, right b = X, left y = Y, squeeze = LB/RB, menu = Start). SteamVR's own Frame-to-Touch remap folds
++// right B, X and Y into one button and the d-pad into two, and drops the bumpers and the right menu; the Frame
++// client's per-input bits carry each one, so the Touch bits are rebuilt from those: each Frame letter lands on the
++// Xbox button of the same letter, the bumpers press the grips and the right menu is MENU. A packet without Frame bits
++// (another client, or nothing pressed) is left alone. The Frame bits stay, so a Frame-profile binding still reads
++// its own inputs, except that the left view (BUTTON_MENU) also reads the right menu while this is on. Sifu under
++// UEVR, 2026-10-26.
++void InputManager::ApplyFrameXboxLayout(uint32_t& buttons, float& leftGrip, float& rightGrip)
++{
++    using namespace oxr::protocol;
++    constexpr uint32_t kFrameBits = BUTTON_FRAME_A | BUTTON_FRAME_B | BUTTON_FRAME_X | BUTTON_FRAME_Y |
++                                    BUTTON_FRAME_DPAD_UP | BUTTON_FRAME_DPAD_DOWN | BUTTON_FRAME_DPAD_LEFT |
++                                    BUTTON_FRAME_DPAD_RIGHT | BUTTON_FRAME_RIGHT_MENU | BUTTON_LEFT_BUMPER |
++                                    BUTTON_RIGHT_BUMPER;
++    if ((buttons & kFrameBits) == 0)
++    {
++        return;
++    }
++    uint32_t b = buttons & ~(BUTTON_A | BUTTON_B | BUTTON_X | BUTTON_Y);
++    if (buttons & BUTTON_FRAME_A) b |= BUTTON_A;   // right a -> Xbox A
++    if (buttons & BUTTON_FRAME_B) b |= BUTTON_X;   // left x  -> Xbox B
++    if (buttons & BUTTON_FRAME_X) b |= BUTTON_B;   // right b -> Xbox X
++    if (buttons & BUTTON_FRAME_Y) b |= BUTTON_Y;   // left y  -> Xbox Y
++    if (buttons & BUTTON_FRAME_RIGHT_MENU) b |= BUTTON_MENU;
++    if (buttons & BUTTON_LEFT_BUMPER) leftGrip = 1.0f;
++    if (buttons & BUTTON_RIGHT_BUMPER) rightGrip = 1.0f;
++    buttons = b;
++}
++
+ XrPosef InputManager::GetHeadPose() const
+ {
+     glm::quat rot = GetHeadRotation();
+@@ -780,6 +821,18 @@ bool InputManager::GetButtonClick(Hand hand, const std::string& componentPath) c
+     {
+         return GetGrabValue(hand) > 0.5f;
+     }
++    // The Frame's left d-pad under a non-Frame profile (UEVR binds it through its own profile JSON); only the Frame
++    // client sets these bits.
++    if (componentPath.starts_with("dpad_") && componentPath.ends_with("/click"))
++    {
++        using namespace oxr::protocol;
++        const uint32_t bit = componentPath == "dpad_up/click"      ? BUTTON_FRAME_DPAD_UP
++                             : componentPath == "dpad_down/click"  ? BUTTON_FRAME_DPAD_DOWN
++                             : componentPath == "dpad_left/click"  ? BUTTON_FRAME_DPAD_LEFT
++                             : componentPath == "dpad_right/click" ? BUTTON_FRAME_DPAD_RIGHT
++                                                                   : 0u;
++        return hand == Hand::Left && bit != 0 && (buttonState_ & bit) != 0;
++    }
+     // The oculus/touch profile has no squeeze/click or trigger/click component — grip and trigger
+     // are analog-only (squeeze/value, trigger/value). Per the OpenXR spec, a boolean action bound
+     // to a float source must be thresholded by the runtime. Without this a boolean grip/trigger
+diff --git a/runtime/src/InputManager.h b/runtime/src/InputManager.h
+index d27f3e8..149ac04 100644
+--- a/runtime/src/InputManager.h
++++ b/runtime/src/InputManager.h
+@@ -91,6 +91,9 @@ class InputManager
+     XrPosef GetPoseComponentForProfile(Hand hand, const std::string& componentPath,
+                                        const std::string& profilePath) const;
+     void SetStreamingClientName(const std::string& clientName);
++    // OXRSYS_FRAME_XBOX (read at construction); see ApplyFrameXboxLayout.
++    void SetFrameXboxLayout(bool on) { frameXboxLayout_ = on; }
++    static void ApplyFrameXboxLayout(uint32_t& buttons, float& leftGrip, float& rightGrip);
+ 
+     // Conformance automation overrides
+     void SetAutomationInteractionProfile(Hand hand, const std::string& interactionProfile, bool isActive);
+@@ -106,6 +109,7 @@ class InputManager
+     }
+ 
+ private:
++    bool frameXboxLayout_ = false;
+     struct AutomationHandState
+     {
+         bool hasExplicitActivity = false;
+diff --git a/tests/TestInputManager.cpp b/tests/TestInputManager.cpp
+index 8c997d4..bb455c5 100644
+--- a/tests/TestInputManager.cpp
++++ b/tests/TestInputManager.cpp
+@@ -489,6 +489,74 @@ TEST_CASE("InputManager — a Steam Frame client's controllers report the Frame
+     CHECK_FALSE(im.GetBooleanComponentForProfile(L, "x/click", kTouch));
+ }
+ 
++TEST_CASE("InputManager — OXRSYS_FRAME_XBOX puts each Frame letter on the same Xbox letter under Touch", "[input]")
++{
++    // UEVR turns Touch into an Xbox pad: right a = A, left x = B, right b = X, left y = Y, squeeze = LB/RB,
++    // menu = Start. With the layout on, pressing the Frame's B must reach the app as Touch left x (Xbox B), and so on.
++    using namespace oxr::protocol;
++    constexpr const char* kTouch = "/interaction_profiles/oculus/touch_controller";
++    InputManager im;
++    im.SetFrameXboxLayout(true);
++    TrackingReceiver receiver;
++    im.SetTrackingReceiver(&receiver);
++    im.SetStreamingClientName("FrameClient");
++    const auto L = InputManager::Hand::Left;
++    const auto R = InputManager::Hand::Right;
++
++    uint64_t t = 1'000'000'000;
++    auto send = [&](uint32_t buttons) {
++        TrackingPacket packet = {};
++        packet.timestampNs = (t += 11'000'000);
++        packet.headOrientation[3] = 1.0f;
++        packet.trackingFlags = TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE | TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE;
++        packet.leftControllerRot[3] = 1.0f;
++        packet.rightControllerRot[3] = 1.0f;
++        packet.controllerProfile = CONTROLLER_PROFILE_VALVE_FRAME;
++        packet.buttonState = buttons;
++        receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
++        im.Update(0.0f);
++    };
++    auto pressed = [&](InputManager::Hand hand, const char* path) {
++        return im.GetBooleanComponentForProfile(hand, path, kTouch);
++    };
++
++    // Frame B, with the Touch bit SteamVR's remap sets for it (B -> Touch B): the app must see left x only.
++    send(BUTTON_FRAME_B | BUTTON_B);
++    CHECK(pressed(L, "x/click"));
++    CHECK_FALSE(pressed(R, "b/click"));
++    CHECK_FALSE(pressed(R, "a/click"));
++    CHECK_FALSE(pressed(L, "y/click"));
++
++    // Frame X (SteamVR also sends Touch B): right b.
++    send(BUTTON_FRAME_X | BUTTON_B);
++    CHECK(pressed(R, "b/click"));
++    CHECK_FALSE(pressed(L, "x/click"));
++
++    // Frame Y (SteamVR sends Touch B): left y. Frame A: right a.
++    send(BUTTON_FRAME_Y | BUTTON_B);
++    CHECK(pressed(L, "y/click"));
++    CHECK_FALSE(pressed(R, "b/click"));
++    send(BUTTON_FRAME_A | BUTTON_A);
++    CHECK(pressed(R, "a/click"));
++
++    // The left bumper squeezes the left grip, the right menu is the menu, and the d-pad reads as itself.
++    send(BUTTON_LEFT_BUMPER | BUTTON_FRAME_RIGHT_MENU | BUTTON_FRAME_DPAD_LEFT | BUTTON_X);
++    CHECK(im.GetFloatComponent(L, "squeeze/value") == 1.0f);
++    CHECK(im.GetFloatComponent(R, "squeeze/value") == 0.0f);
++    CHECK(pressed(L, "menu/click"));
++    CHECK(pressed(L, "dpad_left/click"));
++    CHECK_FALSE(pressed(L, "dpad_up/click"));
++    CHECK_FALSE(pressed(R, "dpad_left/click"));
++    CHECK_FALSE(pressed(R, "a/click"));   // SteamVR's Touch X for the d-pad is gone, and nothing else is pressed
++    CHECK_FALSE(pressed(L, "x/click"));
++
++    // Off: SteamVR's meaning comes through untouched (Frame B -> Touch B).
++    im.SetFrameXboxLayout(false);
++    send(BUTTON_FRAME_B | BUTTON_B);
++    CHECK(pressed(R, "b/click"));
++    CHECK_FALSE(pressed(L, "x/click"));
++}
++
+ TEST_CASE("TrackingReceiver — a packet that stops before touchState carries no controller profile", "[input]")
+ {
+     using namespace oxr::protocol;
+-- 
+2.43.0
+

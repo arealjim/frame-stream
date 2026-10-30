@@ -1,0 +1,1314 @@
+From b6616141c7da2fa1fd1ae1027728a1bfe0ce88a1 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 08:09:02 +0000
+Subject: [PATCH] runtime: review close-out 2026-10-21 (H11 H12 M14-M18 M20 M21
+ L12) - rate lock off by default and capability-gated, per-session pacing
+ state, sane latency reports, USB admission, RTT probe only when read, pacer
+ flushes on stop
+
+Closes the Mac runtime findings of the 2026-10-21 adversarial review that
+were still open. Nothing here changes what a worn stream does with the
+default config except where a finding said it should.
+
+H11 / M14: pacing_lock_wait_ms defaults to 0 (off). When set, the rate lock
+also requires the client to advertise CLIENT_CAPABILITY_PACING_LOCK
+(0x00002000, new in Protocol.h; 0x800 is FOVEATION_CENTER on the Frame client branch): the trim is driven by numbers the client
+reports, so a client whose LatencyReport means something else must not
+steer the app's cadence. LatencyReports with a non-finite or out-of-range
+field are dropped whole before they reach any atomic (LatencyReportCheck.h,
+unit-tested), and WaitFrame checks the error and the trim for finiteness
+before the cast - NaN in the PI integral was a NaN trim forever and
+(long long)NaN is undefined.
+
+M15: the pacing diagnostic accumulators and the rate lock's PI state move
+from function statics into Session members, so they die with the session
+and the client they were tuned against. The pacing_thread policy is applied
+per thread (thread_local), the time-constraint computation is a third of
+the period and the constraint half of it (2 ms / 5 ms before), and the
+mach_thread_self send right is released.
+
+M16: Config::GetSnapshot() returns a shared_ptr to the current values,
+replaced whole on reload. WaitFrame reads the config once per frame through
+it (three copies per frame before), and the encode thread's per-frame copy
+is gone too.
+
+H12: video_send_port (default 9944, 0 = ephemeral) and the bind is made
+without SO_REUSEADDR: a port another process holds - the desktop simulator
+binds 9944 on the same Mac - now fails the bind and falls back to an
+ephemeral port with a warning, instead of sharing the port silently. The
+default stays fixed because the Steam Frame's tailnet firewall zone only
+passes video the client pre-opened (2026-10-13).
+
+M17: the USB connect path runs the same admission decision as WiFi (its
+identity is 127.0.0.1 plus the device name), resets the tracking history,
+the sample timers and the RTT target, and reads the capabilities.
+
+M18: admission compares the device name as well as the address where both
+sides report one, so two devices behind one NAT, or a simulator on the
+host of a USB client, are told apart. The protocol has no refusal message;
+the refusal is logged (rate-limited) and the client keeps retrying.
+
+M20: rtt_probe = "auto" | "on" | "off" (auto = only while pose_prediction is
+"measured", the one mode that reads it; the probe sent ICMP/UDP from inside
+every app before). rtt_assumed_ms replaces the compiled-in 5.3. The UDP
+fallback no longer latches for the life of the process: a new target gets
+ICMP tried afresh.
+
+M21: the video send thread is joined before its socket is closed, and the
+pacer flushes when running_ goes false, so a paced frame can no longer send
+through a descriptor closed under it.
+
+L12: the prediction target timestamp is a saturating add of a bounded
+finite delta (the timestamp is the client's); the located-pose ring grows
+16 -> 64; the pacer's datagram count and the sender share one function
+(DatagramsForNal, unit-tested against the sender's packetisation).
+
+M19 is not changed: StreamingServer::EncodeThread already forces a
+keyframe every keyframe_interval_sec whatever the VideoToolbox session
+kind, so the periodic IDR the finding asked for exists; the Config.h and
+toml comments that said otherwise are corrected.
+
+Tests: 108 cases / 1076 assertions in oxrsys_runtime_tests, all passing;
+ctest 6/6 in build/macos-arm64-metalfix.
+---
+ CMakeLists.txt                                |   1 +
+ .../include/oxrsys/protocol/Protocol.h        |   2 +
+ runtime/oxrsys-runtime.toml                   |  28 ++-
+ runtime/src/ClientAdmission.h                 |  40 ++++-
+ runtime/src/Config.cpp                        |  25 +++
+ runtime/src/Config.h                          |  40 ++++-
+ runtime/src/LatencyReportCheck.h              |  32 ++++
+ runtime/src/PacketPacer.cpp                   |  12 ++
+ runtime/src/PacketPacer.h                     |   6 +
+ runtime/src/RttProbe.cpp                      |  12 ++
+ runtime/src/Session.cpp                       |  86 +++++----
+ runtime/src/Session.h                         |  20 ++-
+ runtime/src/StreamingServer.cpp               | 164 +++++++++++++-----
+ runtime/src/StreamingServer.h                 |  13 ++
+ runtime/src/TrackingReceiver.cpp              |  11 +-
+ tests/TestClientAdmission.cpp                 |  53 ++++++
+ tests/TestConfig.cpp                          |  41 +++++
+ tests/TestLatencyReportCheck.cpp              |  76 ++++++++
+ tests/TestPacketPacer.cpp                     |  14 ++
+ 19 files changed, 584 insertions(+), 92 deletions(-)
+ create mode 100644 runtime/src/LatencyReportCheck.h
+ create mode 100644 tests/TestLatencyReportCheck.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c9da380..b48a665 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -178,6 +178,7 @@ add_executable(oxrsys_runtime_tests
+     tests/TestEncoderPathPolicy.cpp
+     tests/TestEncoderSessionKind.cpp
+     tests/TestInputManager.cpp
++    tests/TestLatencyReportCheck.cpp
+     tests/TestRuntimePlatform.cpp
+     tests/TestStreamingAbr.cpp
+     tests/TestStreamingFrameQueue.cpp
+diff --git a/common/protocol/include/oxrsys/protocol/Protocol.h b/common/protocol/include/oxrsys/protocol/Protocol.h
+index a8b5cd7..9cf2aa6 100644
+--- a/common/protocol/include/oxrsys/protocol/Protocol.h
++++ b/common/protocol/include/oxrsys/protocol/Protocol.h
+@@ -128,6 +128,8 @@ enum ClientCapabilityFlags : uint32_t
+     CLIENT_CAPABILITY_SPATIAL_ENTITY = 0x00000100,
+     CLIENT_CAPABILITY_SCENE_CAPTURE = 0x00000200,
+     CLIENT_CAPABILITY_TEN_BIT_ENCODING = 0x00000400, // client can decode HEVC Main10
++    // 0x00000800 is CLIENT_CAPABILITY_FOVEATION_CENTER on the Steam Frame client branch; 0x1000 left free for it.
++    CLIENT_CAPABILITY_PACING_LOCK = 0x00002000,      // LatencyReport ages fit for the server rate lock (pacing_lock_wait_ms)
+ };
+ 
+ enum ClientCodecCapabilityFlags : uint32_t
+diff --git a/runtime/oxrsys-runtime.toml b/runtime/oxrsys-runtime.toml
+index 8dffde2..e362046 100644
+--- a/runtime/oxrsys-runtime.toml
++++ b/runtime/oxrsys-runtime.toml
+@@ -64,9 +64,31 @@ pacing_thread = "default"
+ pose_prediction = "fixed"
+ pose_prediction_horizon_ms = 0
+ 
+-
+-# VideoToolbox low-latency rate control for the hardware encoder: no look-ahead and no
+-# periodic keyframes (clients request them on loss). Cuts the encode callback from ~12.6 ms
++# Rate lock to the panel: hold the time a decoded frame waits on the client before it is
++# shown at this many ms by trimming the WaitFrame period (PI, clamp 0.5 % of the period), so
++# the app's cadence follows the headset's crystal instead of beating against it (worn on the
++# Steam Frame, 6 ms bought the lock without a frame of waiting, 2026-10-18). 0 = off, the
++# default: the lock steers the app from numbers the client reports, so it also only engages
++# for a client that advertises CLIENT_CAPABILITY_PACING_LOCK in its ClientConnect.
++pacing_lock_wait_ms = 0
++
++# Network RTT probe (ICMP echo to the client, else one UDP byte to a closed port, from inside
++# the app process). "auto" = only while pose_prediction is "measured", the one mode that reads
++# it; "on" = always; "off" = never. rtt_assumed_ms is used when the probe has no answer:
++# 5.3 is the Steam Frame's own access point (70 echoes, 2026-10-18); another link, another number.
++rtt_probe = "auto"
++rtt_assumed_ms = 5.3
++
++# Source port for video and pose packets. 9944 (the announced VIDEO_PORT) lets a client behind a
++# stateful firewall pre-open the return path with one datagram to it; 0 = ephemeral. The bind
++# fails over to ephemeral, with a warning, if another process on this Mac already holds the
++# port (the desktop simulator's video socket is 9944 too).
++video_send_port = 9944
++
++
++# VideoToolbox low-latency rate control for the hardware encoder: no look-ahead. The periodic
++# keyframe still comes every keyframe_interval_sec (the encode thread forces it, whatever the
++# session kind) on top of the client's requests on loss. Cuts the encode callback from ~12.6 ms
+ # to ~8.0 ms at 2272x1264 H.265 (M5 Pro, 2026-10-17). Set false to compare.
+ encoder_low_latency = true
+ 
+diff --git a/runtime/src/ClientAdmission.h b/runtime/src/ClientAdmission.h
+index 262e43f..8775caf 100644
+--- a/runtime/src/ClientAdmission.h
++++ b/runtime/src/ClientAdmission.h
+@@ -20,6 +20,15 @@
+ // how a client resends a lost ClientConnect and how a restarted client (new source
+ // port, same host) reconnects before the liveness watchdog has noticed the old one
+ // is gone. The port is deliberately not compared.
++//
++// Since 2026-10-21 the device name is part of the identity too, where both sides
++// report one: two devices behind one NAT share an address, and a USB client is
++// recorded as 127.0.0.1, which a simulator on the same host also presents. A
++// candidate from the connected address with a DIFFERENT non-empty name is refused;
++// an empty name on either side falls back to the address-only rule. The USB
++// connect path runs through the same decision with "127.0.0.1" as its address.
++// The protocol has no server-to-client refusal message, so a refused client is only
++// logged here; it keeps retrying until the connected one leaves.
+ namespace oxrsys
+ {
+ 
+@@ -43,24 +52,49 @@ struct ClientAdmissionState
+ inline ClientAdmissionDecision EvaluateClientAdmission(ClientAdmissionState& state,
+                                                        bool clientConnected,
+                                                        const std::string& connectedIp,
++                                                       const std::string& connectedName,
+                                                        const std::string& candidateIp,
++                                                       const std::string& candidateName,
+                                                        int64_t nowNs,
+                                                        int64_t logIntervalNs)
+ {
+     ClientAdmissionDecision decision;
+-    if (!clientConnected || connectedIp.empty() || connectedIp == candidateIp)
++    if (!clientConnected || connectedIp.empty())
++    {
++        return decision;
++    }
++    const bool sameAddress = connectedIp == candidateIp;
++    const bool namesKnown = !connectedName.empty() && !candidateName.empty();
++    const bool sameName = !namesKnown || connectedName == candidateName;
++    if (sameAddress && sameName)
+     {
+         return decision;
+     }
+     decision.accept = false;
+-    if (state.lastRefusedIp != candidateIp || state.lastRefusalLogNs == 0 ||
++    // The log key is the candidate's identity, so a second device behind the same
++    // address is logged on its own first refusal.
++    const std::string refusedKey = candidateIp + "/" + candidateName;
++    if (state.lastRefusedIp != refusedKey || state.lastRefusalLogNs == 0 ||
+         nowNs - state.lastRefusalLogNs >= logIntervalNs)
+     {
+         decision.log = true;
+-        state.lastRefusedIp = candidateIp;
++        state.lastRefusedIp = refusedKey;
+         state.lastRefusalLogNs = nowNs;
+     }
+     return decision;
+ }
+ 
++// Address-only form (the policy before 2026-10-21; kept for callers and tests that
++// have no device name).
++inline ClientAdmissionDecision EvaluateClientAdmission(ClientAdmissionState& state,
++                                                       bool clientConnected,
++                                                       const std::string& connectedIp,
++                                                       const std::string& candidateIp,
++                                                       int64_t nowNs,
++                                                       int64_t logIntervalNs)
++{
++    return EvaluateClientAdmission(state, clientConnected, connectedIp, std::string(),
++                                   candidateIp, std::string(), nowNs, logIntervalNs);
++}
++
+ } // namespace oxrsys
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index c16b200..d5021fc 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -413,6 +413,19 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+                 value = ParseString(value);
+                 values.posePrediction = (value == "measured") ? "measured" : "fixed";
+             }
++            else if (key == "rtt_probe")
++            {
++                value = ParseString(value);
++                values.rttProbe = (value == "on" || value == "off") ? value : "auto";
++            }
++            else if (key == "rtt_assumed_ms")
++            {
++                values.rttAssumedMs = std::max(0.0f, std::min(200.0f, std::stof(value)));
++            }
++            else if (key == "video_send_port")
++            {
++                values.videoSendPort = static_cast<uint32_t>(std::max(0, std::min(65535, std::stoi(value))));
++            }
+             else if (key == "pose_prediction_horizon_ms")
+             {
+                 values.posePredictionHorizonMs = std::max(0.0f, std::min(80.0f, std::stof(value)));
+@@ -654,6 +667,7 @@ bool Config::ReloadIfChangedLocked(bool force)
+     }
+ 
+     values_ = newValues;
++    snapshot_ = std::make_shared<const ConfigValues>(values_);
+     configFilePath = resolvedPath;
+     hasConfigFile_ = fileExists;
+     hasKnownWriteTime_ = fileExists && hasWriteTime;
+@@ -786,6 +800,17 @@ ConfigValues Config::GetValues()
+     return values_;
+ }
+ 
++std::shared_ptr<const ConfigValues> Config::GetSnapshot()
++{
++    RefreshIfNeeded();
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!snapshot_)
++    {
++        snapshot_ = std::make_shared<const ConfigValues>(values_);
++    }
++    return snapshot_;
++}
++
+ // ─── Logging setup ───────────────────────────────────────────────────────────
+ 
+ void Config::SetupLogging()
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index 89a212d..2cae817 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -7,6 +7,7 @@
+ #include <cstdio>
+ #include <filesystem>
+ #include <istream>
++#include <memory>
+ #include <mutex>
+ #include <string>
+ #include <thread>
+@@ -25,9 +26,12 @@ struct ConfigValues
+     std::string encoderPreset = "balanced"; // "quality", "balanced", "speed"
+     bool encoder10Bit = false;      // Encode HEVC Main10 for capable H.265 clients
+     // VideoToolbox low-latency rate control for the in-process hardware session
+-    // (kVTVideoEncoderSpecification_EnableLowLatencyRateControl): no look-ahead,
+-    // no periodic IDR (keyframes come from ForceKeyFrame, i.e. client requests).
+-    // Measured 2026-10-17, M5 Pro, 2272x1264 HEVC @72: encode callback 12.6 -> 8.0 ms.
++    // (kVTVideoEncoderSpecification_EnableLowLatencyRateControl): no look-ahead. The
++    // session itself schedules no periodic IDR in this mode; the periodic keyframe comes
++    // from StreamingServer::EncodeThread, which forces one every keyframe_interval_sec
++    // (frameIndex % (interval * refresh) == 0) whatever the session kind, on top of the
++    // client's RequestKeyframe. Measured 2026-10-17, M5 Pro, 2272x1264 HEVC @72: encode
++    // callback 12.6 -> 8.0 ms.
+     bool encoderLowLatency = true;
+     // encoder_min_qp: kVTCompressionPropertyKey_MinAllowedFrameQP on the in-process session,
+     // 0 = leave VideoToolbox's own floor. The low-latency (rtvc) session floors QP at 16 and
+@@ -54,7 +58,8 @@ struct ConfigValues
+     // pacing_spin_ms: WaitFrame sleeps until (deadline - this) and spins the rest. 0 = sleep to the deadline.
+     float pacingSpinMs = 0.0f;
+     // pacing_thread: "default" | "qos" (USER_INTERACTIVE QoS on the app thread that calls WaitFrame)
+-    // | "realtime" (Mach time-constraint policy: period = frame, computation 2 ms, constraint 5 ms).
++    // | "realtime" (Mach time-constraint policy: period = frame, computation = a third of it,
++    // constraint = half of it). Applied per thread, on each thread that calls WaitFrame.
+     std::string pacingThread = "default";
+     // pacing_lock_wait_ms: hold the time a decoded frame waits on the client before it is shown
+     // (its displayed age minus receive->submit, decode and the client's eye pass - the part that is
+@@ -62,8 +67,12 @@ struct ConfigValues
+     // period). That locks the sender's rate to the panel's and sets the latency margin: worn on the
+     // Steam Frame the wait's floor is ~0 ms and arrivals jitter sd 1.3-3.3 ms with 25-30 ms spikes,
+     // so 6 ms buys the lock without a frame of waiting (a fixed 15 ms AGE setpoint, the first form,
+-    // cost a full period of pickup latency worn: 13-14.6 ms). 0 = off. Measured 2026-10-18.
+-    float pacingLockWaitMs = 6.0f;
++    // cost a full period of pickup latency worn: 13-14.6 ms). Measured 2026-10-18.
++    // 0 = off, the default since 2026-10-21: the lock trims the app's frame cadence from numbers
++    // the client reports, so it also only engages for a client that advertises
++    // CLIENT_CAPABILITY_PACING_LOCK (its displayed-frame age and pipeline parts are the ones
++    // GetClientQueueWaitMs expects). Non-finite or absurd reports are dropped before they reach it.
++    float pacingLockWaitMs = 0.0f;
+     // pose_prediction: how far ahead of the client's tracking sample the head pose a frame is
+     // rendered with is predicted. "fixed" (default) = the server encode pipeline + the client's
+     // reported pipeline, as before (10.4 ms on the Frame, 2026-10-18). "measured" = the measured
+@@ -71,6 +80,14 @@ struct ConfigValues
+     // RTT (ICMP echo to the client) + the client's displayed frame age, clamped 0-60 ms. The
+     // latency and the derived reprojection delta are logged in both modes.
+     std::string posePrediction = "fixed";
++    // rtt_probe: whether the runtime measures the RTT to the client (ICMP echo, else UDP to a
++    // closed port, from inside the app process). "auto" (default) = only while pose_prediction is
++    // "measured", the one mode that uses it; "on" = always; "off" = never.
++    std::string rttProbe = "auto";
++    // rtt_assumed_ms: the RTT used in "measured" mode when the probe has no answer (a firewall,
++    // an ICMP-silent client, rtt_probe = "off"). 5.3 = the Steam Frame's own access point,
++    // 70 echoes, 2026-10-18 (min 3.4 / avg 5.3 / max 9.5 ms); another link needs its own number.
++    float rttAssumedMs = 5.3f;
+     // pose_prediction_horizon_ms: > 0 forces this horizon in either mode (0-80); 0 = off.
+     float posePredictionHorizonMs = 0.0f;
+     // pose_prediction_position_scale: the fraction of the horizon the HEAD POSITION is predicted
+@@ -98,6 +115,12 @@ struct ConfigValues
+     std::string encoderHelperMode = "auto";
+     std::string encoderHelperPath; // empty = sibling of the runtime dylib
+     std::string streamingTransport = "auto"; // "auto", "wifi", "usb_adb"
++    // video_send_port: the source port video and pose packets leave from. 9944 (default) = the
++    // announced VIDEO_PORT, which a client behind a stateful firewall (the Steam Frame's tailnet
++    // zone, 2026-10-13) pre-opens with a hole-punch datagram; 0 = ephemeral. The bind is made
++    // without SO_REUSEADDR, so a port another process holds (the desktop simulator binds 9944 on
++    // the same Mac) fails the bind and falls back to ephemeral with a warning instead of sharing.
++    uint32_t videoSendPort = 9944;
+     std::string foveatedEncodingPreset = "off"; // "off", "light", "medium", "medium_plus", "high"
+     std::string clientFoveationPreset = "auto"; // "auto", "off", "light", "medium", "high"
+     bool clientUpscaling = false;    // Enable Quest shader upscaling
+@@ -147,6 +170,10 @@ class Config
+     static Config& Get();
+ 
+     ConfigValues GetValues();
++    // The same values without a copy: a shared pointer to the current snapshot, replaced whole on
++    // each reload. For per-frame readers (WaitFrame, the encode thread), which copied ConfigValues
++    // three to four times a frame before 2026-10-21.
++    std::shared_ptr<const ConfigValues> GetSnapshot();
+     void RefreshIfNeeded();
+ 
+     // Resolved paths
+@@ -176,6 +203,7 @@ class Config
+ 
+     mutable std::mutex mutex_;
+     ConfigValues values_;
++    std::shared_ptr<const ConfigValues> snapshot_;
+     std::filesystem::file_time_type lastConfigWriteTime_ = {};
+     bool hasConfigFile_ = false;
+     bool hasKnownWriteTime_ = false;
+diff --git a/runtime/src/LatencyReportCheck.h b/runtime/src/LatencyReportCheck.h
+new file mode 100644
+index 0000000..02ebf91
+--- /dev/null
++++ b/runtime/src/LatencyReportCheck.h
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#pragma once
++
++#include <oxrsys/protocol/Protocol.h>
++
++#include <cmath>
++
++namespace oxrsys
++{
++
++// A LatencyReport's floats are client-supplied and feed the rate lock's PI integral and the
++// prediction horizon through atomics. A NaN or infinity there is a NaN trim forever, and
++// (long long)NaN is undefined; a value beyond anything a pipeline can measure is a broken
++// client. Every field must be finite and inside [0, kMaxLatencyReportMs].
++constexpr float kMaxLatencyReportMs = 10000.0f;
++
++inline bool LatencyFieldIsSane(float ms)
++{
++    return std::isfinite(ms) && ms >= 0.0f && ms <= kMaxLatencyReportMs;
++}
++
++inline bool LatencyReportIsSane(const oxr::protocol::LatencyReport& report)
++{
++    return LatencyFieldIsSane(report.receiveToDecoderSubmitMs) &&
++           LatencyFieldIsSane(report.decodeLatencyMs) &&
++           LatencyFieldIsSane(report.compositorLatencyMs) &&
++           LatencyFieldIsSane(report.totalClientLatencyMs) &&
++           LatencyFieldIsSane(report.displayedFrameAgeMs);
++}
++
++} // namespace oxrsys
+diff --git a/runtime/src/PacketPacer.cpp b/runtime/src/PacketPacer.cpp
+index 07dd3fd..37db991 100644
+--- a/runtime/src/PacketPacer.cpp
++++ b/runtime/src/PacketPacer.cpp
+@@ -18,6 +18,18 @@
+ namespace oxrsys::streaming
+ {
+ 
++    uint32_t DatagramsForNal(size_t payloadSize, size_t maxPayload, uint32_t fecGroupSize)
++    {
++        if (payloadSize == 0 || maxPayload == 0)
++        {
++            return 0;
++        }
++        const uint32_t dataPackets = static_cast<uint32_t>((payloadSize + maxPayload - 1) / maxPayload);
++        const uint32_t parityPackets =
++            fecGroupSize == 0 ? 0 : (dataPackets + fecGroupSize - 1) / fecGroupSize;
++        return dataPackets + parityPackets;
++    }
++
+     int64_t PacingWindowNs(const PacketPacingConfig& config, bool keyframe, uint32_t refreshRateHz)
+     {
+         if (config.windowMs <= 0.0f)
+diff --git a/runtime/src/PacketPacer.h b/runtime/src/PacketPacer.h
+index 1997423..8b07b84 100644
+--- a/runtime/src/PacketPacer.h
++++ b/runtime/src/PacketPacer.h
+@@ -34,6 +34,12 @@ namespace oxrsys::streaming
+     // deadline and spin the rest (sleep overshoots by 50-500 us on macOS).
+     constexpr int64_t kPacingSpinThresholdNs = 1'000'000;
+ 
++    // Datagrams one NAL of payloadSize bytes becomes on the wire: ceil(payload / maxPayload)
++    // data packets plus one FEC parity packet per fecGroupSize of them (and for the tail
++    // group). The same arithmetic SendNalUnit sends by, so the pacer's plan and the sender's
++    // count cannot drift apart (they were written twice before 2026-10-21).
++    uint32_t DatagramsForNal(size_t payloadSize, size_t maxPayload, uint32_t fecGroupSize);
++
+     // The window (ns) one frame's packets are spread over: the configured window
+     // (keyframe window for keyframes), capped at kMaxPacingFrameFraction of the
+     // frame period. 0 means send as one burst.
+diff --git a/runtime/src/RttProbe.cpp b/runtime/src/RttProbe.cpp
+index 5ab9bf8..e52de69 100644
+--- a/runtime/src/RttProbe.cpp
++++ b/runtime/src/RttProbe.cpp
+@@ -274,6 +274,7 @@ void RttProbe::ThreadMain()
+     spdlog::info("RttProbe: measuring RTT to the streaming client by {}",
+                  useUdp ? "UDP port-unreachable (1 Hz)" : "ICMP echo (4 Hz)");
+ 
++    uint64_t lastGeneration = 0;
+     std::unique_lock<std::mutex> lock(mutex_);
+     while (!stop_)
+     {
+@@ -285,6 +286,17 @@ void RttProbe::ThreadMain()
+         const std::string target = target_;
+         const uint64_t generation = targetGeneration_;
+         lock.unlock();
++        if (generation != lastGeneration)
++        {
++            // A new target gets ICMP tried afresh (2026-10-21): the UDP fallback latched for
++            // the life of the process before, so one ICMP-silent client demoted every later one.
++            lastGeneration = generation;
++            if (icmpSock >= 0 && useUdp)
++            {
++                useUdp = false;
++                icmpRefusals = 0;
++            }
++        }
+ 
+         sockaddr_in addr = {};
+         addr.sin_family = AF_INET;
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index c3e4bb0..a218000 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -28,13 +28,6 @@
+ #include <glm/glm.hpp>
+ #include <glm/gtc/quaternion.hpp>
+ 
+-namespace {
+-struct PacingDiag {
+-    double overshootSum = 0, overshootMax = 0, lateSum = 0;
+-    uint32_t slept = 0, appLate = 0;
+-};
+-}
+-
+ namespace
+ {
+ glm::quat ToGlmQuat(const XrQuaternionf& q) { return glm::quat(q.w, q.x, q.y, q.z); }
+@@ -450,9 +443,6 @@ void Session::GetDebugUtilsLabels(std::vector<XrDebugUtilsLabelEXT>& labels, std
+     }
+ }
+ 
+-// Rate-lock state for the pacing log line (see WaitFrame).
+-static double s_lockErrMs = 0.0, s_lockTrimPpm = 0.0;
+-
+ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState* frameState)
+ {
+     if (frameWaitInfo != nullptr && frameWaitInfo->type != XR_TYPE_FRAME_WAIT_INFO)
+@@ -496,16 +486,20 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+     // absorbed by the next and the cadence locks to the panel period with low
+     // variance. targetFrameTime comes from the client-reported (negotiated) refresh.
+     auto targetFrameTime = std::chrono::nanoseconds(1000000000ll / targetRefreshHz);
+-    static PacingDiag pacing;
++    PacingDiag& pacing = pacingDiag_;
++    // One config read per frame, by pointer (no ConfigValues copy on the render thread).
++    const std::shared_ptr<const ConfigValues> cfg = Config::Get().GetSnapshot();
+     // pacing_thread: the app's render thread is what sleeps here. On an M5 a default-QoS
+     // thread's sleep_until overshoots by 3 ms mean / 6 ms max (timer slack, measured
+     // 2026-10-18); a QoS or time-constraint thread gets tighter timers without spinning.
+     {
+-        static bool applied = false;
++        // Per thread: the policy belongs to whichever thread waits here, and a second thread
++        // (a second session, an engine that moves its render thread) gets its own.
++        thread_local bool applied = false;
+         if (!applied)
+         {
+             applied = true;
+-            const std::string& mode = Config::Get().GetValues().pacingThread;
++            const std::string& mode = cfg->pacingThread;
+             if (mode == "qos")
+             {
+                 const int rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+@@ -518,13 +512,20 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+                 const double nsPerAbs = (double)tb.numer / (double)tb.denom;
+                 thread_time_constraint_policy_data_t policy{};
+                 policy.period = (uint32_t)(targetFrameTime.count() / nsPerAbs);
+-                policy.computation = (uint32_t)(2'000'000 / nsPerAbs);
+-                policy.constraint = (uint32_t)(5'000'000 / nsPerAbs);
++                // A render thread does real work between its WaitFrames: a third of the period
++                // of computation (4.6 ms at 72 Hz; 2 ms before 2026-10-21 under-declared it) and
++                // half the period as the constraint.
++                const long long computationNs = targetFrameTime.count() / 3;
++                const long long constraintNs = targetFrameTime.count() / 2;
++                policy.computation = (uint32_t)(computationNs / nsPerAbs);
++                policy.constraint = (uint32_t)(constraintNs / nsPerAbs);
+                 policy.preemptible = 1;
+-                const kern_return_t kr = thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY,
++                const thread_port_t self = mach_thread_self();   // a send right: released below
++                const kern_return_t kr = thread_policy_set(self, THREAD_TIME_CONSTRAINT_POLICY,
+                                                            (thread_policy_t)&policy, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+-                spdlog::info("OXRSys: Session::WaitFrame pacing_thread=realtime period={}us computation=2ms constraint=5ms kr={}",
+-                             targetFrameTime.count() / 1000, (int)kr);
++                mach_port_deallocate(mach_task_self(), self);
++                spdlog::info("OXRSys: Session::WaitFrame pacing_thread=realtime period={}us computation={}us constraint={}us kr={}",
++                             targetFrameTime.count() / 1000, computationNs / 1000, constraintNs / 1000, (int)kr);
+             }
+         }
+     }
+@@ -544,7 +545,7 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+         // the remainder; the diagnostic below separates sleep overshoot from a late app.
+         if (now < nextFrameDeadline_)
+         {
+-            const float spinMs = Config::Get().GetValues().pacingSpinMs;
++            const float spinMs = cfg->pacingSpinMs;
+             if (spinMs > 0.0f)
+             {
+                 const auto spinStart = nextFrameDeadline_ - std::chrono::duration_cast<std::chrono::nanoseconds>(
+@@ -577,32 +578,41 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+         // is our phase (the decoded frame's wait before pickup) at pacing_lock_wait_ms by trimming
+         // the period: waiting too long means we run early, so lengthen. PI, trim clamped to 0.5% of the period (far more than the 0.14% drift),
+         // reset whenever the client's report counter restarts (reconnect) or nobody is connected.
++        // Off by default and only for a client that advertises CLIENT_CAPABILITY_PACING_LOCK
++        // (2026-10-21): the trim is driven by numbers the client reports, so a client whose
++        // LatencyReport means something else must not steer the app's cadence.
+         {
+-            static uint32_t lastReportCount = 0;
+-            static double integralMs = 0.0;
+-            static double trimNs = 0.0;
+-            const float setpoint = Config::Get().GetValues().pacingLockWaitMs;
+-            if (setpoint > 0.0f && streamingServer_ && streamingServer_->IsClientConnected())
++            const float setpoint = cfg->pacingLockWaitMs;
++            if (setpoint > 0.0f && streamingServer_ && streamingServer_->IsClientConnected() &&
++                streamingServer_->ClientSupportsPacingLock())
+             {
+                 const uint32_t count = streamingServer_->GetClientLatencyReportCount();
+-                if (count != lastReportCount)
++                if (count != lockLastReportCount_)
+                 {
+-                    if (count < lastReportCount) { integralMs = 0.0; trimNs = 0.0; }
+-                    lastReportCount = count;
++                    if (count < lockLastReportCount_) { lockIntegralMs_ = 0.0; lockTrimNs_ = 0.0; }
++                    lockLastReportCount_ = count;
+                     const double errMs = (double)streamingServer_->GetClientQueueWaitMs() - setpoint;
+-                    integralMs = std::clamp(integralMs + errMs, -15.0, 15.0);   // anti-windup: at most 0.15% from the integral
+-                    const double periodNs = (double)targetFrameTime.count();
+-                    const double maxTrim = 0.005 * periodNs;
+-                    trimNs = std::clamp((0.0006 * errMs + 0.0001 * integralMs) * periodNs, -maxTrim, maxTrim);
+-                    s_lockErrMs = errMs;
+-                    s_lockTrimPpm = trimNs / periodNs * 1e6;
++                    // The server drops non-finite reports before they are stored; this is the
++                    // second wall, since NaN in the integral would be a NaN trim forever.
++                    if (std::isfinite(errMs))
++                    {
++                        lockIntegralMs_ = std::clamp(lockIntegralMs_ + errMs, -15.0, 15.0);   // anti-windup: at most 0.15% from the integral
++                        const double periodNs = (double)targetFrameTime.count();
++                        const double maxTrim = 0.005 * periodNs;
++                        lockTrimNs_ = std::clamp((0.0006 * errMs + 0.0001 * lockIntegralMs_) * periodNs, -maxTrim, maxTrim);
++                        lockErrMs_ = errMs;
++                        lockTrimPpm_ = lockTrimNs_ / periodNs * 1e6;
++                    }
+                 }
+             }
+             else
+             {
+-                lastReportCount = 0; integralMs = 0.0; trimNs = 0.0; s_lockErrMs = 0.0; s_lockTrimPpm = 0.0;
++                lockLastReportCount_ = 0; lockIntegralMs_ = 0.0; lockTrimNs_ = 0.0; lockErrMs_ = 0.0; lockTrimPpm_ = 0.0;
++            }
++            if (std::isfinite(lockTrimNs_))
++            {
++                nextFrameDeadline_ += std::chrono::nanoseconds((long long)lockTrimNs_);
+             }
+-            nextFrameDeadline_ += std::chrono::nanoseconds((long long)trimNs);
+         }
+ 
+         // If we fell far behind (a hitch, a stall, or the app pausing), snap the grid
+@@ -617,8 +627,8 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+     // cadence locks to the negotiated period (e.g. ~13.9ms @72Hz, ~11.1ms @90Hz)
+     // with low variance instead of free-running / drifting.
+     {
+-        static std::vector<double> intervalSamplesMs;
+-        static auto lastPacingLog = Clock::now();
++        std::vector<double>& intervalSamplesMs = pacingIntervalSamplesMs_;
++        auto& lastPacingLog = pacingLastLog_;
+         auto intervalMs = std::chrono::duration<double, std::milli>(now - lastFrameTime_).count();
+         if (lastFrameTime_ != startTime_)
+         {
+@@ -641,7 +651,7 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState*
+                          mean, stddev, *mm.first, *mm.second, intervalSamplesMs.size(),
+                          pacing.slept ? pacing.overshootSum / pacing.slept : 0.0, pacing.overshootMax, pacing.slept,
+                          pacing.appLate, pacing.appLate ? pacing.lateSum / pacing.appLate : 0.0,
+-                         Config::Get().GetValues().pacingSpinMs, s_lockErrMs, s_lockTrimPpm);
++                         cfg->pacingSpinMs, lockErrMs_, lockTrimPpm_);
+             pacing = PacingDiag{};
+             intervalSamplesMs.clear();
+             lastPacingLog = now;
+diff --git a/runtime/src/Session.h b/runtime/src/Session.h
+index d294f7b..9c84cac 100644
+--- a/runtime/src/Session.h
++++ b/runtime/src/Session.h
+@@ -149,7 +149,9 @@ class Session
+     // kept with its displayTime and EndFrame picks the one for ITS displayTime; the stats say how often
+     // the old rule would have been wrong and by how much.
+     struct LocatedPose { XrTime displayTime = 0; XrPosef pose = {{0, 0, 0, 1}, {0, 0, 0}}; };
+-    std::array<LocatedPose, 16> locatedPoses_ = {};
++    // 64 entries (16 before 2026-10-21): an app that locates several times a frame, or runs
++    // ahead by more than a few frames, evicted the pose for a frame still to be submitted.
++    std::array<LocatedPose, 64> locatedPoses_ = {};
+     size_t locatedPoseNext_ = 0;
+     std::mutex locatedPoseMutex_;
+     uint32_t tagExact_ = 0, tagFallback_ = 0, tagLastWasNewer_ = 0;
+@@ -171,6 +173,22 @@ class Session
+     // overshoot does not accumulate into phase drift / a slow beat against the panel.
+     std::chrono::steady_clock::time_point nextFrameDeadline_{};
+     std::chrono::nanoseconds pacingPeriod_{0};
++    // Per-session pacing state (2026-10-21; function-static before, so it outlived the session
++    // and the client it was tuned against): the 1 s diagnostic's accumulators and the rate lock's
++    // PI state. lockLastReportCount_ restarting (a reconnect) or nobody connected resets the lock.
++    struct PacingDiag
++    {
++        double overshootSum = 0, overshootMax = 0, lateSum = 0;
++        uint32_t slept = 0, appLate = 0;
++    };
++    PacingDiag pacingDiag_;
++    std::vector<double> pacingIntervalSamplesMs_;
++    std::chrono::steady_clock::time_point pacingLastLog_ = std::chrono::steady_clock::now();
++    uint32_t lockLastReportCount_ = 0;
++    double lockIntegralMs_ = 0.0;
++    double lockTrimNs_ = 0.0;
++    double lockErrMs_ = 0.0;     // for the pacing log line
++    double lockTrimPpm_ = 0.0;
+ 
+     std::vector<DebugUtilsLabelState> debugUtilsLabelRegions_;
+     std::optional<DebugUtilsLabelState> debugUtilsInsertedLabel_;
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index fabedbc..bca9168 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -4,6 +4,7 @@
+ #include "ClientLiveness.h"
+ #include "Config.h"
+ #include "EncodedFrameStats.h"
++#include "LatencyReportCheck.h"
+ #include "RuntimePlatform.h"
+ #include "RuntimeSockets.h"
+ #include "RuntimeStatus.h"
+@@ -632,6 +633,11 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
+     posePredictionMeasured_ = config.posePrediction == "measured";
+     posePredictionOverrideMs_ = config.posePredictionHorizonMs;
+     posePredictionPositionScale_ = config.posePredictionPositionScale;
++    rttProbeMode_ = config.rttProbe;
++    rttAssumedMs_ = config.rttAssumedMs;
++    spdlog::info("StreamingServer: rtt_probe={} ({}), rtt_assumed_ms={:.1f}", rttProbeMode_,
++                 ShouldProbeRtt() ? "probing while a client is connected" : "not probing",
++                 rttAssumedMs_);
+     spdlog::info("StreamingServer: pose_prediction={}{}", config.posePrediction,
+                  posePredictionOverrideMs_ > 0.0f
+                      ? " (pose_prediction_horizon_ms override " +
+@@ -660,6 +666,7 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
+     clientSupportsStreamReconfigure_.store(false);
+     clientSupportsMixedRealityPassthrough_.store(false);
+     clientSupportsSpatialEntity_.store(false);
++    clientSupportsPacingLock_.store(false);
+     activeVideoCodec_.store(oxr::protocol::VideoCodec::H265);
+     {
+         std::lock_guard<std::mutex> lock(streamConfigMutex_);
+@@ -741,28 +748,36 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
+         return false;
+     }
+ 
+-    // Send video from a fixed, announced port so a client behind a stateful firewall or NAT can
+-    // open the return path itself: one datagram from its video socket to <server>:VIDEO_PORT
+-    // makes every video/pose packet we send a reply to an existing flow. Ephemeral source ports
+-    // cannot be pre-opened by the client. Falls back to an ephemeral port if the bind fails.
++    // Send video from a fixed, announced port (video_send_port, default VIDEO_PORT) so a client
++    // behind a stateful firewall or NAT can open the return path itself: one datagram from its
++    // video socket to <server>:VIDEO_PORT makes every video/pose packet we send a reply to an
++    // existing flow. Ephemeral source ports cannot be pre-opened by the client. video_send_port = 0
++    // leaves the port ephemeral. The bind is made WITHOUT SO_REUSEADDR (2026-10-21): with it, a
++    // second UDP socket on this Mac already bound to the port (the desktop simulator's video
++    // socket is 9944 too) shared the port silently and datagrams went to whichever the kernel
++    // chose; now that bind fails and we fall back to an ephemeral port, with a warning.
++    if (config.videoSendPort != 0)
+     {
+-        oxrsys::runtime_socket::SetReuseAddress(videoSocket_);
+         sockaddr_in videoBind = {};
+         videoBind.sin_family = AF_INET;
+-        videoBind.sin_port = htons(oxr::protocol::VIDEO_PORT);
++        videoBind.sin_port = htons(static_cast<uint16_t>(config.videoSendPort));
+         videoBind.sin_addr.s_addr = INADDR_ANY;
+         if (bind(videoSocket_, (sockaddr*)&videoBind, sizeof(videoBind)) < 0)
+         {
+-            spdlog::warn("StreamingServer: could not bind video send socket to port {} ({}); "
+-                         "clients behind stateful firewalls will not receive video",
+-                         oxr::protocol::VIDEO_PORT, oxrsys::runtime_socket::LastErrorText());
++            spdlog::warn("StreamingServer: could not bind video send socket to port {} ({}; another "
++                         "process - the simulator? - may hold it); sending from an ephemeral port, "
++                         "which a client behind a stateful firewall will not receive",
++                         config.videoSendPort, oxrsys::runtime_socket::LastErrorText());
+         }
+         else
+         {
+-            spdlog::info("StreamingServer: video send socket bound to port {}",
+-                         oxr::protocol::VIDEO_PORT);
++            spdlog::info("StreamingServer: video send socket bound to port {}", config.videoSendPort);
+         }
+     }
++    else
++    {
++        spdlog::info("StreamingServer: video_send_port = 0, sending video from an ephemeral port");
++    }
+     oxrsys::runtime_socket::SetSendBuffer(videoSocket_, 4 * 1024 * 1024);
+     {
+         std::lock_guard<std::mutex> lock(packetDispatchState_->mutex);
+@@ -859,6 +874,12 @@ bool StreamingServer::Stop(std::chrono::nanoseconds timeout)
+     }
+     rttProbe_.SetTarget(std::string());
+ 
++    // The video send thread is joined BEFORE its socket is closed (2026-10-21): it may be in the
++    // middle of a paced frame, and a send through a descriptor closed under it would hit
++    // whatever the kernel next hands that number to. It needs no close to wake: running_ is
++    // false, the queue is stopped and the pacer flushes on !running_.
++    JoinWorkerThread(videoSendThread_, "video send");
++
+     oxrsys::runtime_socket::Close(broadcastSocket_);
+     oxrsys::runtime_socket::Close(controlSocket_);
+     oxrsys::runtime_socket::Close(videoSocket_);
+@@ -869,7 +890,6 @@ bool StreamingServer::Stop(std::chrono::nanoseconds timeout)
+     }
+     JoinWorkerThread(controlThread_, "control");
+     JoinWorkerThread(encodeThread_, "encode");
+-    JoinWorkerThread(videoSendThread_, "video send");
+     JoinWorkerThread(tcpControlThread_, "USB control");
+     JoinWorkerThread(tcpVideoThread_, "USB video");
+     JoinWorkerThread(tcpTrackingThread_, "USB tracking");
+@@ -1419,8 +1439,8 @@ void StreamingServer::EncodeThread()
+         telemetry->queueWaitMs.Add(queueWaitMs);
+ 
+         uint32_t currentRefreshHz = std::max(targetRefreshRateHz_.load(), 1u);
+-        const ConfigValues config = Config::Get().GetValues();
+-        uint32_t keyframeFrames = std::max(config.keyframeIntervalSec * currentRefreshHz, 1u);
++        const std::shared_ptr<const ConfigValues> config = Config::Get().GetSnapshot();   // no per-frame copy
++        uint32_t keyframeFrames = std::max(config->keyframeIntervalSec * currentRefreshHz, 1u);
+         bool forceKeyframe = frame.frameIndex < 5 || (frame.frameIndex % keyframeFrames == 0);
+ 
+         std::shared_ptr<VideoEncoder> encoder;
+@@ -1588,21 +1608,21 @@ void StreamingServer::EncodeThread()
+                     stats.refreshRateHz = server->targetRefreshRateHz_.load();
+                     stats.currentBitrateMbps = server->currentBitrateMbps_.load();
+                     stats.maxBitrateMbps = server->configMaxBitrateMbps_.load();
+-                    stats.configuredBitrateMbps = config.bitrateMbps;
++                    stats.configuredBitrateMbps = config->bitrateMbps;
+                     stats.renderWidth = server->renderWidth_ * 2;
+                     stats.renderHeight = server->renderHeight_;
+                     stats.encodedWidth = layoutState.encodedWidth;
+                     stats.encodedHeight = layoutState.encodedHeight;
+                     stats.videoCodec = VideoCodecName(server->activeVideoCodec_.load());
+-                    stats.encoderPreset = config.encoderPreset;
++                    stats.encoderPreset = config->encoderPreset;
+                     const bool foveatedEncodingActive =
+                         server->clientFoveatedEncodingActive_.load();
+                     stats.foveatedEncodingPreset = foveatedEncodingActive
+-                        ? config.foveatedEncodingPreset
++                        ? config->foveatedEncodingPreset
+                         : "off";
+-                    stats.foveatedEncodingRequestedPreset = config.foveatedEncodingPreset;
++                    stats.foveatedEncodingRequestedPreset = config->foveatedEncodingPreset;
+                     stats.foveatedEncodingActive = foveatedEncodingActive;
+-                    if (config.foveatedEncodingPreset == "off")
++                    if (config->foveatedEncodingPreset == "off")
+                     {
+                         stats.foveatedEncodingStatus = "off";
+                     }
+@@ -1627,24 +1647,24 @@ void StreamingServer::EncodeThread()
+                     {
+                         stats.foveatedEncodingStatus = "inactive";
+                     }
+-                    stats.clientFoveationPreset = config.clientFoveationPreset;
+-                    stats.clientUpscaling = config.clientUpscaling;
++                    stats.clientFoveationPreset = config->clientFoveationPreset;
++                    stats.clientUpscaling = config->clientUpscaling;
+                     stats.clientReprojectionMode =
+                         ClientReprojectionModeName(server->clientReprojectionMode_.load());
+                     stats.abrMode = abrModeName;
+                     stats.abrState = abrStateName;
+                     stats.abrProfile = abrProfileName;
+                     stats.resolutionScale = layoutState.activeResolutionScale;
+-                    stats.dynamicResolutionMinScale = config.dynamicResolutionMinScale;
++                    stats.dynamicResolutionMinScale = config->dynamicResolutionMinScale;
+                     stats.streamReconfigure = liveReconfigureReady;
+                     stats.streamConfigSequence = layoutState.streamConfigSequence;
+-                    stats.passthroughEnabled = config.passthroughEnabled;
++                    stats.passthroughEnabled = config->passthroughEnabled;
+                     stats.passthroughSupported =
+                         server->clientSupportsMixedRealityPassthrough_.load();
+                     stats.passthroughReady =
+                         stats.passthroughEnabled && stats.passthroughSupported;
+-                    stats.occlusionMode = config.occlusionMode;
+-                    stats.spatialEnabled = config.spatialEnabled;
++                    stats.occlusionMode = config->occlusionMode;
++                    stats.spatialEnabled = config->spatialEnabled;
+                     stats.headsetAudio = false;
+                     stats.serverPipelineLatencyMs = server->serverPipelineLatencyMs_.load();
+                     stats.clientPipelineLatencyMs = server->clientPipelineLatencyMs_.load();
+@@ -1755,16 +1775,18 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
+             connectedIp = clientIp_;
+             connectedName = clientName_;
+         }
++        const std::string candidateName(clientConnect.deviceName,
++            BoundedStringLength(clientConnect.deviceName, sizeof(clientConnect.deviceName)));
+         const oxrsys::ClientAdmissionDecision admission = oxrsys::EvaluateClientAdmission(
+-            clientAdmission_, state_.load() == State::Connected, connectedIp, ipStr,
+-            SteadyClockNowNs(), kClientAdmissionLogIntervalNs);
++            clientAdmission_, state_.load() == State::Connected, connectedIp, connectedName,
++            ipStr, candidateName, SteadyClockNowNs(), kClientAdmissionLogIntervalNs);
+         if (!admission.accept)
+         {
+             if (admission.log)
+             {
+-                spdlog::warn("StreamingServer: refusing ClientConnect from {} while '{}' ({}) is "
++                spdlog::warn("StreamingServer: refusing ClientConnect from '{}' ({}) while '{}' ({}) is "
+                              "connected; disconnect it first",
+-                             ipStr, connectedName, connectedIp);
++                             candidateName, ipStr, connectedName, connectedIp);
+             }
+             return;
+         }
+@@ -1787,10 +1809,13 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
+         clientName_ = clientName;
+         clientUsesUsbAdb_.store(false);
+     }
+-    rttProbe_.SetTarget(ipStr);
++    // rtt_probe: only the "measured" prediction mode reads the RTT (or rtt_probe = "on").
++    rttProbe_.SetTarget(ShouldProbeRtt() ? std::string(ipStr) : std::string());
+     sampleToSubmitMs_.store(0.0f);
+     sampleAgeAtFetchMs_.store(0.0f);
+     submitToSentMs_.store(0.0f);
++    clientSupportsPacingLock_.store(
++        HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_PACING_LOCK));
+     clientSupportsStreamReconfigure_.store(
+         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_STREAM_RECONFIGURE));
+     const bool clientSupportsPassthrough =
+@@ -2006,13 +2031,52 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
+ {
+     std::string clientName(clientConnect.deviceName,
+         BoundedStringLength(clientConnect.deviceName, sizeof(clientConnect.deviceName)));
++    static const std::string kUsbClientIp = "127.0.0.1";
++
++    // Same admission as the WiFi path (2026-10-21; it skipped it before): a USB ClientConnect
++    // while a WiFi client streams would rebuild its encoder and interleave its tracking clock.
++    // The USB client's identity is 127.0.0.1 plus its device name.
++    {
++        std::string connectedIp;
++        std::string connectedName;
++        {
++            std::lock_guard<std::mutex> lock(clientMutex_);
++            connectedIp = clientIp_;
++            connectedName = clientName_;
++        }
++        const oxrsys::ClientAdmissionDecision admission = oxrsys::EvaluateClientAdmission(
++            clientAdmission_, state_.load() == State::Connected, connectedIp, connectedName,
++            kUsbClientIp, clientName, SteadyClockNowNs(), kClientAdmissionLogIntervalNs);
++        if (!admission.accept)
++        {
++            if (admission.log)
++            {
++                spdlog::warn("StreamingServer: refusing USB ClientConnect from '{}' while '{}' ({}) is "
++                             "connected; disconnect it first",
++                             clientName, connectedName, connectedIp);
++            }
++            return;
++        }
++    }
++
++    // A new client brings a new clock (see HandleClientConnect).
++    if (trackingReceiver_)
++    {
++        trackingReceiver_->ResetHistory();
++    }
+     {
+         std::lock_guard<std::mutex> lock(clientMutex_);
+-        clientIp_ = "127.0.0.1";
++        clientIp_ = kUsbClientIp;
+         clientPort_ = oxr::protocol::CONTROL_PORT;
+         clientName_ = clientName;
+         clientUsesUsbAdb_.store(true);
+     }
++    rttProbe_.SetTarget(std::string());   // USB: no network RTT to measure
++    sampleToSubmitMs_.store(0.0f);
++    sampleAgeAtFetchMs_.store(0.0f);
++    submitToSentMs_.store(0.0f);
++    clientSupportsPacingLock_.store(
++        HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_PACING_LOCK));
+     clientSupportsStreamReconfigure_.store(
+         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_STREAM_RECONFIGURE));
+     const bool clientSupportsPassthrough =
+@@ -2298,6 +2362,7 @@ void StreamingServer::HandleClientDisconnect()
+     clientSupportsStreamReconfigure_.store(false);
+     clientSupportsMixedRealityPassthrough_.store(false);
+     clientSupportsSpatialEntity_.store(false);
++    clientSupportsPacingLock_.store(false);
+     activeVideoCodec_.store(oxr::protocol::VideoCodec::H265);
+     {
+         std::lock_guard<std::mutex> lock(streamConfigMutex_);
+@@ -2343,6 +2408,24 @@ void StreamingServer::HandleClientDisconnect()
+ 
+ void StreamingServer::HandleLatencyReport(const oxr::protocol::LatencyReport& report)
+ {
++    // Every float here is client-supplied and goes straight into state the rate lock (a PI
++    // integral) and the prediction horizon read: a NaN or an absurd value would poison both,
++    // and (long long)NaN is undefined. Drop the whole report instead (2026-10-21).
++    if (!oxrsys::LatencyReportIsSane(report))
++    {
++        const int64_t nowNs = SteadyClockNowNs();
++        int64_t lastLogNs = lastRejectedLatencyReportLogNs_.load();
++        if (nowNs - lastLogNs >= 5LL * 1000000000LL &&
++            lastRejectedLatencyReportLogNs_.compare_exchange_strong(lastLogNs, nowNs))
++        {
++            spdlog::warn("StreamingServer: dropping LatencyReport with a non-finite or out-of-range "
++                         "field (recv->submit {} decode {} compositor {} total {} age {})",
++                         report.receiveToDecoderSubmitMs, report.decodeLatencyMs,
++                         report.compositorLatencyMs, report.totalClientLatencyMs,
++                         report.displayedFrameAgeMs);
++        }
++        return;
++    }
+     clientReceiveToSubmitMs_.store(report.receiveToDecoderSubmitMs);
+     clientDecodeLatencyMs_.store(report.decodeLatencyMs);
+     clientCompositorLatencyMs_.store(report.compositorLatencyMs);
+@@ -2828,10 +2911,10 @@ void StreamingServer::UpdatePredictionHorizon()
+     const float clientAge = clientDisplayedFrameAgeMs_.load();
+     const RttProbe::Summary rtt = rttProbe_.GetSummary();
+     const bool usb = clientUsesUsbAdb_.load();
+-    // No echo reply (a firewall, an ICMP-silent client): fall back to the RTT measured by hand
+-    // on the Steam Frame's own access point, 2026-10-18 - ping from the Mac while streaming,
+-    // 70 echoes: min 3.4 / avg 5.3 / max 9.5 ms. Logged as "assumed".
+-    constexpr float kAssumedRttMs = 5.3f;
++    // No echo reply (a firewall, an ICMP-silent client, rtt_probe off): fall back to
++    // rtt_assumed_ms (default 5.3 = the Steam Frame's own access point, 2026-10-18 - ping from
++    // the Mac while streaming, 70 echoes: min 3.4 / avg 5.3 / max 9.5 ms). Logged as "assumed".
++    const float kAssumedRttMs = rttAssumedMs_;
+     const bool rttAssumed = !usb && !rtt.valid;
+     const float rttMs = usb ? 0.0f : (rtt.valid ? rtt.medianMs : kAssumedRttMs);
+     const bool complete = sampleToSubmit > 0.0f && submitToSent > 0.0f && clientAge > 0.0f;
+@@ -3095,10 +3178,8 @@ void StreamingServer::SendEncodedVideoFrame(const EncodedVideoFrame& frame)
+         const size_t nalSize = std::min<size_t>(
+             nalHeader->payloadSize,
+             nal.tcpPayload.size() - sizeof(oxr::protocol::TcpVideoNalHeader));
+-        const uint32_t dataPackets = static_cast<uint32_t>(
+-            (nalSize + oxr::protocol::MAX_PACKET_PAYLOAD - 1) / oxr::protocol::MAX_PACKET_PAYLOAD);
+-        frameDatagrams += dataPackets +
+-            (dataPackets + oxr::protocol::FEC_GROUP_SIZE - 1) / oxr::protocol::FEC_GROUP_SIZE;
++        frameDatagrams += oxrsys::streaming::DatagramsForNal(
++            nalSize, oxr::protocol::MAX_PACKET_PAYLOAD, oxr::protocol::FEC_GROUP_SIZE);
+         frameHasKeyframe = frameHasKeyframe || nal.isKeyframe;
+     }
+     oxrsys::streaming::PacketPacer pacer(
+@@ -3157,7 +3238,10 @@ void StreamingServer::SendPacedVideoDatagram(SocketHandle socket, const uint8_t*
+ {
+     if (pacer)
+     {
+-        pacer->WaitForNextPacket([this] { return videoSendNewerFrameQueued_.load(); });
++        // Also flush when the server is stopping, so the pacer never keeps spinning on a frame
++        // while Stop waits to join this thread and close the socket (2026-10-21).
++        pacer->WaitForNextPacket(
++            [this] { return videoSendNewerFrameQueued_.load() || !running_.load(); });
+     }
+     if (oxrsys::runtime_socket::SendTo(socket,
+                                        data,
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index 5c5388e..eac55ad 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -90,6 +90,9 @@ class StreamingServer
+     // that carried it, so a reader can act once per report. Both reset on disconnect.
+     float GetClientDisplayedFrameAgeMs() const { return clientDisplayedFrameAgeMs_.load(); }
+     uint32_t GetClientLatencyReportCount() const { return clientLatencyReportCount_.load(); }
++    // The client advertised CLIENT_CAPABILITY_PACING_LOCK: its LatencyReport ages are the ones the
++    // rate lock (pacing_lock_wait_ms) may steer the app's cadence by.
++    bool ClientSupportsPacingLock() const { return clientSupportsPacingLock_.load(); }
+     // How long the displayed frame sat decoded and untaken on the client (ms): its age minus
+     // receive->submit, decode and the client's eye pass. The part of the age that is this sender's
+     // phase against the panel - what the rate lock holds.
+@@ -236,6 +239,10 @@ class StreamingServer
+     std::atomic_bool clientSupportsStreamReconfigure_{false};
+     std::atomic_bool clientSupportsMixedRealityPassthrough_{false};
+     std::atomic_bool clientSupportsSpatialEntity_{false};
++    std::atomic_bool clientSupportsPacingLock_{false};
++    // LatencyReports with a non-finite or absurd field are dropped (they fed atomics the rate
++    // lock and the prediction horizon read); logged at most once per 5 s.
++    std::atomic<int64_t> lastRejectedLatencyReportLogNs_{0};
+     std::atomic<oxr::protocol::VideoCodec> activeVideoCodec_{oxr::protocol::VideoCodec::H265};
+     std::atomic<uint32_t> targetRefreshRateHz_{90};
+     std::atomic<float> clientPipelineLatencyMs_{18.0f};
+@@ -258,6 +265,12 @@ class StreamingServer
+     bool posePredictionMeasured_ = false;
+     float posePredictionOverrideMs_ = 0.0f;
+     float posePredictionPositionScale_ = 0.5f;
++    std::string rttProbeMode_ = "auto";   // rtt_probe: "auto" | "on" | "off"
++    float rttAssumedMs_ = 5.3f;           // rtt_assumed_ms
++    bool ShouldProbeRtt() const
++    {
++        return rttProbeMode_ == "on" || (rttProbeMode_ == "auto" && posePredictionMeasured_);
++    }
+     RttProbe rttProbe_;
+ 
+     // Adaptive bitrate state
+diff --git a/runtime/src/TrackingReceiver.cpp b/runtime/src/TrackingReceiver.cpp
+index 12c33cd..0166b59 100644
+--- a/runtime/src/TrackingReceiver.cpp
++++ b/runtime/src/TrackingReceiver.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <limits>
+ #include <chrono>
+ #include <cstddef>
+ #include <cstring>
+@@ -424,8 +425,16 @@ bool TrackingReceiver::GetPredictedPose(oxr::protocol::TrackingPacket& outPacket
+     if (measuredLatencyKnown && current.packet.timestampNs > 0)
+     {
+         PendingPrediction pending;
++        // The timestamp is the client's; add the latency without signed overflow (UB): a
++        // bounded, finite delta, saturating at INT64_MAX.
++        const double deltaNsD = std::isfinite(measuredLatencyMs)
++            ? std::clamp(static_cast<double>(measuredLatencyMs), 0.0, 10000.0) * 1.0e6
++            : 0.0;
++        const int64_t deltaNs = static_cast<int64_t>(deltaNsD);
+         pending.targetTimestampNs =
+-            current.packet.timestampNs + static_cast<int64_t>(measuredLatencyMs * 1.0e6f);
++            current.packet.timestampNs > std::numeric_limits<int64_t>::max() - deltaNs
++                ? std::numeric_limits<int64_t>::max()
++                : current.packet.timestampNs + deltaNs;
+         memcpy(pending.predicted, outPacket.headOrientation, sizeof(pending.predicted));
+         memcpy(pending.predictedPos, outPacket.headPosition, sizeof(pending.predictedPos));
+         memcpy(pending.sample, current.packet.headOrientation, sizeof(pending.sample));
+diff --git a/tests/TestClientAdmission.cpp b/tests/TestClientAdmission.cpp
+index 6cef01c..1827114 100644
+--- a/tests/TestClientAdmission.cpp
++++ b/tests/TestClientAdmission.cpp
+@@ -78,3 +78,56 @@ TEST_CASE("Client admission: a connected state with no address recorded accepts"
+                                                   kLogIntervalNs);
+     CHECK(decision.accept);
+ }
++
++TEST_CASE("Client admission: same address, different device name is refused (NAT, loopback)",
++          "[client-admission]")
++{
++    // Two devices behind one NAT share an address; a USB client is recorded as 127.0.0.1,
++    // which a simulator on the same host also presents. The name tells them apart.
++    ClientAdmissionState state;
++    const auto decision = EvaluateClientAdmission(state, true, "127.0.0.1", "Steam Frame",
++                                                  "127.0.0.1", "OXRSys Simulator",
++                                                  1'000 * kMs, kLogIntervalNs);
++    CHECK_FALSE(decision.accept);
++    CHECK(decision.log);
++    // ... and the same candidate again inside the interval is refused quietly.
++    const auto again = EvaluateClientAdmission(state, true, "127.0.0.1", "Steam Frame",
++                                               "127.0.0.1", "OXRSys Simulator",
++                                               2'000 * kMs, kLogIntervalNs);
++    CHECK_FALSE(again.accept);
++    CHECK_FALSE(again.log);
++}
++
++TEST_CASE("Client admission: same address and same name reconnects", "[client-admission]")
++{
++    ClientAdmissionState state;
++    const auto decision = EvaluateClientAdmission(state, true, "10.0.0.13", "Steam Frame",
++                                                  "10.0.0.13", "Steam Frame",
++                                                  1'000 * kMs, kLogIntervalNs);
++    CHECK(decision.accept);
++}
++
++TEST_CASE("Client admission: an empty name on either side falls back to the address rule",
++          "[client-admission]")
++{
++    ClientAdmissionState state;
++    CHECK(EvaluateClientAdmission(state, true, "10.0.0.13", "", "10.0.0.13", "Steam Frame",
++                                  1'000 * kMs, kLogIntervalNs).accept);
++    CHECK(EvaluateClientAdmission(state, true, "10.0.0.13", "Steam Frame", "10.0.0.13", "",
++                                  1'000 * kMs, kLogIntervalNs).accept);
++    CHECK_FALSE(EvaluateClientAdmission(state, true, "10.0.0.13", "", "198.51.100.170", "",
++                                        1'000 * kMs, kLogIntervalNs).accept);
++}
++
++TEST_CASE("Client admission: a USB connect while a WiFi client streams is refused",
++          "[client-admission]")
++{
++    // HandleUsbClientConnect presents 127.0.0.1 plus its device name (2026-10-21; it skipped
++    // admission before).
++    ClientAdmissionState state;
++    const auto decision = EvaluateClientAdmission(state, true, "10.0.0.13", "Steam Frame",
++                                                  "127.0.0.1", "Quest 3",
++                                                  1'000 * kMs, kLogIntervalNs);
++    CHECK_FALSE(decision.accept);
++    CHECK(decision.log);
++}
+diff --git a/tests/TestConfig.cpp b/tests/TestConfig.cpp
+index e518d4a..382ea89 100644
+--- a/tests/TestConfig.cpp
++++ b/tests/TestConfig.cpp
+@@ -328,3 +328,44 @@ TEST_CASE("Config parser reads send pacing windows and clamps them", "[config][p
+         CHECK(values.sendPacingKeyframeMs == 0.0f);
+     }
+ }
++
++TEST_CASE("Config parser: the rate lock is off by default and clamps when set", "[config][pacing]")
++{
++    CHECK(ConfigValues{}.pacingLockWaitMs == 0.0f);   // off since 2026-10-21 (review H11)
++    std::istringstream on("[streaming]\npacing_lock_wait_ms = 6\n");
++    CHECK(ParseConfigToml(on).pacingLockWaitMs == 6.0f);
++    std::istringstream high("[streaming]\npacing_lock_wait_ms = 99\n");
++    CHECK(ParseConfigToml(high).pacingLockWaitMs == 30.0f);
++}
++
++TEST_CASE("Config parser reads rtt_probe, rtt_assumed_ms and video_send_port", "[config]")
++{
++    {
++        const ConfigValues defaults;
++        CHECK(defaults.rttProbe == "auto");
++        CHECK(defaults.rttAssumedMs == 5.3f);
++        CHECK(defaults.videoSendPort == 9944u);   // the Steam Frame's firewall pre-opens this one
++    }
++    {
++        std::istringstream input(
++            "[streaming]\nrtt_probe = \"off\"\nrtt_assumed_ms = 12.5\nvideo_send_port = 0\n");
++        const ConfigValues values = ParseConfigToml(input);
++        CHECK(values.rttProbe == "off");
++        CHECK(values.rttAssumedMs == 12.5f);
++        CHECK(values.videoSendPort == 0u);
++    }
++    {
++        std::istringstream input(
++            "[streaming]\nrtt_probe = \"on\"\nrtt_assumed_ms = -3\nvideo_send_port = 70000\n");
++        const ConfigValues values = ParseConfigToml(input);
++        CHECK(values.rttProbe == "on");
++        CHECK(values.rttAssumedMs == 0.0f);
++        CHECK(values.videoSendPort == 65535u);
++    }
++    {
++        std::istringstream input("[streaming]\nrtt_probe = \"sometimes\"\nrtt_assumed_ms = 999\n");
++        const ConfigValues values = ParseConfigToml(input);
++        CHECK(values.rttProbe == "auto");   // unknown words fall back to auto
++        CHECK(values.rttAssumedMs == 200.0f);
++    }
++}
+diff --git a/tests/TestLatencyReportCheck.cpp b/tests/TestLatencyReportCheck.cpp
+new file mode 100644
+index 0000000..6f8253f
+--- /dev/null
++++ b/tests/TestLatencyReportCheck.cpp
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include <catch2/catch_test_macros.hpp>
++
++#include "LatencyReportCheck.h"
++
++#include <limits>
++
++using oxrsys::LatencyReportIsSane;
++
++namespace
++{
++oxr::protocol::LatencyReport SaneReport()
++{
++    oxr::protocol::LatencyReport report;
++    report.receiveToDecoderSubmitMs = 0.4f;
++    report.decodeLatencyMs = 1.1f;
++    report.compositorLatencyMs = 2.0f;
++    report.totalClientLatencyMs = 9.5f;
++    report.displayedFrameAgeMs = 6.0f;
++    return report;
++}
++} // namespace
++
++TEST_CASE("Latency report check: a measured report passes", "[latency-report]")
++{
++    CHECK(LatencyReportIsSane(SaneReport()));
++    oxr::protocol::LatencyReport zeros;
++    zeros.receiveToDecoderSubmitMs = 0.0f;
++    zeros.decodeLatencyMs = 0.0f;
++    zeros.compositorLatencyMs = 0.0f;
++    zeros.totalClientLatencyMs = 0.0f;
++    CHECK(LatencyReportIsSane(zeros));   // a client that has not measured yet reports zeros
++}
++
++TEST_CASE("Latency report check: NaN and infinity in any field are refused", "[latency-report]")
++{
++    const float nan = std::numeric_limits<float>::quiet_NaN();
++    const float inf = std::numeric_limits<float>::infinity();
++    {
++        auto r = SaneReport(); r.displayedFrameAgeMs = nan;
++        CHECK_FALSE(LatencyReportIsSane(r));   // the field the rate lock integrates
++    }
++    {
++        auto r = SaneReport(); r.totalClientLatencyMs = inf;
++        CHECK_FALSE(LatencyReportIsSane(r));   // the field the prediction horizon smooths
++    }
++    {
++        auto r = SaneReport(); r.receiveToDecoderSubmitMs = -inf;
++        CHECK_FALSE(LatencyReportIsSane(r));
++    }
++    {
++        auto r = SaneReport(); r.decodeLatencyMs = nan;
++        CHECK_FALSE(LatencyReportIsSane(r));
++    }
++    {
++        auto r = SaneReport(); r.compositorLatencyMs = nan;
++        CHECK_FALSE(LatencyReportIsSane(r));
++    }
++}
++
++TEST_CASE("Latency report check: negative and absurd values are refused", "[latency-report]")
++{
++    {
++        auto r = SaneReport(); r.displayedFrameAgeMs = -0.5f;
++        CHECK_FALSE(LatencyReportIsSane(r));
++    }
++    {
++        auto r = SaneReport(); r.totalClientLatencyMs = 1.0e9f;
++        CHECK_FALSE(LatencyReportIsSane(r));
++    }
++    {
++        auto r = SaneReport(); r.displayedFrameAgeMs = oxrsys::kMaxLatencyReportMs;
++        CHECK(LatencyReportIsSane(r));   // the bound itself is allowed
++    }
++}
+diff --git a/tests/TestPacketPacer.cpp b/tests/TestPacketPacer.cpp
+index f0ed067..a196762 100644
+--- a/tests/TestPacketPacer.cpp
++++ b/tests/TestPacketPacer.cpp
+@@ -111,3 +111,17 @@ TEST_CASE("Packet pacer flushes the rest as a burst when a newer frame is waitin
+     // Ten packets were paced at 0.5 ms spacing; the other ninety went at once.
+     CHECK(PacingNowNs() - start < 20'000'000);
+ }
++
++TEST_CASE("Datagram count per NAL matches the sender's packetisation", "[pacing]")
++{
++    using oxrsys::streaming::DatagramsForNal;
++    // The sender: ceil(size / 1400) data packets, one FEC parity after every 10 and after the tail.
++    CHECK(DatagramsForNal(0, 1400, 10) == 0);
++    CHECK(DatagramsForNal(1, 1400, 10) == 2);          // 1 data + 1 parity
++    CHECK(DatagramsForNal(1400, 1400, 10) == 2);
++    CHECK(DatagramsForNal(1401, 1400, 10) == 3);       // 2 data + 1 parity
++    CHECK(DatagramsForNal(14000, 1400, 10) == 11);     // 10 data + 1 parity (a full group)
++    CHECK(DatagramsForNal(14001, 1400, 10) == 13);     // 11 data + 2 parity (group + tail)
++    CHECK(DatagramsForNal(300 * 1000, 1400, 10) == 215 + 22);   // a keyframe: 215 data, 22 parity
++    CHECK(DatagramsForNal(1401, 1400, 0) == 2);        // no FEC: data only
++}
+-- 
+2.43.0
+

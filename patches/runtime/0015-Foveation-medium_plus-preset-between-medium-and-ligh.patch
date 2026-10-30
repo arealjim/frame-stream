@@ -1,0 +1,305 @@
+From 54b21917213a9413ddfa93e98928a820cb81b457 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 14:14:27 +0000
+Subject: [PATCH 15/23] Foveation: medium_plus preset between medium and light,
+ and a bench --fov flag
+
+foveated_encoding_preset = medium_plus is centre 0.50x0.45 with edges 4x5:
+2752x1216 encoded for 2160x2160 eyes, 17 percent more pixels than medium
+(2560x1120); light is 3456x1536. It travels as FoveationPreset::Medium with
+its own centre and edge parameters in the stream announce, so no protocol
+change; CalculateFoveationLayout gains an explicit-parameters overload and
+StreamingServer computes every layout through ConfiguredFoveationLayout.
+Existing preset names and their layouts are unchanged; default stays off.
+
+Measured on the M5 Pro low-latency encoder, scene pattern, 50 Mbps,
+encoder_min_qp 12, sparse submits beside the live stream: callback p50
+medium 10.1-10.2 ms, medium_plus 10.8-11.0, light 14.3-14.5. Sustained 90 Hz
+bench runs share the media engine with the live stream and were 18 ms even
+for medium, so whether medium_plus holds 90 Hz live is not yet measured.
+
+---
+ CHANGES.md                                    |  4 ++
+ .../include/oxrsys/protocol/Foveation.h       | 15 +++++-
+ runtime/oxrsys-runtime.toml                   |  6 ++-
+ runtime/src/Config.cpp                        |  3 +-
+ runtime/src/Config.h                          |  2 +-
+ runtime/src/StreamingServer.cpp               | 49 +++++++++++++++----
+ tests/TestConfig.cpp                          | 14 ++++++
+ tools/EncoderBench.mm                         | 11 ++++-
+ 8 files changed, 89 insertions(+), 15 deletions(-)
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 7faaaa2..af0d96f 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -6,6 +6,10 @@ ## 1.3.0 - TBD
+ 
+ ### Added
+ 
++- Added foveated_encoding_preset = "medium_plus": centre 0.50x0.45, edges 4x5, between medium
++  and light (2752x1216 encoded for 2160x2160 eyes, against 2560x1120 and 3456x1536). It is
++  announced as Medium with its own centre/edge parameters, which clients already read. The
++  encoder bench takes --fov centerX,centerY,edgeX,edgeY to try other layouts.
+ - Added config encoder_min_qp (default 0 = VideoToolbox's own floor): the minimum frame QP of the
+   in-process encoder session. The low-latency (rtvc) session floors QP at 16 and stops spending
+   bits there whatever the bitrate; 12 lets it reach the target (bench, 2560x1120 at 50 Mbps:
+diff --git a/common/protocol/include/oxrsys/protocol/Foveation.h b/common/protocol/include/oxrsys/protocol/Foveation.h
+index 34a98d2..87a324a 100644
+--- a/common/protocol/include/oxrsys/protocol/Foveation.h
++++ b/common/protocol/include/oxrsys/protocol/Foveation.h
+@@ -58,9 +58,14 @@ inline uint32_t AlignUp(uint32_t value, uint32_t alignment)
+     return alignment == 0 ? value : ((value + alignment - 1u) / alignment) * alignment;
+ }
+ 
++// The layout for explicit parameters. The wire carries the aligned parameters
++// (StreamConfig foveationCenterSize*/EdgeRatio*), so a config preset whose
++// parameters differ from ParametersForPreset(preset) still decodes on clients
++// that read them; preset only has to be non-Off.
+ inline FoveationLayout CalculateFoveationLayout(uint32_t targetEyeWidth,
+                                                 uint32_t targetEyeHeight,
+                                                 FoveationPreset preset,
++                                                FoveationPresetParameters params,
+                                                 uint32_t alignment = 32)
+ {
+     FoveationLayout layout = {};
+@@ -70,7 +75,6 @@ inline FoveationLayout CalculateFoveationLayout(uint32_t targetEyeWidth,
+     layout.optimizedEyeWidth = targetEyeWidth;
+     layout.optimizedEyeHeight = targetEyeHeight;
+ 
+-    FoveationPresetParameters params = ParametersForPreset(preset);
+     if (preset == FoveationPreset::Off ||
+         targetEyeWidth == 0 ||
+         targetEyeHeight == 0 ||
+@@ -131,6 +135,15 @@ inline FoveationLayout CalculateFoveationLayout(uint32_t targetEyeWidth,
+     return layout;
+ }
+ 
++inline FoveationLayout CalculateFoveationLayout(uint32_t targetEyeWidth,
++                                                uint32_t targetEyeHeight,
++                                                FoveationPreset preset,
++                                                uint32_t alignment = 32)
++{
++    return CalculateFoveationLayout(targetEyeWidth, targetEyeHeight, preset,
++                                    ParametersForPreset(preset), alignment);
++}
++
+ inline bool IsFoveatedEncodingLayoutUsable(const FoveationLayout& layout,
+                                            uint32_t sourceEyeWidth,
+                                            uint32_t sourceEyeHeight)
+diff --git a/runtime/oxrsys-runtime.toml b/runtime/oxrsys-runtime.toml
+index b9a4336..8dffde2 100644
+--- a/runtime/oxrsys-runtime.toml
++++ b/runtime/oxrsys-runtime.toml
+@@ -113,9 +113,11 @@ encoder_helper_path = ""
+ # listeners, and "usb_adb" disables WiFi discovery fallback.
+ transport = "auto"
+ 
+-# Server-side foveated video encoding preset: "off", "light", "medium", or "high".
++# Server-side foveated video encoding preset: "off", "light", "medium", "medium_plus", or "high".
+ # This compresses frame edges before video encoding and asks compatible clients
+-# to re-expand the image after decode.
++# to re-expand the image after decode. "medium_plus" sits between medium and light
++# (2160x2160 eyes: medium 2560x1120, medium_plus 2752x1216, light 3456x1536); it is
++# announced as medium with its own centre/edge parameters, which clients read.
+ foveated_encoding_preset = "off"
+ 
+ # Headset client foveation override: "auto", "off", "light", "medium", or "high".
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index f01136c..6f5cd0c 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -464,7 +464,8 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             else if (key == "foveated_encoding_preset")
+             {
+                 value = ParseString(value);
+-                if (value == "off" || value == "light" || value == "medium" || value == "high")
++                if (value == "off" || value == "light" || value == "medium" ||
++                    value == "medium_plus" || value == "high")
+                 {
+                     values.foveatedEncodingPreset = value;
+                 }
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index 5b12d9d..5da5b8d 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -77,7 +77,7 @@ struct ConfigValues
+     std::string encoderHelperMode = "auto";
+     std::string encoderHelperPath; // empty = sibling of the runtime dylib
+     std::string streamingTransport = "auto"; // "auto", "wifi", "usb_adb"
+-    std::string foveatedEncodingPreset = "off"; // "off", "light", "medium", "high"
++    std::string foveatedEncodingPreset = "off"; // "off", "light", "medium", "medium_plus", "high"
+     std::string clientFoveationPreset = "auto"; // "auto", "off", "light", "medium", "high"
+     bool clientUpscaling = false;    // Enable Quest shader upscaling
+     float clientSharpening = 0.0f;   // Headset contrast-adaptive sharpen strength (0.0-1.0); 0 = off
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index 6f6abe1..0c3593d 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -88,7 +88,9 @@ oxr::protocol::FoveationPreset ParseFoveationPreset(const std::string& value)
+     {
+         return oxr::protocol::FoveationPreset::Light;
+     }
+-    if (value == "medium")
++    // medium_plus travels as Medium: clients read the centre/edge parameters the
++    // announce carries, and need only a non-Off preset.
++    if (value == "medium" || value == "medium_plus")
+     {
+         return oxr::protocol::FoveationPreset::Medium;
+     }
+@@ -99,6 +101,31 @@ oxr::protocol::FoveationPreset ParseFoveationPreset(const std::string& value)
+     return oxr::protocol::FoveationPreset::Off;
+ }
+ 
++// The parameters for a configured preset name. medium_plus is centre 0.50x0.45,
++// edges 4x5: 2752x1216 for 2160x2160 eyes, 17 % more pixels than medium. On the
++// M5 Pro low-latency encoder it measured +0.7 ms per frame over medium (sparse
++// bench, 2026-10-18); whether it holds 90 Hz live is not yet measured.
++oxr::protocol::FoveationPresetParameters FoveationParametersForConfig(const std::string& value)
++{
++    if (value == "medium_plus")
++    {
++        return {0.50f, 0.45f, 0.0f, 0.0f, 4.0f, 5.0f};
++    }
++    return oxr::protocol::ParametersForPreset(ParseFoveationPreset(value));
++}
++
++oxr::protocol::FoveationLayout ConfiguredFoveationLayout(uint32_t targetEyeWidth,
++                                                         uint32_t targetEyeHeight,
++                                                         oxr::protocol::FoveationPreset preset,
++                                                         const std::string& configPreset)
++{
++    return oxr::protocol::CalculateFoveationLayout(
++        targetEyeWidth, targetEyeHeight, preset,
++        preset == oxr::protocol::FoveationPreset::Off
++            ? oxr::protocol::ParametersForPreset(preset)
++            : FoveationParametersForConfig(configPreset));
++}
++
+ oxr::protocol::ClientFoveationPreset ParseClientFoveationPreset(const std::string& value)
+ {
+     if (value == "light")
+@@ -221,10 +248,11 @@ StreamLayout BuildStreamLayout(uint32_t renderWidth,
+             unscaledFoveationTarget ? renderWidth : layout.scaledWidth;
+         layout.foveatedTargetEyeHeight =
+             unscaledFoveationTarget ? renderHeight : layout.scaledHeight;
+-        layout.foveationLayout = oxr::protocol::CalculateFoveationLayout(
++        layout.foveationLayout = ConfiguredFoveationLayout(
+             layout.foveatedTargetEyeWidth,
+             layout.foveatedTargetEyeHeight,
+-            layout.foveationPreset);
++            layout.foveationPreset,
++            config.foveatedEncodingPreset);
+         if (unscaledFoveationTarget &&
+             oxr::protocol::IsFoveatedEncodingLayoutUsable(
+                 layout.foveationLayout, renderWidth, renderHeight))
+@@ -928,9 +956,10 @@ oxr::protocol::ServerAnnounce StreamingServer::BuildServerAnnounce(
+             ? ParseFoveationPreset(config.foveatedEncodingPreset)
+             : oxr::protocol::FoveationPreset::Off;
+     const oxr::protocol::FoveationLayout layout =
+-        oxr::protocol::CalculateFoveationLayout(layoutState.foveatedTargetEyeWidth,
++        ConfiguredFoveationLayout(layoutState.foveatedTargetEyeWidth,
+                                                 layoutState.foveatedTargetEyeHeight,
+-                                                foveationPreset);
++                                                foveationPreset,
++                                                config.foveatedEncodingPreset);
+ 
+     if (layoutState.foveatedEncodingActive)
+     {
+@@ -1872,9 +1901,10 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
+                         ? ParseFoveationPreset(config.foveatedEncodingPreset)
+                         : oxr::protocol::FoveationPreset::Off;
+                 const oxr::protocol::FoveationLayout layout =
+-                    oxr::protocol::CalculateFoveationLayout(layoutState.foveatedTargetEyeWidth,
++                    ConfiguredFoveationLayout(layoutState.foveatedTargetEyeWidth,
+                                                             layoutState.foveatedTargetEyeHeight,
+-                                                            foveationPreset);
++                                                            foveationPreset,
++                                                            config.foveatedEncodingPreset);
+                 const bool clientSupportsFoveatedEncoding =
+                     HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING);
+                 clientSupportsFoveatedEncoding_.store(clientSupportsFoveatedEncoding);
+@@ -2092,9 +2122,10 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
+                         ? ParseFoveationPreset(config.foveatedEncodingPreset)
+                         : oxr::protocol::FoveationPreset::Off;
+                 const oxr::protocol::FoveationLayout layout =
+-                    oxr::protocol::CalculateFoveationLayout(layoutState.foveatedTargetEyeWidth,
++                    ConfiguredFoveationLayout(layoutState.foveatedTargetEyeWidth,
+                                                             layoutState.foveatedTargetEyeHeight,
+-                                                            foveationPreset);
++                                                            foveationPreset,
++                                                            config.foveatedEncodingPreset);
+                 const bool clientSupportsFoveatedEncoding =
+                     HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING);
+                 clientSupportsFoveatedEncoding_.store(clientSupportsFoveatedEncoding);
+diff --git a/tests/TestConfig.cpp b/tests/TestConfig.cpp
+index e58e482..f3dbfae 100644
+--- a/tests/TestConfig.cpp
++++ b/tests/TestConfig.cpp
+@@ -181,6 +181,20 @@ encoder_low_latency = false
+     CHECK(ParseConfigToml(off).encoderLowLatency == false);
+ }
+ 
++TEST_CASE("Config parser accepts the medium_plus foveated encoding preset", "[config]")
++{
++    std::istringstream plus(R"TOML(
++[streaming]
++foveated_encoding_preset = "medium_plus"
++)TOML");
++    CHECK(ParseConfigToml(plus).foveatedEncodingPreset == "medium_plus");
++    std::istringstream unknown(R"TOML(
++[streaming]
++foveated_encoding_preset = "medium_minus"
++)TOML");
++    CHECK(ParseConfigToml(unknown).foveatedEncodingPreset == "off");
++}
++
+ TEST_CASE("Config parser reads encoder_min_qp, 0 by default, clamped to the HEVC range", "[config]")
+ {
+     CHECK(ConfigValues{}.encoderMinQp == 0);
+diff --git a/tools/EncoderBench.mm b/tools/EncoderBench.mm
+index 75a929c..109bd89 100644
+--- a/tools/EncoderBench.mm
++++ b/tools/EncoderBench.mm
+@@ -7,6 +7,7 @@
+ //   oxrsys_encoder_bench [--preset medium|light|high|off] [--eye 2160] [--fps 90]
+ //                        [--mbps 50] [--frames 900] [--submit-hz N]
+ //                        [--codec h265|h264] [--ten-bit] [--pattern texture|scene|smooth]
++//                        [--fov centerX,centerY,edgeRatioX,edgeRatioY]
+ //
+ // It reads the runtime config from $HOME/Library/Application Support/OXRSys,
+ // like the runtime, so run it with HOME pointing at a scratch directory whose
+@@ -116,6 +117,7 @@ int main(int argc, char** argv)
+         std::string preset = "medium";
+         uint32_t eye = 2160, fps = 90, mbps = 50, frames = 900, submitHz = 0;
+         int patternMode = 0;
++        float fovParams[4] = {0, 0, 0, 0};
+         std::string codecName = "h265";
+         bool tenBit = false;
+         for (int i = 1; i < argc; ++i)
+@@ -129,6 +131,7 @@ int main(int argc, char** argv)
+             else if (a == "--frames") frames = std::stoul(next());
+             else if (a == "--codec") codecName = next();
+             else if (a == "--ten-bit") tenBit = true;
++            else if (a == "--fov") std::sscanf(next().c_str(), "%f,%f,%f,%f", &fovParams[0], &fovParams[1], &fovParams[2], &fovParams[3]);
+             else if (a == "--pattern") { std::string v = next(); patternMode = v == "texture" ? 1 : v == "scene" ? 2 : v == "smooth" ? 3 : 0; }
+             else if (a == "--submit-hz") submitHz = std::stoul(next());
+         }
+@@ -136,7 +139,13 @@ int main(int argc, char** argv)
+         if (preset == "light") fp = oxr::protocol::FoveationPreset::Light;
+         else if (preset == "medium") fp = oxr::protocol::FoveationPreset::Medium;
+         else if (preset == "high") fp = oxr::protocol::FoveationPreset::High;
+-        const auto layout = oxr::protocol::CalculateFoveationLayout(eye, eye, fp);
++        oxr::protocol::FoveationPresetParameters params = oxr::protocol::ParametersForPreset(fp);
++        if (fovParams[2] > 0.0f)
++        {
++            if (fp == oxr::protocol::FoveationPreset::Off) fp = oxr::protocol::FoveationPreset::Medium;
++            params = {fovParams[0], fovParams[1], 0.0f, 0.0f, fovParams[2], fovParams[3]};
++        }
++        const auto layout = oxr::protocol::CalculateFoveationLayout(eye, eye, fp, params);
+         const uint32_t encW = layout.optimizedEyeWidth * 2;
+         const uint32_t encH = layout.optimizedEyeHeight;
+ 
+-- 
+2.43.0
+

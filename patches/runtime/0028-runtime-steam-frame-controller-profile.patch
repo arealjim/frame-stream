@@ -1,0 +1,551 @@
+From 44a2a907747c01c49efc577eb36fea94b7ebb12b Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 22:36:22 +0000
+Subject: [PATCH] runtime: report the Steam Frame controller as itself
+ (XR_VALVE_frame_controller_interaction)
+
+A Steam Frame client that has SteamVR's native Frame bindings now says so in the tracking packet
+(controllerProfile, with per-input bits and touchState). The runtime then advertises and accepts
+/interaction_profiles/valve/frame_controller_valve, reports it as current to an app that suggested
+it, and reads each Frame input on its own: A, B, X, Y and menu on the right, the four d-pad
+directions and view on the left, and a bumper on each hand. Apps without Frame bindings get Oculus
+Touch, as before, with the meaning SteamVR's own Frame-to-Touch remap gives the buttons.
+
+When the Frame profile is current, only its bindings are read: an app that suggests both would
+otherwise see Frame X also fire its Touch B action.
+
+The packet grows by gazeDirection (which the Frame client already sends), controllerProfile and
+touchState. A packet that stops before the end of touchState carries no profile, so an older client's
+padding is never read as one. The USB tracking path no longer drops packets smaller than the struct.
+
+Tests: Frame profile and inputs, Touch fallback meanings, an older client's 1080-byte packet, and the
+profile accepted only with its extension enabled.
+
+---
+ .../include/oxrsys/protocol/Protocol.h        | 35 ++++++++
+ runtime/src/EntryPoint.cpp                    | 44 +++++++++-
+ runtime/src/InputManager.cpp                  | 52 +++++++++++-
+ runtime/src/InputManager.h                    |  5 ++
+ runtime/src/StreamingServer.cpp               |  3 +-
+ runtime/src/TrackingReceiver.cpp              | 13 +++
+ tests/TestInputManager.cpp                    | 84 +++++++++++++++++++
+ tests/TestProtocolLayout.cpp                  |  8 +-
+ tests/TestRuntimeApi.cpp                      | 48 +++++++++++
+ 9 files changed, 288 insertions(+), 4 deletions(-)
+
+diff --git a/common/protocol/include/oxrsys/protocol/Protocol.h b/common/protocol/include/oxrsys/protocol/Protocol.h
+index 9cf2aa6..f77ca7b 100644
+--- a/common/protocol/include/oxrsys/protocol/Protocol.h
++++ b/common/protocol/include/oxrsys/protocol/Protocol.h
+@@ -332,6 +332,26 @@ struct TrackingPacket
+     float leftControllerAimRot[4];
+     float rightControllerAimPos[3];
+     float rightControllerAimRot[4];
++
++    // Eye gaze direction in head space as a unit vector (-Z forward), sent by the Steam Frame client
++    // (XR_EXT_eye_gaze_interaction). This runtime does not read it; it is here so the fields after it
++    // sit where that client puts them.
++    float gazeDirection[3];
++
++    // The controller the client's own runtime reports (see ControllerProfile). 0 = unknown, and the
++    // profile is picked from the client name as before. A client from before this field sent its
++    // padding here, so TrackingReceiver keeps it only from a packet that reaches the end of touchState.
++    uint32_t controllerProfile;
++    // Capacitive touch, one bit per input in the ButtonFlags layout (a set BUTTON_A bit = A is touched).
++    // Valid only with a known controllerProfile.
++    uint32_t touchState;
++};
++
++enum ControllerProfile : uint32_t
++{
++    CONTROLLER_PROFILE_UNKNOWN = 0,
++    // /interaction_profiles/valve/frame_controller_valve (XR_VALVE_frame_controller_interaction)
++    CONTROLLER_PROFILE_VALVE_FRAME = 1,
+ };
+ 
+ enum ButtonFlags : uint32_t
+@@ -347,6 +367,21 @@ enum ButtonFlags : uint32_t
+     BUTTON_RIGHT_TRIGGER = 0x0100,
+     BUTTON_LEFT_GRIP = 0x0200,
+     BUTTON_RIGHT_GRIP = 0x0400,
++    // Steam Frame controllers (controllerProfile == CONTROLLER_PROFILE_VALVE_FRAME): the right hand has
++    // A, B, X and Y and a menu button, the left a four-way d-pad and a view button (sent as BUTTON_MENU).
++    // These bits carry each input on its own. The A/B/X/Y bits above keep the Oculus Touch meaning that
++    // SteamVR's own Frame-to-Touch remap gives: A = A, B = B|X|Y, X = d-pad down, Y = the other three.
++    BUTTON_FRAME_A = 0x0800,
++    BUTTON_FRAME_B = 0x1000,
++    BUTTON_FRAME_X = 0x2000,
++    BUTTON_FRAME_Y = 0x4000,
++    BUTTON_FRAME_DPAD_UP = 0x8000,
++    BUTTON_FRAME_DPAD_DOWN = 0x10000,
++    BUTTON_FRAME_DPAD_LEFT = 0x20000,
++    BUTTON_FRAME_DPAD_RIGHT = 0x40000,
++    BUTTON_FRAME_RIGHT_MENU = 0x80000,
++    BUTTON_LEFT_BUMPER = 0x100000,
++    BUTTON_RIGHT_BUMPER = 0x200000,
+ };
+ 
+ enum TrackingFlags : uint32_t
+diff --git a/runtime/src/EntryPoint.cpp b/runtime/src/EntryPoint.cpp
+index 25fd12e..8c9408f 100644
+--- a/runtime/src/EntryPoint.cpp
++++ b/runtime/src/EntryPoint.cpp
+@@ -212,6 +212,10 @@ struct ExtensionInfo
+ 
+ #ifdef XR_USE_GRAPHICS_API_METAL
+ static constexpr const char* UNITY_METAL_ENABLE_EXTENSION_ALIAS = "XR_KHRX2_metal_enable";
++// Newer than the OpenXR headers this builds against, so named here. Version 1 adds only an interaction profile.
++static constexpr const char* VALVE_FRAME_CONTROLLER_EXTENSION_NAME = "XR_VALVE_frame_controller_interaction";
++static constexpr uint32_t VALVE_FRAME_CONTROLLER_SPEC_VERSION = 1;
++static constexpr const char* VALVE_FRAME_CONTROLLER_PROFILE = "/interaction_profiles/valve/frame_controller_valve";
+ static constexpr const char* UNITY_METAL_GRAPHICS_REQUIREMENTS_FUNCTION_ALIAS =
+     "xrGetMetalGraphicsRequirementsKHRX2";
+ #endif
+@@ -248,6 +252,7 @@ static std::vector<ExtensionInfo> GetSupportedExtensionInfos()
+         {XR_EXT_CONFORMANCE_AUTOMATION_EXTENSION_NAME, XR_EXT_conformance_automation_SPEC_VERSION},
+         {XR_EXT_HAND_INTERACTION_EXTENSION_NAME, XR_EXT_hand_interaction_SPEC_VERSION},
+         {XR_EXT_DEBUG_UTILS_EXTENSION_NAME, XR_EXT_debug_utils_SPEC_VERSION},
++        {VALVE_FRAME_CONTROLLER_EXTENSION_NAME, VALVE_FRAME_CONTROLLER_SPEC_VERSION},
+ #ifdef XR_META_touch_controller_plus
+         {XR_META_TOUCH_CONTROLLER_PLUS_EXTENSION_NAME, XR_META_touch_controller_plus_SPEC_VERSION},
+ #endif
+@@ -1500,6 +1505,10 @@ static bool IsKnownInteractionProfilePath(const Instance* instance, const std::s
+     {
+         return instance->IsExtensionEnabled(XR_EXT_HAND_INTERACTION_EXTENSION_NAME);
+     }
++    if (profilePath == VALVE_FRAME_CONTROLLER_PROFILE)
++    {
++        return instance->IsExtensionEnabled(VALVE_FRAME_CONTROLLER_EXTENSION_NAME);
++    }
+ #ifdef XR_META_touch_controller_plus
+     if (profilePath == "/interaction_profiles/meta/touch_controller_plus")
+     {
+@@ -2390,9 +2399,14 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrSyncActions(
+     for (InputManager::Hand hand : {InputManager::Hand::Left, InputManager::Hand::Right})
+     {
+         XrPath expectedTopLevelPath = TopLevelPathFromHand(hand);
++        // The fallback list's bindings add up, which is harmless while they all describe one Touch controller. An
++        // app with Frame bindings also suggests Touch ones, and there Touch B means Frame B, X or Y: read only the
++        // Frame bindings, as SteamVR does, so Frame X does not also fire whatever the app put on Touch B.
++        const bool frameBound = SelectCurrentInteractionProfileForInstance(sess->GetInstance(), inputManager, hand) ==
++                                VALVE_FRAME_CONTROLLER_PROFILE;
+         for (const std::string& profilePathString : inputManager.GetActiveInteractionProfiles(hand))
+         {
+-            if (profilePathString.empty())
++            if (profilePathString.empty() || (frameBound && profilePathString != VALVE_FRAME_CONTROLLER_PROFILE))
+             {
+                 continue;
+             }
+@@ -2744,6 +2758,10 @@ static std::string LocalizedInteractionProfileName(Session* session, XrPath sour
+     {
+         return "EXT Hand Interaction";
+     }
++    if (profilePath == VALVE_FRAME_CONTROLLER_PROFILE)
++    {
++        return "Steam Frame Controller";
++    }
+     return "Unknown Profile";
+ }
+ 
+@@ -2760,6 +2778,30 @@ static std::string LocalizedComponentName(XrPath sourcePath)
+     {
+         return "Menu";
+     }
++    if (component == "view/click")
++    {
++        return "View";
++    }
++    if (component == "bumper/click")
++    {
++        return "Bumper";
++    }
++    if (component == "dpad_up/click")
++    {
++        return "D-pad Up";
++    }
++    if (component == "dpad_down/click")
++    {
++        return "D-pad Down";
++    }
++    if (component == "dpad_left/click")
++    {
++        return "D-pad Left";
++    }
++    if (component == "dpad_right/click")
++    {
++        return "D-pad Right";
++    }
+     if (component == "grip/pose")
+     {
+         return "Grip Pose";
+diff --git a/runtime/src/InputManager.cpp b/runtime/src/InputManager.cpp
+index a631d58..5525de5 100644
+--- a/runtime/src/InputManager.cpp
++++ b/runtime/src/InputManager.cpp
+@@ -20,6 +20,7 @@ constexpr const char* kOculusTouchProfile = "/interaction_profiles/oculus/touch_
+ constexpr const char* kTouchPlusPromotedProfile = "/interaction_profiles/meta/touch_plus_controller";
+ constexpr const char* kSimpleControllerProfile = "/interaction_profiles/khr/simple_controller";
+ constexpr const char* kHandInteractionProfile = "/interaction_profiles/ext/hand_interaction_ext";
++constexpr const char* kValveFrameProfile = "/interaction_profiles/valve/frame_controller_valve";
+ 
+ size_t HandIndex(InputManager::Hand hand)
+ {
+@@ -180,6 +181,8 @@ void InputManager::SetTrackingReceiver(TrackingReceiver* receiver)
+         }
+         streamingClientName_.clear();
+         streamingControllerProfile_.clear();
++        controllerProfile_ = 0;
++        touchState_ = 0;
+     }
+ }
+ 
+@@ -297,6 +300,8 @@ void InputManager::UpdateFromStreaming()
+ 
+     // Apply button/trigger states
+     buttonState_ = packet.buttonState;
++    controllerProfile_ = packet.controllerProfile;
++    touchState_ = packet.touchState;
+     leftTrigger_ = packet.leftTrigger;
+     rightTrigger_ = packet.rightTrigger;
+     leftGripValue_ = packet.leftGrip;
+@@ -693,6 +698,13 @@ std::vector<std::string> InputManager::GetCurrentInteractionProfileCandidates(Ha
+ 
+     if (IsControllerTrackingActive(hand))
+     {
++        // The client knows what is in the hand better than its name does: the Steam Frame client reports the
++        // Frame's own profile when SteamVR bound it. Apps that do not know that profile get Touch from the
++        // compatibility list below, which is what SteamVR's own emulation gives them.
++        if (controllerProfile_ == oxr::protocol::CONTROLLER_PROFILE_VALVE_FRAME)
++        {
++            return {kValveFrameProfile};
++        }
+         return {streamingControllerProfile_.empty() ? kOculusTouchProfile
+                                                     : streamingControllerProfile_};
+     }
+@@ -725,7 +737,7 @@ std::vector<std::string> InputManager::GetActiveInteractionProfiles(Hand hand) c
+     if (IsControllerTrackingActive(hand))
+     {
+         if (currentProfile.find("/interaction_profiles/meta/") == 0 ||
+-            currentProfile == kOculusTouchProfile)
++            currentProfile == kOculusTouchProfile || currentProfile == kValveFrameProfile)
+         {
+             AddProfileIfMissing(profiles, kOculusTouchProfile);
+         }
+@@ -817,6 +829,39 @@ bool InputManager::GetButtonClick(Hand hand, const std::string& componentPath) c
+     return false;
+ }
+ 
++// The Steam Frame controller's inputs (XR_VALVE_frame_controller_interaction), from the client's per-input bits.
++// The right hand has A, B, X, Y and menu; the left a four-way d-pad and view; both a bumper.
++bool InputManager::GetFrameControllerComponent(Hand hand, const std::string& componentPath) const
++{
++    using namespace oxr::protocol;
++    const bool left = hand == Hand::Left;
++    const size_t slash = componentPath.find('/');
++    const std::string input = componentPath.substr(0, slash);
++    const std::string kind = slash == std::string::npos ? "" : componentPath.substr(slash + 1);
++    if (kind != "click" && kind != "touch")
++    {
++        return GetButtonClick(hand, componentPath);   // the float thresholds: trigger/value, squeeze/value
++    }
++    const uint32_t bits = (kind == "touch") ? touchState_ : buttonState_;
++
++    uint32_t mask = 0;
++    if (!left && input == "a") mask = BUTTON_FRAME_A;
++    else if (!left && input == "b") mask = BUTTON_FRAME_B;
++    else if (!left && input == "x") mask = BUTTON_FRAME_X;
++    else if (!left && input == "y") mask = BUTTON_FRAME_Y;
++    else if (!left && input == "menu") mask = BUTTON_FRAME_RIGHT_MENU;
++    else if (left && input == "dpad_up") mask = BUTTON_FRAME_DPAD_UP;
++    else if (left && input == "dpad_down") mask = BUTTON_FRAME_DPAD_DOWN;
++    else if (left && input == "dpad_left") mask = BUTTON_FRAME_DPAD_LEFT;
++    else if (left && input == "dpad_right") mask = BUTTON_FRAME_DPAD_RIGHT;
++    else if (left && input == "view") mask = BUTTON_MENU;
++    else if (input == "bumper") mask = left ? BUTTON_LEFT_BUMPER : BUTTON_RIGHT_BUMPER;
++    else if (input == "squeeze") mask = left ? BUTTON_LEFT_GRIP : BUTTON_RIGHT_GRIP;
++    else if (input == "trigger") mask = left ? BUTTON_LEFT_TRIGGER : BUTTON_RIGHT_TRIGGER;
++    else if (input == "thumbstick") mask = left ? BUTTON_LEFT_THUMBSTICK : BUTTON_RIGHT_THUMBSTICK;
++    return (bits & mask) != 0;   // system, and an input on the wrong hand, read false
++}
++
+ bool InputManager::GetBooleanComponent(Hand hand, const std::string& componentPath) const
+ {
+     return GetBooleanComponentForProfile(hand, componentPath, "");
+@@ -849,6 +894,11 @@ bool InputManager::GetBooleanComponentForProfile(Hand hand, const std::string& c
+         return false;
+     }
+ 
++    if (profilePath == kValveFrameProfile)
++    {
++        return GetFrameControllerComponent(hand, componentPath);
++    }
++
+     return GetButtonClick(hand, componentPath);
+ }
+ 
+diff --git a/runtime/src/InputManager.h b/runtime/src/InputManager.h
+index 63da963..d27f3e8 100644
+--- a/runtime/src/InputManager.h
++++ b/runtime/src/InputManager.h
+@@ -81,6 +81,7 @@ class InputManager
+     float GetFloatComponent(Hand hand, const std::string& componentPath) const;
+     XrVector2f GetVector2fComponent(Hand hand, const std::string& componentPath) const;
+     XrPosef GetPoseComponent(Hand hand, const std::string& componentPath) const;
++    bool GetFrameControllerComponent(Hand hand, const std::string& componentPath) const;
+     bool GetBooleanComponentForProfile(Hand hand, const std::string& componentPath,
+                                        const std::string& profilePath) const;
+     float GetFloatComponentForProfile(Hand hand, const std::string& componentPath,
+@@ -152,6 +153,10 @@ class InputManager
+     XrVector2f leftThumbstick_ = {0.0f, 0.0f};
+     XrVector2f rightThumbstick_ = {0.0f, 0.0f};
+     uint32_t buttonState_ = 0;
++    // From the client's packet (Protocol.h ControllerProfile): which controller its own runtime bound, and
++    // the touch bits that go with it. Zero from a client that does not say.
++    uint32_t controllerProfile_ = 0;
++    uint32_t touchState_ = 0;
+     std::array<bool, 2> streamingControllerActive_ = {false, false};
+     std::string streamingClientName_;
+     std::string streamingControllerProfile_;
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index bca9168..b6e38db 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -1322,8 +1322,9 @@ void StreamingServer::TcpTrackingThread()
+             {
+                 break;
+             }
++            // No size check here: InjectPacket takes any packet from the oldest layout on, as the UDP
++            // path does. Requiring sizeof(TrackingPacket) would drop every client built before its newest field.
+             if (header.type == oxr::protocol::TcpRecordType::Tracking &&
+-                payload.size() >= sizeof(oxr::protocol::TrackingPacket) &&
+                 trackingReceiver_ != nullptr)
+             {
+                 trackingReceiver_->InjectPacket(payload.data(), payload.size());
+diff --git a/runtime/src/TrackingReceiver.cpp b/runtime/src/TrackingReceiver.cpp
+index 0166b59..84a0529 100644
+--- a/runtime/src/TrackingReceiver.cpp
++++ b/runtime/src/TrackingReceiver.cpp
+@@ -215,6 +215,17 @@ void TrackingReceiver::Stop()
+ static constexpr size_t kMinTrackingPacketSize =
+     offsetof(oxr::protocol::TrackingPacket, leftControllerAimPos);
+ 
++// The Steam Frame client sent 1080 bytes before controllerProfile existed: gazeDirection, then four bytes of
++// struct padding where controllerProfile now sits. Only a packet that reaches the end of touchState carries them.
++static void ClearFieldsBeyond(oxr::protocol::TrackingPacket& packet, size_t received)
++{
++    if (received < offsetof(oxr::protocol::TrackingPacket, touchState) + sizeof(packet.touchState))
++    {
++        packet.controllerProfile = oxr::protocol::CONTROLLER_PROFILE_UNKNOWN;
++        packet.touchState = 0;
++    }
++}
++
+ void TrackingReceiver::ReceiveThread()
+ {
+     uint8_t buffer[sizeof(oxr::protocol::TrackingPacket)];
+@@ -232,6 +243,7 @@ void TrackingReceiver::ReceiveThread()
+         oxr::protocol::TrackingPacket packet = {};
+         size_t copyBytes = std::min(static_cast<size_t>(received), sizeof(packet));
+         memcpy(&packet, buffer, copyBytes);
++        ClearFieldsBeyond(packet, copyBytes);
+         StorePacket(packet, SteadyClockNowNs());
+     }
+ }
+@@ -245,6 +257,7 @@ void TrackingReceiver::InjectPacket(const uint8_t* data, size_t size)
+ 
+     oxr::protocol::TrackingPacket packet = {};
+     memcpy(&packet, data, std::min(size, sizeof(packet)));
++    ClearFieldsBeyond(packet, size);
+     StorePacket(packet, SteadyClockNowNs());
+ }
+ 
+diff --git a/tests/TestInputManager.cpp b/tests/TestInputManager.cpp
+index f080a69..8c997d4 100644
+--- a/tests/TestInputManager.cpp
++++ b/tests/TestInputManager.cpp
+@@ -6,6 +6,7 @@
+ #include "InputManager.h"
+ #include "TrackingReceiver.h"
+ #include <algorithm>
++#include <cstddef>
+ #include <cmath>
+ #include <glm/gtc/quaternion.hpp>
+ #include <vector>
+@@ -433,6 +434,89 @@ TEST_CASE("InputManager — select follows trigger and squeeze follows grab", "[
+     CHECK_FALSE(im.GetButtonClick(InputManager::Hand::Left, "squeeze/click"));
+ }
+ 
++TEST_CASE("InputManager — a Steam Frame client's controllers report the Frame profile and its inputs", "[input]")
++{
++    using namespace oxr::protocol;
++    constexpr const char* kFrame = "/interaction_profiles/valve/frame_controller_valve";
++    constexpr const char* kTouch = "/interaction_profiles/oculus/touch_controller";
++    InputManager im;
++    TrackingReceiver receiver;
++    im.SetTrackingReceiver(&receiver);
++    im.SetStreamingClientName("FrameClient");
++
++    TrackingPacket packet = {};
++    packet.timestampNs = 1'000'000'000;
++    packet.headOrientation[3] = 1.0f;
++    packet.trackingFlags = TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE | TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE;
++    packet.leftControllerRot[3] = 1.0f;
++    packet.rightControllerRot[3] = 1.0f;
++    packet.controllerProfile = CONTROLLER_PROFILE_VALVE_FRAME;
++    // Right X pressed, left d-pad up pressed, right A touched; the client also sets the Touch bits
++    // SteamVR's remap gives them: X -> Touch B, d-pad up -> Touch Y.
++    packet.buttonState = BUTTON_FRAME_X | BUTTON_B | BUTTON_FRAME_DPAD_UP | BUTTON_Y | BUTTON_LEFT_BUMPER;
++    packet.touchState = BUTTON_FRAME_A | BUTTON_A;
++    receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
++    im.Update(0.0f);
++
++    for (InputManager::Hand hand : {InputManager::Hand::Left, InputManager::Hand::Right})
++    {
++        CHECK(im.GetCurrentInteractionProfile(hand) == kFrame);
++        const std::vector<std::string> profiles = im.GetActiveInteractionProfiles(hand);
++        REQUIRE(profiles.size() == 3);
++        CHECK(profiles[0] == kFrame);
++        CHECK(profiles[1] == kTouch);
++        CHECK(profiles[2] == "/interaction_profiles/khr/simple_controller");
++    }
++
++    const auto L = InputManager::Hand::Left;
++    const auto R = InputManager::Hand::Right;
++    // Frame bindings see each input on its own.
++    CHECK(im.GetBooleanComponentForProfile(R, "x/click", kFrame));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(R, "b/click", kFrame));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(R, "y/click", kFrame));
++    CHECK(im.GetBooleanComponentForProfile(L, "dpad_up/click", kFrame));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(L, "dpad_left/click", kFrame));
++    CHECK(im.GetBooleanComponentForProfile(L, "bumper/click", kFrame));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(R, "bumper/click", kFrame));
++    CHECK(im.GetBooleanComponentForProfile(R, "a/touch", kFrame));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(R, "a/click", kFrame));
++    // An input on the other hand's controller does not exist there.
++    CHECK_FALSE(im.GetBooleanComponentForProfile(L, "x/click", kFrame));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(R, "dpad_up/click", kFrame));
++    // Touch bindings see what SteamVR's emulation would give them.
++    CHECK(im.GetBooleanComponentForProfile(R, "b/click", kTouch));
++    CHECK(im.GetBooleanComponentForProfile(L, "y/click", kTouch));
++    CHECK_FALSE(im.GetBooleanComponentForProfile(L, "x/click", kTouch));
++}
++
++TEST_CASE("TrackingReceiver — a packet that stops before touchState carries no controller profile", "[input]")
++{
++    using namespace oxr::protocol;
++    InputManager im;
++    TrackingReceiver receiver;
++    im.SetTrackingReceiver(&receiver);
++    im.SetStreamingClientName("FrameClient");
++
++    // A Steam Frame client from before controllerProfile sent 1080 bytes: gazeDirection, then four bytes of
++    // padding that land on controllerProfile. Whatever is in them must not select a profile.
++    TrackingPacket packet = {};
++    packet.timestampNs = 1'000'000'000;
++    packet.headOrientation[3] = 1.0f;
++    packet.trackingFlags = TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE;
++    packet.rightControllerRot[3] = 1.0f;
++    packet.controllerProfile = CONTROLLER_PROFILE_VALVE_FRAME;
++    packet.touchState = 0xffffffffu;
++    receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&packet), offsetof(TrackingPacket, touchState));
++    im.Update(0.0f);
++    CHECK(im.GetCurrentInteractionProfile(InputManager::Hand::Right) == "/interaction_profiles/oculus/touch_controller");
++
++    packet.timestampNs += 11'000'000;   // a newer packet: the receiver drops one that is not
++    receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
++    im.Update(0.0f);
++    CHECK(im.GetCurrentInteractionProfile(InputManager::Hand::Right) ==
++          "/interaction_profiles/valve/frame_controller_valve");
++}
++
+ TEST_CASE("TrackingReceiver — predicted pose extrapolates recent motion", "[input]")
+ {
+     TrackingReceiver receiver;
+diff --git a/tests/TestProtocolLayout.cpp b/tests/TestProtocolLayout.cpp
+index b2cf425..4a43664 100644
+--- a/tests/TestProtocolLayout.cpp
++++ b/tests/TestProtocolLayout.cpp
+@@ -48,7 +48,8 @@ TEST_CASE("C++ protocol layouts match the documented wire format", "[protocol]")
+     STATIC_REQUIRE(SERVER_FEATURE_STREAM_RECONFIGURE == 0x00000010);
+     STATIC_REQUIRE(CLIENT_CAPABILITY_STREAM_RECONFIGURE == 0x00000010);
+ 
+-    STATIC_REQUIRE(sizeof(TrackingPacket) == 1064);
++    // 1088, not 1084: touchState ends at 1084 and the struct's int64 alignment pads to 8.
++    STATIC_REQUIRE(sizeof(TrackingPacket) == 1088);
+     STATIC_REQUIRE(offsetof(TrackingPacket, headLinearVelocity) == 152);
+     STATIC_REQUIRE(offsetof(TrackingPacket, headAngularVelocity) == 164);
+     STATIC_REQUIRE(offsetof(TrackingPacket, leftHandJoints) == 176);
+@@ -58,6 +59,11 @@ TEST_CASE("C++ protocol layouts match the documented wire format", "[protocol]")
+     STATIC_REQUIRE(offsetof(TrackingPacket, leftControllerAimRot) == 1020);
+     STATIC_REQUIRE(offsetof(TrackingPacket, rightControllerAimPos) == 1036);
+     STATIC_REQUIRE(offsetof(TrackingPacket, rightControllerAimRot) == 1048);
++    // Gaze, the controller profile and touch bits follow the aim poses, where the Steam Frame client
++    // puts them. That client sent 1080 bytes before controllerProfile existed, the last four padding.
++    STATIC_REQUIRE(offsetof(TrackingPacket, gazeDirection) == 1064);
++    STATIC_REQUIRE(offsetof(TrackingPacket, controllerProfile) == 1076);
++    STATIC_REQUIRE(offsetof(TrackingPacket, touchState) == 1080);
+     STATIC_REQUIRE(TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE == 0x0004);
+     STATIC_REQUIRE(TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE == 0x0008);
+ }
+diff --git a/tests/TestRuntimeApi.cpp b/tests/TestRuntimeApi.cpp
+index 97c5cd7..e346c9d 100644
+--- a/tests/TestRuntimeApi.cpp
++++ b/tests/TestRuntimeApi.cpp
+@@ -1621,6 +1621,54 @@ TEST_CASE("Suggest interaction profile bindings rejects unavailable extension-ga
+     XR_CHECK(xrDestroyActionSet(actionSet));
+ }
+ 
++TEST_CASE("Suggest interaction profile bindings takes the Steam Frame profile only with its extension",
++          "[runtime][actions]")
++{
++    auto suggestFrameBindings = [](RuntimeSessionContext& context) -> XrResult
++    {
++
++        XrActionSet actionSet = XR_NULL_HANDLE;
++        XrActionSetCreateInfo actionSetCreateInfo = {XR_TYPE_ACTION_SET_CREATE_INFO};
++        std::strncpy(actionSetCreateInfo.actionSetName, "frame", XR_MAX_ACTION_SET_NAME_SIZE);
++        std::strncpy(actionSetCreateInfo.localizedActionSetName, "Frame", XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE);
++        XR_CHECK(xrCreateActionSet(context.instance, &actionSetCreateInfo, &actionSet));
++
++        XrAction buttonAction = XR_NULL_HANDLE;
++        XrActionCreateInfo actionCreateInfo = {XR_TYPE_ACTION_CREATE_INFO};
++        actionCreateInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
++        std::strncpy(actionCreateInfo.actionName, "button", XR_MAX_ACTION_NAME_SIZE);
++        std::strncpy(actionCreateInfo.localizedActionName, "Button", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
++        XR_CHECK(xrCreateAction(actionSet, &actionCreateInfo, &buttonAction));
++
++        // The Frame's d-pad is its own buttons (dpad_up/click), not a trackpad's emulated dpad_up.
++        std::array<XrActionSuggestedBinding, 3> bindings = {{
++            {buttonAction, context.Path("/user/hand/left/input/dpad_up/click")},
++            {buttonAction, context.Path("/user/hand/right/input/x/click")},
++            {buttonAction, context.Path("/user/hand/left/input/bumper/click")},
++        }};
++        XrInteractionProfileSuggestedBinding suggestedBindings = {
++            XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
++        suggestedBindings.interactionProfile =
++            context.Path("/interaction_profiles/valve/frame_controller_valve");
++        suggestedBindings.suggestedBindings = bindings.data();
++        suggestedBindings.countSuggestedBindings = static_cast<uint32_t>(bindings.size());
++        const XrResult result = xrSuggestInteractionProfileBindings(context.instance, &suggestedBindings);
++
++        XR_CHECK(xrDestroyAction(buttonAction));
++        XR_CHECK(xrDestroyActionSet(actionSet));
++        return result;
++    };
++
++    {
++        RuntimeSessionContext context({XR_KHR_METAL_ENABLE_EXTENSION_NAME});
++        CHECK(suggestFrameBindings(context) == XR_ERROR_PATH_UNSUPPORTED);
++    }
++    {
++        RuntimeSessionContext context({XR_KHR_METAL_ENABLE_EXTENSION_NAME, "XR_VALVE_frame_controller_interaction"});
++        CHECK(suggestFrameBindings(context) == XR_SUCCESS);
++    }
++}
++
+ TEST_CASE("Suggest interaction profile bindings accepts hand interaction components when enabled",
+           "[runtime][actions]")
+ {
+-- 
+2.43.0
+

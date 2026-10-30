@@ -1,0 +1,1105 @@
+From 511ca9253fdd1581d6c3eda2b6b968a47da1ac1d Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 14:53:34 +0000
+Subject: [PATCH 14/23] runtime: pose_prediction = "measured" predicts the head
+ pose to the time it is seen
+
+The runtime predicted the head pose about 10 ms ahead (the server pipeline estimate),
+while the sample reaches the eye about 34 ms after the client took it. The runtime now
+measures that sample-to-display latency in the live chain and can use it as the horizon.
+
+Measured, per frame, smoothed (EMA 0.1), logged every 5 s as
+"StreamingServer: sample->display latency (measured)":
+- sample age at fetch: now minus the receive time of the tracking sample WaitFrame used
+- render: WaitFrame fetch to SendFrame
+- encode+send: SendFrame to the last packet handed to the socket (and to send start)
+- client displayed age: the client's own LatencyReport.displayedFrameAgeMs
+- rtt: RttProbe, a 1 Hz probe thread (ICMP echo, else UDP port-unreachable). The protocol
+  has no ping/pong and no clock sync. Inside Godot on the Mac every probe send is refused
+  (No route to host / Broken pipe), so a fixed 5.3 ms is used and logged as assumed.
+
+pose_prediction = "fixed" (default) keeps the old behaviour. "measured" sets the horizon
+per call to (now - sample receive) + post-fetch latency, clamped to 0-60 ms, and falls
+back to the fixed estimate until every term is measured. pose_prediction_horizon_ms > 0
+overrides both with a constant.
+
+TrackingReceiver also scores each frame's predicted pose against the client's later
+samples at sample time + measured latency and logs the derived reprojection delta
+(rot mean/p95, pos mean, and the unpredicted baseline) every 5 s.
+
+The UDP probe socket sets SO_NOSIGPIPE and is reopened after any unanswered probe: an
+earlier build without it took Godot down silently about a second after the switch to UDP.
+
+Live, off-head, 60 s windows (bitrate 50, ffe medium, 90 Hz):
+fixed:    horizon 10.0-10.3 ms, measured latency 33.1-34.6 ms
+measured: horizon 32.9-36.2 ms, measured latency 33.7-35.7 ms
+Reprojection delta 0.000 deg either way: the pose is still off-head.
+
+Tests: [input] 211 assertions in 13 test cases pass, including a new measured-mode case.
+
+---
+ runtime/CMakeLists.txt           |   1 +
+ runtime/oxrsys-runtime.toml      |   9 +
+ runtime/src/Config.cpp           |   9 +
+ runtime/src/Config.h             |   9 +
+ runtime/src/RttProbe.cpp         | 383 +++++++++++++++++++++++++++++++
+ runtime/src/RttProbe.h           |  76 ++++++
+ runtime/src/StreamingServer.cpp  |  92 ++++++++
+ runtime/src/StreamingServer.h    |  16 ++
+ runtime/src/TrackingReceiver.cpp | 130 ++++++++++-
+ runtime/src/TrackingReceiver.h   |  45 ++++
+ tests/TestInputManager.cpp       |  44 ++++
+ 11 files changed, 813 insertions(+), 1 deletion(-)
+ create mode 100644 runtime/src/RttProbe.cpp
+ create mode 100644 runtime/src/RttProbe.h
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 85d19d8..781e2d4 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -20,6 +20,7 @@ add_library(oxrsys_runtime SHARED
+     src/InputManager.cpp
+     src/HandTracker.cpp
+     src/StreamingServer.cpp
++    src/RttProbe.cpp
+     src/TrackingReceiver.cpp
+     src/VulkanDispatch.cpp
+     src/SwapchainCommon.cpp
+diff --git a/runtime/oxrsys-runtime.toml b/runtime/oxrsys-runtime.toml
+index 50db0ee..b9a4336 100644
+--- a/runtime/oxrsys-runtime.toml
++++ b/runtime/oxrsys-runtime.toml
+@@ -55,6 +55,15 @@ pacing_spin_ms = 0
+ # (Mach time-constraint policy, period = one frame). Tighter wakeups without spinning.
+ pacing_thread = "default"
+ 
++# Head-pose prediction for the frames the app renders. "fixed" predicts by the encode
++# pipeline + the client's reported pipeline (about 10 ms on the Steam Frame); "measured"
++# predicts to the measured sample->display latency (sample age + render + encode/send +
++# network RTT by ICMP echo + the client's displayed frame age, clamped 0-60 ms). Both log the
++# latency and the derived reprojection delta every 5 s. pose_prediction_horizon_ms > 0 forces
++# a horizon in either mode.
++pose_prediction = "fixed"
++pose_prediction_horizon_ms = 0
++
+ 
+ # VideoToolbox low-latency rate control for the hardware encoder: no look-ahead and no
+ # periodic keyframes (clients request them on loss). Cuts the encode callback from ~12.6 ms
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index cec86c7..f01136c 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -408,6 +408,15 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             {
+                 values.pacingLockWaitMs = std::max(0.0f, std::min(30.0f, std::stof(value)));
+             }
++            else if (key == "pose_prediction")
++            {
++                value = ParseString(value);
++                values.posePrediction = (value == "measured") ? "measured" : "fixed";
++            }
++            else if (key == "pose_prediction_horizon_ms")
++            {
++                values.posePredictionHorizonMs = std::max(0.0f, std::min(80.0f, std::stof(value)));
++            }
+             else if (key == "pacing_spin_ms")
+             {
+                 values.pacingSpinMs = std::max(0.0f, std::min(8.0f, std::stof(value)));
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index b21c99e..5b12d9d 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -48,6 +48,15 @@ struct ConfigValues
+     // so 6 ms buys the lock without a frame of waiting (a fixed 15 ms AGE setpoint, the first form,
+     // cost a full period of pickup latency worn: 13-14.6 ms). 0 = off. Measured 2026-10-18.
+     float pacingLockWaitMs = 6.0f;
++    // pose_prediction: how far ahead of the client's tracking sample the head pose a frame is
++    // rendered with is predicted. "fixed" (default) = the server encode pipeline + the client's
++    // reported pipeline, as before (10.4 ms on the Frame, 2026-10-18). "measured" = the measured
++    // sample->display latency: the sample's age when fetched + render + encode/send + network
++    // RTT (ICMP echo to the client) + the client's displayed frame age, clamped 0-60 ms. The
++    // latency and the derived reprojection delta are logged in both modes.
++    std::string posePrediction = "fixed";
++    // pose_prediction_horizon_ms: > 0 forces this horizon in either mode (0-80); 0 = off.
++    float posePredictionHorizonMs = 0.0f;
+     // Feed the low-latency (rtvc) or software session the BGRA surface directly
+     // instead of a BT.709 video-range 4:2:0 conversion of each frame (about 1 ms
+     // of submit per frame, measured 2026-10-17). Those sessions then write a
+diff --git a/runtime/src/RttProbe.cpp b/runtime/src/RttProbe.cpp
+new file mode 100644
+index 0000000..5ab9bf8
+--- /dev/null
++++ b/runtime/src/RttProbe.cpp
+@@ -0,0 +1,383 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include "RttProbe.h"
++
++#include <spdlog/spdlog.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cerrno>
++#include <cstring>
++#include <vector>
++
++#if defined(__APPLE__) || defined(__linux__)
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#define OXRSYS_RTT_PROBE_SUPPORTED 1
++#endif
++
++namespace
++{
++int64_t NowNs()
++{
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++uint16_t InternetChecksum(const uint8_t* data, size_t size)
++{
++    uint32_t sum = 0;
++    for (size_t i = 0; i + 1 < size; i += 2)
++    {
++        sum += static_cast<uint32_t>((data[i] << 8) | data[i + 1]);
++    }
++    if (size & 1)
++    {
++        sum += static_cast<uint32_t>(data[size - 1] << 8);
++    }
++    while (sum >> 16)
++    {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++    return static_cast<uint16_t>(~sum);
++}
++} // namespace
++
++RttProbe::~RttProbe()
++{
++    Shutdown();
++}
++
++void RttProbe::SetTarget(const std::string& ipv4)
++{
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (ipv4 == target_)
++    {
++        return;
++    }
++    target_ = ipv4;
++    targetGeneration_++;
++    samplesMs_.clear();
++    lost_ = 0;
++    sent_ = 0;
++    sendFailures_ = 0;
++    lastSendErrno_ = 0;
++#ifdef OXRSYS_RTT_PROBE_SUPPORTED
++    if (!target_.empty() && !thread_.joinable() && !stop_)
++    {
++        thread_ = std::thread(&RttProbe::ThreadMain, this);
++    }
++#endif
++    cv_.notify_all();
++}
++
++void RttProbe::Shutdown()
++{
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        stop_ = true;
++        target_.clear();
++        cv_.notify_all();
++    }
++    if (thread_.joinable())
++    {
++        thread_.join();
++    }
++}
++
++RttProbe::Summary RttProbe::GetSummary() const
++{
++    std::lock_guard<std::mutex> lock(mutex_);
++    Summary summary;
++    summary.lost = lost_;
++    summary.sent = sent_;
++    summary.sendFailures = sendFailures_;
++    summary.lastSendErrno = lastSendErrno_;
++    summary.samples = static_cast<uint32_t>(samplesMs_.size());
++    if (samplesMs_.size() < 3)
++    {
++        return summary;
++    }
++    std::vector<float> sorted(samplesMs_.begin(), samplesMs_.end());
++    std::sort(sorted.begin(), sorted.end());
++    summary.valid = true;
++    summary.medianMs = sorted[sorted.size() / 2];
++    summary.minMs = sorted.front();
++    summary.maxMs = sorted.back();
++    return summary;
++}
++
++namespace
++{
++#ifdef OXRSYS_RTT_PROBE_SUPPORTED
++struct ProbeResult
++{
++    bool sent = false;
++    int sendErrno = 0;
++    float rttMs = -1.0f;
++    int recvErrno = 0; // UDP: what recv said instead of ECONNREFUSED (0 = timed out)
++};
++
++// Wait up to the deadline for something readable (or an error) on a non-blocking socket.
++bool WaitReadable(int sock, int64_t deadlineNs)
++{
++    const int64_t remainingMs = (deadlineNs - NowNs()) / 1000000;
++    if (remainingMs <= 0)
++    {
++        return false;
++    }
++    pollfd pfd = {sock, POLLIN, 0};
++    return poll(&pfd, 1, static_cast<int>(remainingMs)) > 0;
++}
++
++ProbeResult ProbeIcmp(int sock, const sockaddr_in& addr, uint16_t ident, uint16_t sequence,
++                      int timeoutMs)
++{
++    ProbeResult result;
++    uint8_t packet[64] = {};
++    packet[0] = 8; // echo request
++    packet[4] = static_cast<uint8_t>(ident >> 8);
++    packet[5] = static_cast<uint8_t>(ident & 0xff);
++    packet[6] = static_cast<uint8_t>(sequence >> 8);
++    packet[7] = static_cast<uint8_t>(sequence & 0xff);
++    const int64_t sentNs = NowNs();
++    memcpy(packet + 8, &sentNs, sizeof(sentNs));
++    const uint16_t checksum = InternetChecksum(packet, sizeof(packet));
++    packet[2] = static_cast<uint8_t>(checksum >> 8);
++    packet[3] = static_cast<uint8_t>(checksum & 0xff);
++    result.sent = sendto(sock, packet, sizeof(packet), 0, reinterpret_cast<const sockaddr*>(&addr),
++                         sizeof(addr)) == static_cast<ssize_t>(sizeof(packet));
++    result.sendErrno = result.sent ? 0 : errno;
++
++    const int64_t deadlineNs = sentNs + int64_t(timeoutMs) * 1000000;
++    while (result.sent && result.rttMs < 0.0f && WaitReadable(sock, deadlineNs))
++    {
++        uint8_t reply[512];
++        const ssize_t got = recv(sock, reply, sizeof(reply), MSG_DONTWAIT);
++        const int64_t gotNs = NowNs();
++        if (got <= 0)
++        {
++            if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
++            {
++                continue;
++            }
++            break;
++        }
++        // macOS hands a datagram ICMP socket the IP header too; Linux does not.
++        size_t offset = 0;
++        if (got >= 20 && (reply[0] >> 4) == 4)
++        {
++            offset = static_cast<size_t>(reply[0] & 0x0f) * 4;
++        }
++        if (static_cast<size_t>(got) < offset + 16 || reply[offset] != 0)
++        {
++            continue; // not an echo reply
++        }
++        const uint16_t replySeq = static_cast<uint16_t>((reply[offset + 6] << 8) | reply[offset + 7]);
++        int64_t echoedNs = 0;
++        memcpy(&echoedNs, reply + offset + 8, sizeof(echoedNs));
++        if (replySeq == sequence && echoedNs == sentNs)
++        {
++            result.rttMs = static_cast<float>(gotNs - sentNs) / 1.0e6f;
++        }
++    }
++    return result;
++}
++
++// One byte to a closed UDP port: the client's kernel answers port-unreachable, which a connected
++// socket reports as ECONNREFUSED. Linux rate-limits that answer to about one a second per peer
++// (icmp_ratelimit 1000 ms, burst 6), so this runs at 1 Hz. One socket for the whole run (no
++// descriptor churn inside the host process), SO_NOSIGPIPE so no error on it can raise a signal.
++int OpenUdpProbeSocket(const sockaddr_in& addr, int& errOut)
++{
++    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++    if (sock < 0)
++    {
++        errOut = errno;
++        return -1;
++    }
++#ifdef SO_NOSIGPIPE
++    int one = 1;
++    setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
++#endif
++    fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) | O_NONBLOCK);
++    if (connect(sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0)
++    {
++        errOut = errno;
++        close(sock);
++        return -1;
++    }
++    return sock;
++}
++
++ProbeResult ProbeUdpUnreachable(int sock, int timeoutMs)
++{
++    ProbeResult result;
++    // Drain anything pending (a late refusal from the previous probe) before timing this one.
++    uint8_t scratch[64];
++    for (int i = 0; i < 4 && recv(sock, scratch, sizeof(scratch), MSG_DONTWAIT) != -1; ++i)
++    {
++    }
++    int pending = 0;
++    socklen_t len = sizeof(pending);
++    getsockopt(sock, SOL_SOCKET, SO_ERROR, &pending, &len);
++
++    const uint8_t byte = 0;
++    const int64_t sentNs = NowNs();
++    result.sent = send(sock, &byte, 1, 0) == 1;
++    result.sendErrno = result.sent ? 0 : errno;
++    const int64_t deadlineNs = sentNs + int64_t(timeoutMs) * 1000000;
++    while (result.sent && result.rttMs < 0.0f && WaitReadable(sock, deadlineNs))
++    {
++        const ssize_t got = recv(sock, scratch, sizeof(scratch), MSG_DONTWAIT);
++        const int64_t gotNs = NowNs();
++        if (got < 0 && errno == ECONNREFUSED)
++        {
++            result.rttMs = static_cast<float>(gotNs - sentNs) / 1.0e6f;
++        }
++        else if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
++        {
++            continue;
++        }
++        else
++        {
++            result.recvErrno = got < 0 ? errno : -1;
++            break; // data (the port is open) or another error: no measurement
++        }
++    }
++    return result;
++}
++#endif
++} // namespace
++
++void RttProbe::ThreadMain()
++{
++#ifdef OXRSYS_RTT_PROBE_SUPPORTED
++    // ICMP echo first; a process the OS will not let send ICMP (measured 2026-10-18: inside
++    // Godot on macOS 27 every echo fails "No route to host" while its UDP flows) falls back to
++    // UDP port-unreachable after three refusals.
++    int icmpSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
++    if (icmpSock >= 0)
++    {
++        fcntl(icmpSock, F_SETFL, fcntl(icmpSock, F_GETFL, 0) | O_NONBLOCK);
++    }
++    bool useUdp = icmpSock < 0;
++    int udpSock = -1;
++    std::string udpTarget;
++    uint32_t icmpRefusals = 0;
++    const uint16_t ident = static_cast<uint16_t>(getpid() & 0xffff);
++    uint16_t sequence = 0;
++    spdlog::info("RttProbe: measuring RTT to the streaming client by {}",
++                 useUdp ? "UDP port-unreachable (1 Hz)" : "ICMP echo (4 Hz)");
++
++    std::unique_lock<std::mutex> lock(mutex_);
++    while (!stop_)
++    {
++        if (target_.empty())
++        {
++            cv_.wait(lock, [this] { return stop_ || !target_.empty(); });
++            continue;
++        }
++        const std::string target = target_;
++        const uint64_t generation = targetGeneration_;
++        lock.unlock();
++
++        sockaddr_in addr = {};
++        addr.sin_family = AF_INET;
++        ProbeResult result;
++        const bool addrOk = inet_pton(AF_INET, target.c_str(), &addr.sin_addr) == 1;
++        if (addrOk && !useUdp)
++        {
++            result = ProbeIcmp(icmpSock, addr, ident, ++sequence, kReplyTimeoutMs);
++            if (!result.sent && ++icmpRefusals >= 3)
++            {
++                useUdp = true;
++                spdlog::info("RttProbe: ICMP echo refused ({}); measuring by UDP port-unreachable "
++                             "to {}:{} at 1 Hz instead", strerror(result.sendErrno), target,
++                             kUdpProbePort);
++            }
++        }
++        else if (addrOk)
++        {
++            if (udpSock >= 0 && udpTarget != target)
++            {
++                close(udpSock);
++                udpSock = -1;
++            }
++            if (udpSock < 0)
++            {
++                addr.sin_port = htons(kUdpProbePort);
++                udpSock = OpenUdpProbeSocket(addr, result.sendErrno);
++                udpTarget = target;
++            }
++            if (udpSock >= 0)
++            {
++                result = ProbeUdpUnreachable(udpSock, kReplyTimeoutMs);
++                if (!result.sent || result.rttMs < 0.0f)
++                {
++                    // macOS can latch a connected UDP socket into EPIPE after an unanswered
++                    // probe; a fresh socket next time costs nothing at 1 Hz.
++                    close(udpSock);
++                    udpSock = -1;
++                }
++            }
++        }
++
++        lock.lock();
++        if (generation == targetGeneration_ && !stop_)
++        {
++            if (result.sent)
++            {
++                sent_++;
++            }
++            else
++            {
++                sendFailures_++;
++                lastSendErrno_ = result.sendErrno;
++                if (sendFailures_ == 1 || sendFailures_ % 100 == 0)
++                {
++                    spdlog::warn("RttProbe: probe to {} not sent ({} failures, last: {})", target,
++                                 sendFailures_, strerror(result.sendErrno));
++                }
++            }
++            if (result.rttMs >= 0.0f)
++            {
++                if (samplesMs_.empty() && lost_ == 0)
++                {
++                    spdlog::info("RttProbe: first reply from {} in {:.2f} ms", target, result.rttMs);
++                }
++                samplesMs_.push_back(result.rttMs);
++                while (samplesMs_.size() > kWindow)
++                {
++                    samplesMs_.pop_front();
++                }
++            }
++            else if (result.sent)
++            {
++                lost_++;
++                if (useUdp && (lost_ == 1 || lost_ % 100 == 0))
++                {
++                    spdlog::warn("RttProbe: UDP probe to {} unanswered ({} lost, recv said: {})", target,
++                                 lost_, result.recvErrno > 0 ? strerror(result.recvErrno)
++                                        : result.recvErrno < 0 ? "data" : "timeout");
++                }
++            }
++        }
++        cv_.wait_for(lock, std::chrono::milliseconds(useUdp ? kUdpIntervalMs : kIntervalMs),
++                     [this, generation] { return stop_ || generation != targetGeneration_; });
++    }
++    lock.unlock();
++    if (icmpSock >= 0)
++    {
++        close(icmpSock);
++    }
++    if (udpSock >= 0)
++    {
++        close(udpSock);
++    }
++#endif
++}
+diff --git a/runtime/src/RttProbe.h b/runtime/src/RttProbe.h
+new file mode 100644
+index 0000000..d9e29bd
+--- /dev/null
++++ b/runtime/src/RttProbe.h
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#pragma once
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <mutex>
++#include <string>
++#include <thread>
++
++/**
++ * Round-trip time to the streaming client, measured with ICMP echo.
++ *
++ * The streaming protocol carries no ping/pong and no clock sync (the tracking timestamp is the
++ * client's XrTime, the video timestamps are the server's steady clock), so the server cannot
++ * see the network's share of sample->display latency from its own traffic. An unprivileged ICMP
++ * datagram socket (macOS allows SOCK_DGRAM/IPPROTO_ICMP without root) answers it with no client
++ * change: the headset's kernel replies, a few times a second, 64 bytes each way. What it
++ * measures is uplink + downlink one-way delay for a small packet - exactly the sum that a tracking
++ * sample (up) and the frame rendered from it (down) both pay. It does not include the airtime of a
++ * frame's burst behind its first packet, nor client userspace scheduling.
++ *
++ * Where the process may not send ICMP, it falls back to one UDP byte to a closed port (9) on the
++ * client: the client kernel's port-unreachable answer comes back as ECONNREFUSED, the same
++ * small-packet round trip.
++ */
++class RttProbe
++{
++public:
++    RttProbe() = default;
++    ~RttProbe();
++
++    RttProbe(const RttProbe&) = delete;
++    RttProbe& operator=(const RttProbe&) = delete;
++
++    // Probe this IPv4 address; an empty string idles the probe and forgets the samples.
++    void SetTarget(const std::string& ipv4);
++    void Shutdown();
++
++    struct Summary
++    {
++        bool valid = false;
++        float medianMs = 0.0f;
++        float minMs = 0.0f;
++        float maxMs = 0.0f;
++        uint32_t samples = 0;
++        uint32_t lost = 0;   // since the target was set
++        uint32_t sent = 0;
++        uint32_t sendFailures = 0;
++        int lastSendErrno = 0;
++    };
++    Summary GetSummary() const;
++
++private:
++    void ThreadMain();
++
++    mutable std::mutex mutex_;
++    std::condition_variable cv_;
++    std::thread thread_;
++    bool stop_ = false;
++    std::string target_;
++    uint64_t targetGeneration_ = 0;
++    std::deque<float> samplesMs_;
++    uint32_t lost_ = 0;
++    uint32_t sent_ = 0;
++    uint32_t sendFailures_ = 0;
++    int lastSendErrno_ = 0;
++
++    static constexpr size_t kWindow = 17;      // ~4 s at 4 Hz; the median of it is used
++    static constexpr int kIntervalMs = 250;
++    static constexpr int kReplyTimeoutMs = 200;
++    static constexpr int kUdpIntervalMs = 1000;
++    static constexpr uint16_t kUdpProbePort = 9;   // discard: closed on the Steam Frame
++};
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index 34df0eb..6f6abe1 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -592,6 +592,13 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
+ 
+     const ConfigValues config = Config::Get().GetValues();
+     refreshRateHz_ = config.refreshRateHz;
++    posePredictionMeasured_ = config.posePrediction == "measured";
++    posePredictionOverrideMs_ = config.posePredictionHorizonMs;
++    spdlog::info("StreamingServer: pose_prediction={}{}", config.posePrediction,
++                 posePredictionOverrideMs_ > 0.0f
++                     ? " (pose_prediction_horizon_ms override " +
++                           std::to_string(posePredictionOverrideMs_) + ")"
++                     : std::string());
+     targetRefreshRateHz_.store(refreshRateHz_);
+     wifiEnabled_ = config.streamingTransport != "usb_adb";
+     usbAdbEnabled_ = config.streamingTransport != "wifi";
+@@ -812,6 +819,7 @@ bool StreamingServer::Stop(std::chrono::nanoseconds timeout)
+         clientPort_ = 0;
+         clientUsesUsbAdb_.store(false);
+     }
++    rttProbe_.SetTarget(std::string());
+ 
+     oxrsys::runtime_socket::Close(broadcastSocket_);
+     oxrsys::runtime_socket::Close(controlSocket_);
+@@ -1733,6 +1741,10 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
+         clientName_ = clientName;
+         clientUsesUsbAdb_.store(false);
+     }
++    rttProbe_.SetTarget(ipStr);
++    sampleToSubmitMs_.store(0.0f);
++    sampleAgeAtFetchMs_.store(0.0f);
++    submitToSentMs_.store(0.0f);
+     clientSupportsStreamReconfigure_.store(
+         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_STREAM_RECONFIGURE));
+     const bool clientSupportsPassthrough =
+@@ -2185,6 +2197,7 @@ void StreamingServer::HandleClientDisconnect()
+         clientPort_ = 0;
+         clientUsesUsbAdb_.store(false);
+     }
++    rttProbe_.SetTarget(std::string());
+     if (previousState != State::Connected && !hadClient)
+     {
+         return;
+@@ -2751,7 +2764,50 @@ void StreamingServer::UpdatePredictionHorizon()
+ 
+     float horizonMs = serverPipelineLatencyMs_.load() + clientPipelineLatencyMs_.load();
+     horizonMs = std::clamp(horizonMs, 0.0f, 80.0f);
++    if (posePredictionOverrideMs_ > 0.0f)
++    {
++        horizonMs = posePredictionOverrideMs_;
++    }
+     trackingReceiver_->SetPredictionHorizonMs(horizonMs);
++
++    // What a pose pays after the app fetches it: the uplink + downlink (one RTT: the sample came
++    // up, the frame goes down), the app's render, encode + send, and the client's receive -> eye
++    // pass age. The sample's own age at the fetch is added per call by the TrackingReceiver.
++    const float sampleToSubmit = sampleToSubmitMs_.load();
++    const float ageAtFetch = sampleAgeAtFetchMs_.load();
++    const float submitToSent = submitToSentMs_.load();
++    const float clientAge = clientDisplayedFrameAgeMs_.load();
++    const RttProbe::Summary rtt = rttProbe_.GetSummary();
++    const bool usb = clientUsesUsbAdb_.load();
++    // No echo reply (a firewall, an ICMP-silent client): fall back to the RTT measured by hand
++    // on the Steam Frame's own access point, 2026-10-18 - ping from the Mac while streaming,
++    // 70 echoes: min 3.4 / avg 5.3 / max 9.5 ms. Logged as "assumed".
++    constexpr float kAssumedRttMs = 5.3f;
++    const bool rttAssumed = !usb && !rtt.valid;
++    const float rttMs = usb ? 0.0f : (rtt.valid ? rtt.medianMs : kAssumedRttMs);
++    const bool complete = sampleToSubmit > 0.0f && submitToSent > 0.0f && clientAge > 0.0f;
++    const float renderMs = std::max(0.0f, sampleToSubmit - ageAtFetch);
++    const float postFetchMs = complete ? rttMs + renderMs + submitToSent + clientAge : 0.0f;
++    trackingReceiver_->SetMeasuredPostFetchLatencyMs(postFetchMs);
++    trackingReceiver_->SetMeasuredPredictionEnabled(posePredictionMeasured_ &&
++                                                    posePredictionOverrideMs_ <= 0.0f);
++
++    const int64_t nowNs = SteadyClockNowNs();
++    int64_t lastLogNs = lastMeasuredLatencyLogNs_.load();
++    if (nowNs - lastLogNs >= 5LL * 1000000000LL &&
++        lastMeasuredLatencyLogNs_.compare_exchange_strong(lastLogNs, nowNs))
++    {
++        spdlog::info("StreamingServer: sample->display latency (measured) {:.1f}ms = rtt {:.1f}{} "
++                     "(median of {}, min {:.1f} max {:.1f}, lost {}/{}, send failures {}) + sample "
++                     "age at fetch {:.1f} + render {:.1f} + encode+send {:.1f} (to send start {:.1f}) "
++                     "+ client displayed age {:.1f}; pose_prediction={} horizon applied {:.1f}ms "
++                     "(fixed estimate {:.1f}ms)",
++                     complete ? ageAtFetch + postFetchMs : 0.0f, rttMs, rttAssumed ? " assumed" : "",
++                     rtt.samples, rtt.minMs, rtt.maxMs, rtt.lost, rtt.sent, rtt.sendFailures,
++                     ageAtFetch, renderMs, submitToSent, submitToSendStartMs_.load(), clientAge,
++                     trackingReceiver_->IsMeasuredPredictionEnabled() ? "measured" : "fixed",
++                     trackingReceiver_->GetAppliedHorizonMs(), horizonMs);
++    }
+ }
+ 
+ void StreamingServer::CheckClientLiveness(int64_t nowNs)
+@@ -2801,6 +2857,26 @@ void StreamingServer::SendFrame(FrameSource frameSource,
+     frame.source = std::move(frameSource);
+     frame.frameIndex = frameIndex_++;
+     frame.timestampNs = SteadyClockNowNs();
++
++    // Sample -> submit for the frame rendered from the app's last pose fetch (WaitFrame).
++    if (renderHeadOrientation != nullptr && trackingReceiver_ != nullptr)
++    {
++        int64_t sampleReceiveNs = 0;
++        int64_t fetchNs = 0;
++        if (trackingReceiver_->GetLastPredictionTimes(sampleReceiveNs, fetchNs) &&
++            frame.timestampNs >= fetchNs)
++        {
++            const float toSubmit = static_cast<float>(frame.timestampNs - sampleReceiveNs) / 1.0e6f;
++            const float atFetch = static_cast<float>(fetchNs - sampleReceiveNs) / 1.0e6f;
++            if (toSubmit < 200.0f)
++            {
++                const float prevSubmit = sampleToSubmitMs_.load();
++                const float prevFetch = sampleAgeAtFetchMs_.load();
++                sampleToSubmitMs_.store(prevSubmit > 0.0f ? prevSubmit * 0.9f + toSubmit * 0.1f : toSubmit);
++                sampleAgeAtFetchMs_.store(prevSubmit > 0.0f ? prevFetch * 0.9f + atFetch * 0.1f : atFetch);
++            }
++        }
++    }
+     frame.alphaBlend = frameSource.alphaBlend;
+     frame.valid = true;
+     pendingFrameDepthMax_.store(std::max(pendingFrameDepthMax_.load(), 1u));
+@@ -2937,6 +3013,7 @@ void StreamingServer::VideoSendThread()
+ 
+ void StreamingServer::SendEncodedVideoFrame(const EncodedVideoFrame& frame)
+ {
++    const int64_t sendStartNs = SteadyClockNowNs();
+     if (frame.hasPose)
+     {
+         SendRenderPosePacket(frame);
+@@ -2959,6 +3036,21 @@ void StreamingServer::SendEncodedVideoFrame(const EncodedVideoFrame& frame)
+         SendNalUnit(packetDispatchState_, frame.frameIndex, nalData, nalSize,
+                     nal.isKeyframe, frame.alphaBlend, frame.timestampNs, frame.codec);
+     }
++
++    // SendFrame -> last packet handed to the socket: encode queue + encode + send (and pacing).
++    const int64_t sentNs = SteadyClockNowNs();
++    if (frame.timestampNs > 0 && sentNs > frame.timestampNs)
++    {
++        const float toSent = static_cast<float>(sentNs - frame.timestampNs) / 1.0e6f;
++        if (toSent < 200.0f)
++        {
++            const float toStart = static_cast<float>(sendStartNs - frame.timestampNs) / 1.0e6f;
++            const float prev = submitToSentMs_.load();
++            const float prevStart = submitToSendStartMs_.load();
++            submitToSentMs_.store(prev > 0.0f ? prev * 0.9f + toSent * 0.1f : toSent);
++            submitToSendStartMs_.store(prev > 0.0f ? prevStart * 0.9f + toStart * 0.1f : toStart);
++        }
++    }
+ }
+ 
+ void StreamingServer::SendRenderPosePacket(const EncodedVideoFrame& frame)
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index dabf32f..41924ae 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -18,6 +18,7 @@
+ #include <vector>
+ 
+ #include "RuntimeSockets.h"
++#include "RttProbe.h"
+ #include "GraphicsTypes.h"
+ #include "StreamingAbr.h"
+ #include "StreamingFrameQueue.h"
+@@ -242,6 +243,21 @@ class StreamingServer
+     std::atomic<float> clientDecodeLatencyMs_{0.0f};
+     std::atomic<float> clientCompositorLatencyMs_{0.0f};
+ 
++    // Sample->display latency, measured (pose_prediction). Each is an EMA in ms; 0 = unmeasured.
++    //   sampleToSubmitMs_: tracking sample received -> the frame rendered from it reaches SendFrame
++    //                      (the sample's age when the app fetched it + the app's render)
++    //   sampleAgeAtFetchMs_: the first part of that alone
++    //   submitToSentMs_:   SendFrame -> the frame's last packet handed to the socket (encode + send)
++    // plus the network RTT (rttProbe_) and the client's displayed frame age (receive -> eye pass).
++    std::atomic<float> sampleToSubmitMs_{0.0f};
++    std::atomic<float> sampleAgeAtFetchMs_{0.0f};
++    std::atomic<float> submitToSentMs_{0.0f};
++    std::atomic<float> submitToSendStartMs_{0.0f};  // the encode share of submitToSentMs_
++    std::atomic<int64_t> lastMeasuredLatencyLogNs_{0};
++    bool posePredictionMeasured_ = false;
++    float posePredictionOverrideMs_ = 0.0f;
++    RttProbe rttProbe_;
++
+     // Adaptive bitrate state
+     std::atomic<uint32_t> configMaxBitrateMbps_{50};
+     std::atomic<uint32_t> currentBitrateMbps_{50};
+diff --git a/runtime/src/TrackingReceiver.cpp b/runtime/src/TrackingReceiver.cpp
+index d464b53..83b552b 100644
+--- a/runtime/src/TrackingReceiver.cpp
++++ b/runtime/src/TrackingReceiver.cpp
+@@ -5,6 +5,7 @@
+ #include <spdlog/spdlog.h>
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <chrono>
+ #include <cstddef>
+ #include <cstring>
+@@ -272,12 +273,28 @@ bool TrackingReceiver::GetPredictedPose(oxr::protocol::TrackingPacket& outPacket
+     }
+ 
+     outPacket = history_.back().packet;
++    const int64_t fetchNs = SteadyClockNowNs();
++    lastPredictionSampleReceiveNs_.store(history_.back().receiveTimeNs);
++    lastPredictionFetchNs_.store(fetchNs);
+     if (history_.size() < 2)
+     {
+         return true;
+     }
+ 
+-    float horizonMs = std::clamp(predictionHorizonMs_.load(), 0.0f, 80.0f);
++    // Measured: the sample's age now plus what the pose still has to pay after this fetch (set by
++    // the server from its own and the client's measurements). Fixed: the pipeline estimate or the
++    // configured override, as before.
++    const float sampleAgeMs =
++        static_cast<float>(fetchNs - history_.back().receiveTimeNs) / 1.0e6f;
++    const float postFetchMs = postFetchLatencyMs_.load();
++    const bool measuredLatencyKnown = postFetchMs > 0.0f && sampleAgeMs >= 0.0f;
++    const float measuredLatencyMs = measuredLatencyKnown
++        ? std::clamp(sampleAgeMs + postFetchMs, 0.0f, MeasuredHorizonMaxMs)
++        : 0.0f;
++    float horizonMs = (measuredPrediction_.load() && measuredLatencyKnown)
++        ? measuredLatencyMs
++        : std::clamp(predictionHorizonMs_.load(), 0.0f, 80.0f);
++    appliedHorizonMs_.store(horizonMs);
+     if (horizonMs <= 0.01f)
+     {
+         return true;
+@@ -341,6 +358,46 @@ bool TrackingReceiver::GetPredictedPose(oxr::protocol::TrackingPacket& outPacket
+                      headReportedSpeed, headPositionHorizonSeconds * 1000.0f, couplingScale,
+                      std::min(headReportedSpeed, 3.0f) * headPositionHorizonSeconds * 1000.0f,
+                      reorderedDropCount_.load());
++
++        // The derived reprojection delta: each frame's predicted head pose against the client's
++        // own pose for the time that frame is shown (its sample + the measured latency), i.e.
++        // the correction the headset's compositor applies. "unpredicted" is the same against
++        // the raw sample - what the delta would be with no prediction at all.
++        const size_t scored = scoredRotErrDeg_.size();
++        if (scored > 0)
++        {
++            auto meanOf = [](const std::vector<float>& v) {
++                double sum = 0.0;
++                for (float x : v) sum += x;
++                return v.empty() ? 0.0 : sum / v.size();
++            };
++            auto p95Of = [](std::vector<float> v) {
++                if (v.empty()) return 0.0f;
++                size_t k = std::min(v.size() - 1, (v.size() * 95) / 100);
++                std::nth_element(v.begin(), v.begin() + k, v.end());
++                return v[k];
++            };
++            spdlog::info("TrackingReceiver: reprojection delta (derived, {} frames) mode={} "
++                         "rot mean={:.3f}deg p95={:.3f}deg pos mean={:.2f}mm | unpredicted rot "
++                         "mean={:.3f}deg p95={:.3f}deg pos mean={:.2f}mm | measured latency={:.1f}ms "
++                         "(sample age at fetch {:.1f} + post-fetch {:.1f})",
++                         scored, measuredPrediction_.load() ? "measured" : "fixed",
++                         meanOf(scoredRotErrDeg_), p95Of(scoredRotErrDeg_),
++                         scoredPosErrMmSum_ / scored, meanOf(scoredUnpredictedRotDeg_),
++                         p95Of(scoredUnpredictedRotDeg_), scoredUnpredictedPosMmSum_ / scored,
++                         measuredLatencyMs, sampleAgeMs, postFetchMs);
++        }
++        else
++        {
++            spdlog::info("TrackingReceiver: reprojection delta (derived): no frames scored "
++                         "(measured latency {:.1f}ms, known={}) mode={}",
++                         measuredLatencyMs, measuredLatencyKnown ? "yes" : "no",
++                         measuredPrediction_.load() ? "measured" : "fixed");
++        }
++        scoredRotErrDeg_.clear();
++        scoredUnpredictedRotDeg_.clear();
++        scoredPosErrMmSum_ = 0.0;
++        scoredUnpredictedPosMmSum_ = 0.0;
+     }
+ 
+     StoreVec3(outPacket.headPosition,
+@@ -364,6 +421,22 @@ bool TrackingReceiver::GetPredictedPose(oxr::protocol::TrackingPacket& outPacket
+                                      glm::radians(35.0f)));
+     }
+ 
++    if (measuredLatencyKnown && current.packet.timestampNs > 0)
++    {
++        PendingPrediction pending;
++        pending.targetTimestampNs =
++            current.packet.timestampNs + static_cast<int64_t>(measuredLatencyMs * 1.0e6f);
++        memcpy(pending.predicted, outPacket.headOrientation, sizeof(pending.predicted));
++        memcpy(pending.predictedPos, outPacket.headPosition, sizeof(pending.predictedPos));
++        memcpy(pending.sample, current.packet.headOrientation, sizeof(pending.sample));
++        memcpy(pending.samplePos, current.packet.headPosition, sizeof(pending.samplePos));
++        pendingPredictions_.push_back(pending);
++        while (pendingPredictions_.size() > MaxPendingPredictions)
++        {
++            pendingPredictions_.pop_front();
++        }
++    }
++
+     const bool previousLeftControllerActive =
+         (previous.packet.trackingFlags &
+          oxr::protocol::TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE) != 0;
+@@ -410,12 +483,63 @@ void TrackingReceiver::SetPredictionHorizonMs(float predictionHorizonMs)
+     predictionHorizonMs_.store(std::max(predictionHorizonMs, 0.0f));
+ }
+ 
++bool TrackingReceiver::GetLastPredictionTimes(int64_t& sampleReceiveNs, int64_t& fetchNs) const
++{
++    sampleReceiveNs = lastPredictionSampleReceiveNs_.load();
++    fetchNs = lastPredictionFetchNs_.load();
++    return sampleReceiveNs > 0 && fetchNs >= sampleReceiveNs;
++}
++
++void TrackingReceiver::ScorePendingPredictionsLocked(const HistorySample& previous,
++                                                      const HistorySample& current)
++{
++    const int64_t t0 = previous.packet.timestampNs;
++    const int64_t t1 = current.packet.timestampNs;
++    if (t0 <= 0 || t1 <= t0)
++    {
++        return;
++    }
++    // A target older than the history this pair spans was missed (a gap); drop it unscored.
++    while (!pendingPredictions_.empty() && pendingPredictions_.front().targetTimestampNs < t0)
++    {
++        pendingPredictions_.pop_front();
++    }
++    while (!pendingPredictions_.empty() && pendingPredictions_.front().targetTimestampNs <= t1)
++    {
++        const PendingPrediction& p = pendingPredictions_.front();
++        const float u = static_cast<float>(p.targetTimestampNs - t0) / static_cast<float>(t1 - t0);
++        const glm::quat q0 = LoadQuat(previous.packet.headOrientation);
++        glm::quat q1 = LoadQuat(current.packet.headOrientation);
++        if (glm::dot(q0, q1) < 0.0f) q1 = -q1;
++        const glm::quat truth = glm::normalize(glm::slerp(q0, q1, u));
++        const glm::vec3 truthPos = glm::mix(LoadVec3(previous.packet.headPosition),
++                                            LoadVec3(current.packet.headPosition), u);
++        auto angleDeg = [](const glm::quat& a, const glm::quat& b) {
++            const float d = std::min(1.0f, std::abs(glm::dot(a, b)));
++            return glm::degrees(2.0f * std::acos(d));
++        };
++        scoredRotErrDeg_.push_back(angleDeg(LoadQuat(p.predicted), truth));
++        scoredUnpredictedRotDeg_.push_back(angleDeg(LoadQuat(p.sample), truth));
++        scoredPosErrMmSum_ += glm::length(LoadVec3(p.predictedPos) - truthPos) * 1000.0;
++        scoredUnpredictedPosMmSum_ += glm::length(LoadVec3(p.samplePos) - truthPos) * 1000.0;
++        pendingPredictions_.pop_front();
++    }
++    if (scoredRotErrDeg_.size() > 4096)
++    {
++        scoredRotErrDeg_.clear();
++        scoredUnpredictedRotDeg_.clear();
++        scoredPosErrMmSum_ = 0.0;
++        scoredUnpredictedPosMmSum_ = 0.0;
++    }
++}
++
+ void TrackingReceiver::ResetHistory()
+ {
+     {
+         std::lock_guard<std::mutex> lock(poseMutex_);
+         history_.clear();
+         latestPacket_ = {};
++        pendingPredictions_.clear();
+     }
+     hasData_.store(false);
+     spdlog::info("TrackingReceiver: history reset for a new client");
+@@ -474,6 +598,10 @@ void TrackingReceiver::StorePacket(const oxr::protocol::TrackingPacket& packet,
+         {
+             history_.pop_front();
+         }
++        if (history_.size() >= 2 && !pendingPredictions_.empty())
++        {
++            ScorePendingPredictionsLocked(history_[history_.size() - 2], history_.back());
++        }
+     }
+ 
+     hasData_.store(true);
+diff --git a/runtime/src/TrackingReceiver.h b/runtime/src/TrackingReceiver.h
+index bbf35cf..af3d113 100644
+--- a/runtime/src/TrackingReceiver.h
++++ b/runtime/src/TrackingReceiver.h
+@@ -8,6 +8,7 @@
+ #include <deque>
+ #include <mutex>
+ #include <thread>
++#include <vector>
+ 
+ #include "RuntimeSockets.h"
+ 
+@@ -43,6 +44,22 @@ class TrackingReceiver
+     void SetPredictionHorizonMs(float predictionHorizonMs);
+     float GetPredictionHorizonMs() const { return predictionHorizonMs_.load(); }
+ 
++    // Measured prediction (pose_prediction = "measured"). The server measures what a pose pays
++    // AFTER it is fetched for a frame - the client->server uplink, the app's render, encode +
++    // send, the downlink, and the client's receive->eye-pass age - and hands that sum here. The
++    // horizon is then the age of the sample at the moment it is fetched plus that sum: the time
++    // from the client's sample to the client frame that shows the result. The client stamps each
++    // sample with its own predicted display time, and the frame is shown at a later predicted
++    // display time of the same loop, so no vsync term is added.
++    void SetMeasuredPostFetchLatencyMs(float postFetchMs) { postFetchLatencyMs_.store(postFetchMs); }
++    void SetMeasuredPredictionEnabled(bool enabled) { measuredPrediction_.store(enabled); }
++    bool IsMeasuredPredictionEnabled() const { return measuredPrediction_.load(); }
++    // The horizon the last GetPredictedPose applied (either mode).
++    float GetAppliedHorizonMs() const { return appliedHorizonMs_.load(); }
++    // Receive time (server steady ns) of the sample the last GetPredictedPose predicted from, and
++    // when that call ran. 0 until a prediction has been made.
++    bool GetLastPredictionTimes(int64_t& sampleReceiveNs, int64_t& fetchNs) const;
++
+     // Check if we're receiving tracking data
+     bool IsReceiving() const { return hasData_.load(); }
+     bool IsRunning() const { return running_.load(); }
+@@ -63,8 +80,20 @@ class TrackingReceiver
+         int64_t receiveTimeNs = 0;
+     };
+ 
++    // A head pose handed out for a frame, scored once the client's own samples reach the time
++    // it is shown: the rotation between the two is what the headset's compositor must reproject.
++    struct PendingPrediction
++    {
++        int64_t targetTimestampNs = 0;   // client clock: sample timestamp + measured latency
++        float predicted[4] = {0, 0, 0, 1};
++        float predictedPos[3] = {};
++        float sample[4] = {0, 0, 0, 1};
++        float samplePos[3] = {};
++    };
++
+     void ReceiveThread();
+     void StorePacket(const oxr::protocol::TrackingPacket& packet, int64_t receiveTimeNs);
++    void ScorePendingPredictionsLocked(const HistorySample& previous, const HistorySample& current);
+ 
+     oxrsys::runtime_socket::SocketHandle socket_ = oxrsys::runtime_socket::InvalidSocket;
+     std::thread receiveThread_;
+@@ -79,5 +108,21 @@ class TrackingReceiver
+     std::atomic<float> predictionHorizonMs_{0.0f};
+     mutable std::atomic<int64_t> lastPredictionDiagnosticNs_{0};
+ 
++    std::atomic<bool> measuredPrediction_{false};
++    std::atomic<float> postFetchLatencyMs_{0.0f};   // 0 = not measured yet
++    mutable std::atomic<float> appliedHorizonMs_{0.0f};
++    mutable std::atomic<int64_t> lastPredictionSampleReceiveNs_{0};
++    mutable std::atomic<int64_t> lastPredictionFetchNs_{0};
++
++    // Scoring (guarded by poseMutex_). Errors since the last diagnostic line.
++    mutable std::deque<PendingPrediction> pendingPredictions_;
++    mutable std::vector<float> scoredRotErrDeg_;
++    mutable std::vector<float> scoredUnpredictedRotDeg_;
++    mutable double scoredPosErrMmSum_ = 0.0;
++    mutable double scoredUnpredictedPosMmSum_ = 0.0;
++
++    static constexpr size_t MaxPendingPredictions = 64;
++    static constexpr float MeasuredHorizonMaxMs = 60.0f;
++
+     static constexpr size_t MaxHistorySamples = 8;
+ };
+diff --git a/tests/TestInputManager.cpp b/tests/TestInputManager.cpp
+index bc9e423..f080a69 100644
+--- a/tests/TestInputManager.cpp
++++ b/tests/TestInputManager.cpp
+@@ -522,3 +522,47 @@ TEST_CASE("TrackingReceiver — angular velocity uses the full prediction horizo
+     CHECK_THAT(predicted.headOrientation[1], WithinAbs(std::sin(0.010f), 0.001f));
+     CHECK_THAT(predicted.headOrientation[3], WithinAbs(std::cos(0.010f), 0.001f));
+ }
++
++TEST_CASE("TrackingReceiver — measured prediction uses sample age plus post-fetch latency", "[input]")
++{
++    TrackingReceiver receiver;
++
++    oxr::protocol::TrackingPacket first = {};
++    first.timestampNs = 3'000'000'000;
++    first.headOrientation[3] = 1.0f;
++
++    oxr::protocol::TrackingPacket second = {};
++    second.timestampNs = 3'011'111'111;
++    second.headOrientation[3] = 1.0f;
++    second.headAngularVelocity[1] = 1.0f;
++
++    receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&first), sizeof(first));
++    receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&second), sizeof(second));
++    receiver.SetPredictionHorizonMs(10.0f);
++    receiver.SetMeasuredPostFetchLatencyMs(30.0f);
++
++    oxr::protocol::TrackingPacket predicted = {};
++
++    // Fixed (the default): the configured horizon, whatever was measured.
++    REQUIRE(receiver.GetPredictedPose(predicted));
++    CHECK_THAT(receiver.GetAppliedHorizonMs(), WithinAbs(10.0f, 0.001f));
++    CHECK_THAT(predicted.headOrientation[1], WithinAbs(std::sin(0.005f), 0.0005f));
++
++    // Measured: 30 ms after the fetch plus the sample's (sub-millisecond) age; 1 rad/s turns
++    // the head 0.030 rad in that time, a half-angle of 0.015.
++    receiver.SetMeasuredPredictionEnabled(true);
++    REQUIRE(receiver.GetPredictedPose(predicted));
++    CHECK(receiver.GetAppliedHorizonMs() >= 30.0f);
++    CHECK(receiver.GetAppliedHorizonMs() < 32.0f);
++    CHECK_THAT(predicted.headOrientation[1], WithinAbs(std::sin(0.015f), 0.001f));
++
++    // Nothing measured yet: measured mode falls back to the fixed horizon.
++    receiver.SetMeasuredPostFetchLatencyMs(0.0f);
++    REQUIRE(receiver.GetPredictedPose(predicted));
++    CHECK_THAT(receiver.GetAppliedHorizonMs(), WithinAbs(10.0f, 0.001f));
++
++    int64_t sampleReceiveNs = 0;
++    int64_t fetchNs = 0;
++    CHECK(receiver.GetLastPredictionTimes(sampleReceiveNs, fetchNs));
++    CHECK(fetchNs >= sampleReceiveNs);
++}
+-- 
+2.43.0
+

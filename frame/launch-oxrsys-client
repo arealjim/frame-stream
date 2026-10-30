@@ -1,0 +1,18 @@
+#!/bin/bash
+# OXRSys Steam Frame client (demonixis/oxrsys PR #30 + patches/client), built on the headset by frame/install.sh
+# into <source>/build-frame. The source is OXRSYS_CLIENT_SRC when set, else the directory install.sh recorded in
+# ~/games/oxrsys/client-src, else ~/src/oxrsys (install.sh and uninstall.sh resolve it the same way). Runs on the host (SteamOS ships FFmpeg 61), with the Steam Linux Runtime 4 ARM64
+# libopenxr_loader.so.1 copied into ./lib; the loader finds SteamVR through ~/.config/openxr/1/active_runtime.json.
+# Usage: launch-oxrsys-client <server-ip>
+export LD_LIBRARY_PATH=$HOME/games/oxrsys/lib:/opt/steamvr/bin/linuxarm64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export FRAME_CLIENT_STREAM=1
+# The measured defaults (orientation not predicted, FRAME_CLIENT_PREDICT_MS turns it back on; position extrapolated 40 ms by a 100 ms
+# low-passed velocity, displayed eye position on the stamp, deadband off, sRGB linearisation on) live IN THE BINARY
+# since 2026-10-21 (review H2: the upstream PR carries only the binary, and it shipped the rejected settings). Any
+# FRAME_CLIENT_* in the environment still overrides; oxrsys-client lists the knobs.
+export FRAME_CLIENT_SERVER=${1:?server ip}
+SRC=${OXRSYS_CLIENT_SRC:-}
+if [ -z "$SRC" ] && [ -r "$HOME/games/oxrsys/client-src" ]; then SRC=$(cat "$HOME/games/oxrsys/client-src"); fi
+SRC=${SRC:-$HOME/src/oxrsys}
+[ -x "$SRC/build-frame/steam_frame_client" ] || { echo "launch-oxrsys-client: no client at $SRC/build-frame/steam_frame_client; run frame/install.sh" >&2; exit 1; }
+exec "$SRC/build-frame/steam_frame_client" --stream

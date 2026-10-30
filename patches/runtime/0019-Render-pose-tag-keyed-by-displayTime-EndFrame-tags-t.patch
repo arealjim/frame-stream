@@ -1,0 +1,108 @@
+From 392dff229b1bc816ee2e652c896c95dd6aa74162 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 23:36:54 +0000
+Subject: [PATCH 19/23] Render-pose tag keyed by displayTime: EndFrame tags the
+ streamed frame with the pose located for ITS displayTime, not the most recent
+ xrLocateViews (Godot locates N+1 before ending N, so the tag could be one
+ frame newer than the pixels); a 5 s stat line counts exact vs fallback and
+ how often the last locate was newer
+
+---
+ runtime/src/Session.cpp | 39 +++++++++++++++++++++++++++++++++++----
+ runtime/src/Session.h   | 14 ++++++++++++++
+ 2 files changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index e23b59c..c3e4bb0 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -809,12 +809,38 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
+         auto sendStart = Clock::now();
+         if (lastRenderHasPose_)
+         {
++            // The pose located for THIS frame's displayTime, not the most recent locate (see Session.h).
++            XrPosef tagPose = lastRenderHeadPose_;
++            {
++                std::lock_guard<std::mutex> lock(locatedPoseMutex_);
++                bool found = false;
++                XrTime newestLocated = 0;
++                for (const auto& lp : locatedPoses_)
++                {
++                    if (lp.displayTime == frameEndInfo->displayTime) { tagPose = lp.pose; found = true; }
++                    if (lp.displayTime > newestLocated) newestLocated = lp.displayTime;
++                }
++                if (found) tagExact_++; else tagFallback_++;
++                if (newestLocated > frameEndInfo->displayTime)
++                {
++                    tagLastWasNewer_++;
++                    tagLastNewerMsSum_ += static_cast<double>(newestLocated - frameEndInfo->displayTime) / 1.0e6;
++                }
++                const auto now = std::chrono::steady_clock::now();
++                if (now - tagStatsLogged_ >= std::chrono::seconds(5))
++                {
++                    spdlog::info("OXRSys: render-pose tag: {} frames tagged by their own displayTime, {} fell back to the last locate; the last locate was NEWER than the submitted frame on {} (mean {:.1f} ms)",
++                                 tagExact_, tagFallback_, tagLastWasNewer_,
++                                 tagLastWasNewer_ ? tagLastNewerMsSum_ / tagLastWasNewer_ : 0.0);
++                    tagExact_ = tagFallback_ = tagLastWasNewer_ = 0; tagLastNewerMsSum_ = 0.0; tagStatsLogged_ = now;
++                }
++            }
+             const float renderHeadOrientation[4] = {
+-                lastRenderHeadPose_.orientation.x, lastRenderHeadPose_.orientation.y,
+-                lastRenderHeadPose_.orientation.z, lastRenderHeadPose_.orientation.w};
++                tagPose.orientation.x, tagPose.orientation.y,
++                tagPose.orientation.z, tagPose.orientation.w};
+             const float renderHeadPosition[3] = {
+-                lastRenderHeadPose_.position.x, lastRenderHeadPose_.position.y,
+-                lastRenderHeadPose_.position.z};
++                tagPose.position.x, tagPose.position.y,
++                tagPose.position.z};
+             streamingServer_->SendFrame(std::move(frameSource), renderHeadOrientation,
+                                         renderHeadPosition);
+         }
+@@ -1041,6 +1067,11 @@ XrResult Session::LocateViews(const XrViewLocateInfo* viewLocateInfo, XrViewStat
+     // tagged with it at submission instead of a later re-prediction.
+     lastRenderHeadPose_ = inputManager_->GetHeadPose();
+     lastRenderHasPose_ = true;
++    {
++        std::lock_guard<std::mutex> lock(locatedPoseMutex_);
++        locatedPoses_[locatedPoseNext_] = {viewLocateInfo->displayTime, lastRenderHeadPose_};
++        locatedPoseNext_ = (locatedPoseNext_ + 1) % locatedPoses_.size();
++    }
+ 
+     return XR_SUCCESS;
+ }
+diff --git a/runtime/src/Session.h b/runtime/src/Session.h
+index 5874569..d294f7b 100644
+--- a/runtime/src/Session.h
++++ b/runtime/src/Session.h
+@@ -10,6 +10,7 @@
+ #include <atomic>
+ #include <cstdint>
+ #include <ctime>
++#include <array>
+ #include <mutex>
+ #include <optional>
+ #include <string>
+@@ -141,6 +142,19 @@ class Session
+     // the current frame for. Captured here so the streamed frame is tagged with it at submission.
+     XrPosef lastRenderHeadPose_ = {{0, 0, 0, 1}, {0, 0, 0}};
+     bool lastRenderHasPose_ = false;
++    // Keyed by displayTime (2026-10-18): Godot locates views for frame N+1 before it ends frame N, so
++    // "the most recent xrLocateViews" at EndFrame can be one frame NEWER than the pixels being submitted,
++    // and the client then under-warps by one frame on every head turn (measured on the Steam Frame: a
++    // consistent 13.5 ms rotational lag of the layer behind the overlays, r -0.80). Each located pose is
++    // kept with its displayTime and EndFrame picks the one for ITS displayTime; the stats say how often
++    // the old rule would have been wrong and by how much.
++    struct LocatedPose { XrTime displayTime = 0; XrPosef pose = {{0, 0, 0, 1}, {0, 0, 0}}; };
++    std::array<LocatedPose, 16> locatedPoses_ = {};
++    size_t locatedPoseNext_ = 0;
++    std::mutex locatedPoseMutex_;
++    uint32_t tagExact_ = 0, tagFallback_ = 0, tagLastWasNewer_ = 0;
++    double tagLastNewerMsSum_ = 0.0;
++    std::chrono::steady_clock::time_point tagStatsLogged_ = std::chrono::steady_clock::now();
+     std::vector<std::unique_ptr<Swapchain>> swapchains_;
+     mutable std::mutex swapchainsMutex_;
+     std::mutex shutdownMutex_;
+-- 
+2.43.0
+

@@ -1,0 +1,1228 @@
+From 405d46170a6d9077d4f0e9be4f978cc49cbb2bd3 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 22:59:00 +0000
+Subject: [PATCH 56/56] runtime: composite equirect2 and cube layers into the
+ eye before encode
+
+XR_KHR_composition_layer_equirect2 and XR_KHR_composition_layer_cube were
+not advertised, so apps drew those layers themselves or dropped them (360
+video players, skyboxes, loading screens). Both are now advertised,
+validated in EndFrame and composited into each eye's image before encode,
+in submission order with the quad and cylinder layers, over or under the
+projection layer as those are.
+
+Quad and cylinder are rasterized surfaces; these two are ray cast: one
+triangle covers the eye, each pixel's ray is taken back into the layer's
+space through the inverse of its clip transform, and
+
+- equirect2: a finite radius takes the far hit of the sphere from the eye
+  (radius 0 or infinity: the direction itself); longitude 0 is -Z growing
+  toward +X, s = longitude / central + 0.5; t = (upper - latitude) /
+  (upper - lower), so the image's top row is the upper angle, as the spec
+  says for asymmetric ranges too. Outside the angles nothing is drawn. The
+  footprint filter of the quad applies, with the seam of a full sphere
+  taking one tap;
+- cube: the direction in the layer's orientation samples the cube texture
+  (position ignored: the layer is infinitely far).
+
+A cube layer on a non-cube swapchain, or the reverse, is skipped with one
+warning. Equirect-only or cube-only frames (no projection layer) are not
+streamed yet: the encoder still needs a projection layer.
+
+Tests: the ray, the sphere hit and the image coordinates on the CPU; on
+the GPU an infinite and a finite equirect, an angle window, and every
+face of a cube turned by its orientation. GPU time per Frame-sized eye
+(2048 px, [.overlay-bench]): a full-sphere 4096 x 2048 equirect 0.219 ms
+p50, a 1024 cube 0.110 ms p50, over or under.
+---
+ runtime/src/CompositionOverlay.h |  78 ++++++++-
+ runtime/src/EntryPoint.cpp       |   2 +
+ runtime/src/GraphicsTypes.h      |  12 +-
+ runtime/src/OverlayCompositor.h  |   7 +-
+ runtime/src/OverlayCompositor.mm | 212 ++++++++++++++++++++-----
+ runtime/src/Session.cpp          | 170 ++++++++++++++++++--
+ runtime/src/Session.h            |   2 +
+ tests/TestCompositionOverlay.cpp |  67 ++++++++
+ tests/TestOverlayCompositor.mm   | 265 +++++++++++++++++++++++++++++++
+ 9 files changed, 750 insertions(+), 65 deletions(-)
+
+diff --git a/runtime/src/CompositionOverlay.h b/runtime/src/CompositionOverlay.h
+index 75606b8..9f30beb 100644
+--- a/runtime/src/CompositionOverlay.h
++++ b/runtime/src/CompositionOverlay.h
+@@ -2,7 +2,7 @@
+ 
+ #pragma once
+ 
+-// Geometry for quad and cylinder composition layers. The runtime streams one
++// Geometry for quad, cylinder, equirect and cube composition layers. The runtime streams one
+ // projection image per eye, so every quad or cylinder the application submits
+ // is drawn into that image before encode, from the same eye pose and field of
+ // view the projection view was rendered with. That makes the overlay part of
+@@ -16,6 +16,7 @@
+ #include <glm/glm.hpp>
+ #include <glm/gtc/quaternion.hpp>
+ 
++#include <algorithm>
+ #include <cmath>
+ 
+ namespace oxrsys::runtime
+@@ -99,4 +100,79 @@ inline float CylinderHeight(float radius, float centralAngle, float aspectRatio)
+     return radius * centralAngle / aspectRatio;
+ }
+ 
++// Equirect (XR_KHR_composition_layer_equirect2) and cube layers are ray-cast: for each eye pixel the
++// shader unprojects through layerFromClip = inverse(OverlayClipFromLayer) to a ray in layer-local
++// space. These mirror the shader so the mapping is unit-testable.
++
++// The eye's position and the ray through normalized device coordinate (x, y), in layer-local space.
++// Clip (x, y, near, 1) is the view-space point at z = -1; clip (0, 0, near, 0) is the eye itself.
++inline void OverlayRayFromClip(const glm::mat4& layerFromClip, float ndcX, float ndcY,
++                               glm::vec3& origin, glm::vec3& direction, float nearZ = kOverlayNearClip)
++{
++    const glm::vec4 eye = layerFromClip * glm::vec4(0.0f, 0.0f, nearZ, 0.0f);
++    const glm::vec4 point = layerFromClip * glm::vec4(ndcX, ndcY, nearZ, 1.0f);
++    origin = glm::vec3(eye) / eye.w;
++    direction = glm::normalize(glm::vec3(point) / point.w - origin);
++}
++
++// radius 0 or +inf: the sphere is infinitely far, so only the ray's direction picks the texel.
++inline bool IsInfiniteEquirectRadius(float radius)
++{
++    return radius == 0.0f || std::isinf(radius);
++}
++
++// The direction from the sphere's centre to where the ray leaves a sphere of the given radius around
++// the layer pose (the far hit, so a viewer inside sees the inside; outside, the far wall). False if
++// the ray misses or the sphere is behind it.
++inline bool EquirectSphereDirection(const glm::vec3& origin, const glm::vec3& direction, float radius,
++                                    glm::vec3& fromCentre)
++{
++    if (IsInfiniteEquirectRadius(radius))
++    {
++        fromCentre = direction;
++        return true;
++    }
++    const float b = glm::dot(origin, direction);
++    const float h = b * b - (glm::dot(origin, origin) - radius * radius);
++    if (h < 0.0f)
++    {
++        return false;
++    }
++    const float t = -b + std::sqrt(h);
++    if (t <= 0.0f)
++    {
++        return false;
++    }
++    fromCentre = glm::normalize(origin + t * direction);
++    return true;
++}
++
++// Image coordinates (s left to right, t top to bottom, both 0..1 over the layer's subImage) of a
++// direction from the sphere's centre, per the equirect2 spec: longitude 0 at -Z, growing toward +X,
++// the image spanning centralHorizontalAngle symmetrically about it; latitude from upperVerticalAngle
++// (top row) down to lowerVerticalAngle (bottom row). False outside that range: nothing is drawn.
++inline bool EquirectImageCoords(const glm::vec3& fromCentre, float centralHorizontalAngle,
++                                float upperVerticalAngle, float lowerVerticalAngle, float& s, float& t)
++{
++    const float longitude = std::atan2(fromCentre.x, -fromCentre.z);
++    const float latitude = std::asin(std::clamp(fromCentre.y, -1.0f, 1.0f));
++    if (std::fabs(longitude) > 0.5f * centralHorizontalAngle || latitude > upperVerticalAngle ||
++        latitude < lowerVerticalAngle)
++    {
++        return false;
++    }
++    s = longitude / centralHorizontalAngle + 0.5f;
++    t = (upperVerticalAngle - latitude) / (upperVerticalAngle - lowerVerticalAngle);
++    return true;
++}
++
++inline bool IsDrawableEquirect(float radius, float centralHorizontalAngle, float upperVerticalAngle,
++                               float lowerVerticalAngle)
++{
++    return !std::isnan(radius) && radius >= 0.0f &&
++           std::isfinite(centralHorizontalAngle) && centralHorizontalAngle > 0.0f &&
++           std::isfinite(upperVerticalAngle) && std::isfinite(lowerVerticalAngle) &&
++           upperVerticalAngle > lowerVerticalAngle;
++}
++
+ } // namespace oxrsys::runtime
+diff --git a/runtime/src/EntryPoint.cpp b/runtime/src/EntryPoint.cpp
+index f0aeb65..ebb99b9 100644
+--- a/runtime/src/EntryPoint.cpp
++++ b/runtime/src/EntryPoint.cpp
+@@ -250,6 +250,8 @@ static std::vector<ExtensionInfo> GetSupportedExtensionInfos()
+         {XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME, XR_KHR_convert_timespec_time_SPEC_VERSION},
+ #endif
+         {XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME, XR_KHR_composition_layer_cylinder_SPEC_VERSION},
++        {XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME, XR_KHR_composition_layer_equirect2_SPEC_VERSION},
++        {XR_KHR_COMPOSITION_LAYER_CUBE_EXTENSION_NAME, XR_KHR_composition_layer_cube_SPEC_VERSION},
+         {XR_EXT_HAND_TRACKING_EXTENSION_NAME, XR_EXT_hand_tracking_SPEC_VERSION},
+         {XR_EXT_CONFORMANCE_AUTOMATION_EXTENSION_NAME, XR_EXT_conformance_automation_SPEC_VERSION},
+         {XR_EXT_HAND_INTERACTION_EXTENSION_NAME, XR_EXT_hand_interaction_SPEC_VERSION},
+diff --git a/runtime/src/GraphicsTypes.h b/runtime/src/GraphicsTypes.h
+index 36eefc1..0d26ed9 100644
+--- a/runtime/src/GraphicsTypes.h
++++ b/runtime/src/GraphicsTypes.h
+@@ -154,23 +154,29 @@ struct FrameImageSource
+ };
+ 
+ // A quad or cylinder composition layer, drawn into each eye's projection image
+-// before encode (CompositionOverlay.h has the geometry, OverlayCompositor the draw).
++// before encode (CompositionOverlay.h has the geometry, OverlayCompositor the draw). Equirect and
++// cube layers have no surface to rasterize: they are ray-cast per eye pixel through layerFromClip.
+ struct FrameOverlayLayer
+ {
+     enum class Shape : uint32_t
+     {
+         Quad = 0,
+         Cylinder = 1,
++        Equirect = 2, // XR_KHR_composition_layer_equirect2
++        Cube = 3,     // XR_KHR_composition_layer_cube; image is a cube texture
+     };
+ 
+     Shape shape = Shape::Quad;
+     FrameImageSource image = {};      // the layer's swapchain snapshot + subImage rect
+     float clipFromLayer[2][16] = {};  // per eye, column-major, Metal clip space
++    float layerFromClip[2][16] = {};  // per eye, its inverse: equirect and cube cast a ray per pixel
+     uint32_t eyeMask = 0;             // bit 0 = left eye, bit 1 = right eye
+     float width = 0.0f;               // quad: metres
+     float height = 0.0f;              // quad and cylinder: metres
+-    float radius = 0.0f;              // cylinder
+-    float centralAngle = 0.0f;        // cylinder, radians
++    float radius = 0.0f;              // cylinder; equirect (0 = infinitely far)
++    float centralAngle = 0.0f;        // cylinder and equirect (horizontal), radians
++    float upperVerticalAngle = 0.0f;  // equirect, radians above the horizon
++    float lowerVerticalAngle = 0.0f;  // equirect, radians (negative below the horizon)
+     bool sourceAlpha = false;         // XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+     bool unpremultipliedAlpha = false; // XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT
+     bool underlay = false;            // submitted before the projection layer: drawn under the eye image,
+diff --git a/runtime/src/OverlayCompositor.h b/runtime/src/OverlayCompositor.h
+index 531ffdc..45c717f 100644
+--- a/runtime/src/OverlayCompositor.h
++++ b/runtime/src/OverlayCompositor.h
+@@ -12,7 +12,7 @@
+ namespace oxrsys::video
+ {
+ 
+-// Draws quad and cylinder composition layers into one eye's projection image
++// Draws quad, cylinder, equirect and cube composition layers into one eye's projection image
+ // on the encoder's command buffer, alpha-blended per the layer flags: underlays
+ // first, nearest the projection first, UNDER the image (they fill only what its
+ // alpha leaves uncovered), then the layers after the projection, back to front,
+@@ -45,13 +45,14 @@ class OverlayCompositor
+     }
+ 
+ private:
+-    void* PipelineFor(void* device, uint64_t pixelFormat, bool under);
++    // kind: 0 quad/cylinder surface, 1 equirect, 2 cube (each its own fragment function)
++    void* PipelineFor(void* device, uint64_t pixelFormat, bool under, uint32_t kind);
+ 
+     std::mutex mutex_;
+     void* device_ = nullptr;   // id<MTLDevice>, not retained (owned by the encoder)
+     void* library_ = nullptr;  // id<MTLLibrary>
+     void* sampler_ = nullptr;  // id<MTLSamplerState>
+-    std::map<uint64_t, void*> pipelines_; // MTLPixelFormat * 2 + under -> id<MTLRenderPipelineState>
++    std::map<uint64_t, void*> pipelines_; // (MTLPixelFormat * 3 + kind) * 2 + under -> id<MTLRenderPipelineState>
+     bool failed_ = false;
+ };
+ 
+diff --git a/runtime/src/OverlayCompositor.mm b/runtime/src/OverlayCompositor.mm
+index 671a519..a3f1a78 100644
+--- a/runtime/src/OverlayCompositor.mm
++++ b/runtime/src/OverlayCompositor.mm
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ #include "OverlayCompositor.h"
++#include "CompositionOverlay.h"
+ #include "VideoTextureFormat.h"
+ 
+ #import <Metal/Metal.h>
+@@ -21,16 +22,19 @@ namespace
+ struct OverlayUniforms
+ {
+     float clipFromLayer[16];
++    float layerFromClip[16]; // equirect and cube: its inverse, to cast a ray per pixel
+     float uvRect[4];      // u0, v0, du, dv in normalized texture coordinates
+-    float shapeParams[4]; // quad: width, height; cylinder: radius, centralAngle, height
+-    uint32_t shape;       // 0 quad, 1 cylinder
++    float shapeParams[4]; // quad: width, height; cylinder: radius, centralAngle, height;
++                          // equirect: radius (0 = infinite), central, upper, lower angles
++    uint32_t shape;       // 0 quad, 1 cylinder, 2 equirect, 3 cube
+     uint32_t columns;     // tessellation across s
+     uint32_t colorMode;   // 0 none, 1 decode sRGB -> linear, 2 encode linear -> sRGB
+     uint32_t alphaMode;   // 0 opaque, 1 premultiplied, 2 unpremultiplied
+     uint32_t minifyTaps;  // most bilinear taps per screen axis over a minified pixel's footprint; 1 = one tap
+-    uint32_t pad[3];      // the shader's struct rounds up to 16 bytes
++    float nearZ;          // the clip transform's near plane (CompositionOverlay.h kOverlayNearClip)
++    uint32_t pad[2];      // the shader's struct rounds up to 16 bytes
+ };
+-static_assert(sizeof(OverlayUniforms) == 128, "OverlayUniforms must match the shader's layout");
++static_assert(sizeof(OverlayUniforms) == 192, "OverlayUniforms must match the shader's layout");
+ 
+ const char* kOverlayShaderSource = R"METAL(
+ #include <metal_stdlib>
+@@ -39,6 +43,7 @@ using namespace metal;
+ struct OverlayUniforms
+ {
+     float4x4 clipFromLayer;
++    float4x4 layerFromClip;
+     float4 uvRect;
+     float4 shapeParams;
+     uint shape;
+@@ -46,6 +51,7 @@ struct OverlayUniforms
+     uint colorMode;
+     uint alphaMode;
+     uint minifyTaps;
++    float nearZ;
+ };
+ 
+ struct OverlayVertexOut
+@@ -57,6 +63,16 @@ struct OverlayVertexOut
+ vertex OverlayVertexOut overlay_vertex(uint vid [[vertex_id]],
+                                        constant OverlayUniforms& u [[buffer(0)]])
+ {
++    OverlayVertexOut out;
++    if (u.shape >= 2)
++    {
++        // Equirect and cube: one triangle over the whole eye; uv carries the pixel's NDC for the ray cast.
++        const float2 ndc = float2(vid == 1 ? 3.0 : -1.0, vid == 2 ? 3.0 : -1.0);
++        out.position = float4(ndc, 0.5, 1.0);
++        out.uv = ndc;
++        return out;
++    }
++
+     // Each column of the surface is two triangles.
+     const uint2 corners[6] = {uint2(0, 0), uint2(1, 0), uint2(0, 1),
+                               uint2(1, 0), uint2(1, 1), uint2(0, 1)};
+@@ -77,7 +93,6 @@ vertex OverlayVertexOut overlay_vertex(uint vid [[vertex_id]],
+                    -u.shapeParams.x * cos(theta));
+     }
+ 
+-    OverlayVertexOut out;
+     out.position = u.clipFromLayer * float4(p, 1.0);
+     out.uv = u.uvRect.xy + float2(s, t) * u.uvRect.zw;
+     return out;
+@@ -95,18 +110,14 @@ static float3 linear_to_srgb(float3 c)
+     return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308);
+ }
+ 
+-fragment float4 overlay_fragment(OverlayVertexOut in [[stage_in]],
+-                                 texture2d<float> image [[texture(0)]],
+-                                 sampler imageSampler [[sampler(0)]],
+-                                 constant OverlayUniforms& u [[buffer(0)]])
++// A panel drawn smaller than its image skips texels with one bilinear tap per pixel, so its text shimmers
++// as the head moves. Average a grid of taps over the pixel's footprint in the image instead (a box filter,
++// what a mip chain approximates, without building mips for every new swapchain snapshot). Magnified and
++// 1:1 pixels take one tap, as before. Taps stay inside the layer's sub-image so an atlas does not bleed.
++static float4 sample_footprint(texture2d<float> image, sampler imageSampler, float2 uv, float2 du, float2 dv,
++                               constant OverlayUniforms& u)
+ {
+-    // A panel drawn smaller than its image skips texels with one bilinear tap per pixel, so its text shimmers
+-    // as the head moves. Average a grid of taps over the pixel's footprint in the image instead (a box filter,
+-    // what a mip chain approximates, without building mips for every new swapchain snapshot). Magnified and
+-    // 1:1 pixels take one tap, as before. Taps stay inside the layer's sub-image so an atlas does not bleed.
+     const float2 texels = float2(image.get_width(), image.get_height());
+-    const float2 du = dfdx(in.uv);
+-    const float2 dv = dfdy(in.uv);
+     const float maxTaps = float(max(u.minifyTaps, 1u));
+     const uint nx = uint(clamp(ceil(length(du * texels) - 0.001), 1.0, maxTaps));
+     const uint ny = uint(clamp(ceil(length(dv * texels) - 0.001), 1.0, maxTaps));
+@@ -119,10 +130,16 @@ fragment float4 overlay_fragment(OverlayVertexOut in [[stage_in]],
+         {
+             const float2 offset = du * ((float(i) + 0.5) / float(nx) - 0.5) +
+                                   dv * ((float(j) + 0.5) / float(ny) - 0.5);
+-            c += image.sample(imageSampler, clamp(in.uv + offset, lo, hi));
++            c += image.sample(imageSampler, clamp(uv + offset, lo, hi));
+         }
+     }
+-    c /= float(nx * ny);
++    return c / float(nx * ny);
++}
++
++// Opaque or straight/premultiplied alpha and the colour conversion, as the layer flags and formats ask;
++// returns premultiplied colour for the blend.
++static float4 finish_layer_colour(float4 c, constant OverlayUniforms& u)
++{
+     if (u.alphaMode == 0)
+     {
+         c.a = 1.0;
+@@ -143,6 +160,77 @@ fragment float4 overlay_fragment(OverlayVertexOut in [[stage_in]],
+     }
+     return float4(rgb * c.a, c.a);
+ }
++
++fragment float4 overlay_fragment(OverlayVertexOut in [[stage_in]],
++                                 texture2d<float> image [[texture(0)]],
++                                 sampler imageSampler [[sampler(0)]],
++                                 constant OverlayUniforms& u [[buffer(0)]])
++{
++    return finish_layer_colour(sample_footprint(image, imageSampler, in.uv, dfdx(in.uv), dfdy(in.uv), u), u);
++}
++
++// The eye pixel's ray in layer-local space (CompositionOverlay.h OverlayRayFromClip).
++static float3 layer_ray(float2 ndc, constant OverlayUniforms& u, thread float3& origin)
++{
++    const float4 eye = u.layerFromClip * float4(0.0, 0.0, u.nearZ, 0.0);
++    const float4 onNear = u.layerFromClip * float4(ndc, u.nearZ, 1.0);
++    origin = eye.xyz / eye.w;
++    return normalize(onNear.xyz / onNear.w - origin);
++}
++
++// XR_KHR_composition_layer_equirect2 (CompositionOverlay.h EquirectSphereDirection, EquirectImageCoords).
++fragment float4 overlay_fragment_equirect(OverlayVertexOut in [[stage_in]],
++                                          texture2d<float> image [[texture(0)]],
++                                          sampler imageSampler [[sampler(0)]],
++                                          constant OverlayUniforms& u [[buffer(0)]])
++{
++    // No early discard: the footprint below takes derivatives, which need every pixel of the quad.
++    float3 origin;
++    float3 dir = layer_ray(in.uv, u, origin);
++    bool visible = true;
++    const float radius = u.shapeParams.x;
++    if (radius > 0.0)
++    {
++        const float b = dot(origin, dir);
++        const float h = b * b - (dot(origin, origin) - radius * radius);
++        const float t = -b + sqrt(max(h, 0.0));
++        visible = h >= 0.0 && t > 0.0;
++        dir = visible ? normalize(origin + t * dir) : dir;
++    }
++    const float longitude = atan2(dir.x, -dir.z);
++    const float latitude = asin(clamp(dir.y, -1.0, 1.0));
++    const float central = u.shapeParams.y;
++    const float upper = u.shapeParams.z;
++    const float lower = u.shapeParams.w;
++    visible = visible && abs(longitude) <= 0.5 * central && latitude <= upper && latitude >= lower;
++    const float2 st = float2(longitude / central + 0.5, (upper - latitude) / (upper - lower));
++    const float2 uv = u.uvRect.xy + st * u.uvRect.zw;
++    float2 du = dfdx(uv);
++    float2 dv = dfdy(uv);
++    if (any(abs(du) > 0.5 * u.uvRect.zw) || any(abs(dv) > 0.5 * u.uvRect.zw))
++    {
++        // the longitude seam of a full sphere: the neighbour wrapped, so this is no footprint
++        du = float2(0.0);
++        dv = float2(0.0);
++    }
++    if (!visible)
++    {
++        discard_fragment();
++    }
++    return finish_layer_colour(sample_footprint(image, imageSampler, uv, du, dv, u), u);
++}
++
++// XR_KHR_composition_layer_cube: the ray's direction in the layer's orientation picks the texel, the way a
++// Vulkan or GL samplerCube does (the cube layer has no position: it is infinitely far).
++fragment float4 overlay_fragment_cube(OverlayVertexOut in [[stage_in]],
++                                      texturecube<float> image [[texture(0)]],
++                                      sampler imageSampler [[sampler(0)]],
++                                      constant OverlayUniforms& u [[buffer(0)]])
++{
++    float3 origin;
++    const float3 dir = layer_ray(in.uv, u, origin);
++    return finish_layer_colour(image.sample(imageSampler, dir), u);
++}
+ )METAL";
+ 
+ // Formats whose samples come back as linear light: sRGB formats are decoded by
+@@ -182,6 +270,16 @@ uint32_t MinifyTaps()
+     return taps;
+ }
+ 
++uint32_t PipelineKind(FrameOverlayLayer::Shape shape)
++{
++    switch (shape)
++    {
++        case FrameOverlayLayer::Shape::Equirect: return 1;
++        case FrameOverlayLayer::Shape::Cube: return 2;
++        default: return 0;
++    }
++}
++
+ uint32_t CylinderColumns(float centralAngle)
+ {
+     // About 2.8 degrees per column: under a pixel of sagitta for any radius we draw.
+@@ -210,7 +308,7 @@ OverlayCompositor::~OverlayCompositor()
+     }
+ }
+ 
+-void* OverlayCompositor::PipelineFor(void* deviceHandle, uint64_t pixelFormat, bool under)
++void* OverlayCompositor::PipelineFor(void* deviceHandle, uint64_t pixelFormat, bool under, uint32_t kind)
+ {
+     id<MTLDevice> device = (id<MTLDevice>)deviceHandle;
+     if (device_ != nullptr && device_ != deviceHandle)
+@@ -239,7 +337,7 @@ void* OverlayCompositor::PipelineFor(void* deviceHandle, uint64_t pixelFormat, b
+         return nullptr;
+     }
+ 
+-    const uint64_t key = pixelFormat * 2 + (under ? 1 : 0);
++    const uint64_t key = (pixelFormat * 3 + kind) * 2 + (under ? 1 : 0);
+     auto existing = pipelines_.find(key);
+     if (existing != pipelines_.end())
+     {
+@@ -277,7 +375,10 @@ void* OverlayCompositor::PipelineFor(void* deviceHandle, uint64_t pixelFormat, b
+ 
+     id<MTLLibrary> library = (id<MTLLibrary>)library_;
+     id<MTLFunction> vertexFunction = [library newFunctionWithName:@"overlay_vertex"];
+-    id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"overlay_fragment"];
++    NSString* fragmentName = kind == 1 ? @"overlay_fragment_equirect"
++                           : kind == 2 ? @"overlay_fragment_cube"
++                                       : @"overlay_fragment";
++    id<MTLFunction> fragmentFunction = [library newFunctionWithName:fragmentName];
+     MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+     desc.vertexFunction = vertexFunction;
+     desc.fragmentFunction = fragmentFunction;
+@@ -315,7 +416,8 @@ void* OverlayCompositor::PipelineFor(void* deviceHandle, uint64_t pixelFormat, b
+         return nullptr;
+     }
+     pipelines_[key] = (void*)pipeline;
+-    spdlog::info("OverlayCompositor: {} pipeline ready for format {}", under ? "underlay" : "overlay", pixelFormat);
++    spdlog::info("OverlayCompositor: {} {} pipeline ready for format {}", under ? "underlay" : "overlay",
++                 kind == 1 ? "equirect" : kind == 2 ? "cube" : "surface", pixelFormat);
+     return (void*)pipeline;
+ }
+ 
+@@ -336,28 +438,26 @@ int OverlayCompositor::Draw(void* commandBufferHandle, void* targetHandle, uint3
+     std::lock_guard<std::mutex> lock(mutex_);
+     bool anyUnder = false;
+     bool anyOver = false;
++    // [under][kind]: every pipeline this eye needs, made before the pass opens
++    id<MTLRenderPipelineState> pipelines[2][3] = {};
+     for (const auto& overlay : overlays)
+     {
+-        if ((overlay.eyeMask & (1u << eyeIndex)) != 0)
++        if ((overlay.eyeMask & (1u << eyeIndex)) == 0)
+         {
+-            (overlay.underlay ? anyUnder : anyOver) = true;
++            continue;
++        }
++        (overlay.underlay ? anyUnder : anyOver) = true;
++        const uint32_t kind = PipelineKind(overlay.shape);
++        id<MTLRenderPipelineState>& pipeline = pipelines[overlay.underlay ? 1 : 0][kind];
++        if (pipeline == nil)
++        {
++            pipeline = (id<MTLRenderPipelineState>)PipelineFor((void*)commandBuffer.device,
++                                                               (uint64_t)target.pixelFormat, overlay.underlay, kind);
++            if (pipeline == nil)
++            {
++                return -1;
++            }
+         }
+-    }
+-    id<MTLRenderPipelineState> underPipeline = nil;
+-    id<MTLRenderPipelineState> overPipeline = nil;
+-    if (anyUnder)
+-    {
+-        underPipeline = (id<MTLRenderPipelineState>)PipelineFor((void*)commandBuffer.device,
+-                                                                (uint64_t)target.pixelFormat, true);
+-    }
+-    if (anyOver)
+-    {
+-        overPipeline = (id<MTLRenderPipelineState>)PipelineFor((void*)commandBuffer.device,
+-                                                               (uint64_t)target.pixelFormat, false);
+-    }
+-    if ((anyUnder && underPipeline == nil) || (anyOver && overPipeline == nil))
+-    {
+-        return -1;
+     }
+ 
+     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+@@ -374,12 +474,24 @@ int OverlayCompositor::Draw(void* commandBufferHandle, void* targetHandle, uint3
+ 
+     const bool targetIsLinear = IsSrgbTextureFormat(static_cast<uint64_t>(target.pixelFormat));
+     int drawn = 0;
++    id<MTLRenderPipelineState> bound = nil;
+     auto drawLayer = [&](const FrameOverlayLayer& overlay) {
+         id<MTLTexture> image = (id<MTLTexture>)overlay.image.GetImage();
+         if (image == nil || image.width == 0 || image.height == 0)
+         {
+             return;
+         }
++        const bool isCube = overlay.shape == FrameOverlayLayer::Shape::Cube;
++        if (isCube != (image.textureType == MTLTextureTypeCube))
++        {
++            return; // a cube layer on a non-cube swapchain, or the reverse: nothing to sample
++        }
++        id<MTLRenderPipelineState> pipeline = pipelines[overlay.underlay ? 1 : 0][PipelineKind(overlay.shape)];
++        if (pipeline != bound)
++        {
++            [encoder setRenderPipelineState:pipeline];
++            bound = pipeline;
++        }
+ 
+         OverlayUniforms u = {};
+         std::memcpy(u.clipFromLayer, overlay.clipFromLayer[eyeIndex], sizeof(u.clipFromLayer));
+@@ -397,6 +509,9 @@ int OverlayCompositor::Draw(void* commandBufferHandle, void* targetHandle, uint3
+             u.uvRect[2] = 1.0f;
+             u.uvRect[3] = 1.0f;
+         }
++        std::memcpy(u.layerFromClip, overlay.layerFromClip[eyeIndex], sizeof(u.layerFromClip));
++        u.nearZ = oxrsys::runtime::kOverlayNearClip;
++        uint32_t vertexCount = 0;
+         if (overlay.shape == FrameOverlayLayer::Shape::Quad)
+         {
+             u.shape = 0;
+@@ -404,6 +519,20 @@ int OverlayCompositor::Draw(void* commandBufferHandle, void* targetHandle, uint3
+             u.shapeParams[0] = overlay.width;
+             u.shapeParams[1] = overlay.height;
+         }
++        else if (overlay.shape == FrameOverlayLayer::Shape::Equirect)
++        {
++            u.shape = 2;
++            u.shapeParams[0] = overlay.radius;
++            u.shapeParams[1] = overlay.centralAngle;
++            u.shapeParams[2] = overlay.upperVerticalAngle;
++            u.shapeParams[3] = overlay.lowerVerticalAngle;
++            vertexCount = 3;
++        }
++        else if (isCube)
++        {
++            u.shape = 3;
++            vertexCount = 3;
++        }
+         else
+         {
+             u.shape = 1;
+@@ -420,13 +549,13 @@ int OverlayCompositor::Draw(void* commandBufferHandle, void* targetHandle, uint3
+         [encoder setVertexBytes:&u length:sizeof(u) atIndex:0];
+         [encoder setFragmentBytes:&u length:sizeof(u) atIndex:0];
+         [encoder setFragmentTexture:image atIndex:0];
+-        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:u.columns * 6];
++        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
++                    vertexCount:vertexCount != 0 ? vertexCount : u.columns * 6];
+         ++drawn;
+     };
+     if (anyUnder)
+     {
+         // Under the image, the one nearest the projection first, so each fills only what is still uncovered.
+-        [encoder setRenderPipelineState:underPipeline];
+         for (auto it = overlays.rbegin(); it != overlays.rend(); ++it)
+         {
+             if (it->underlay && (it->eyeMask & (1u << eyeIndex)) != 0)
+@@ -437,7 +566,6 @@ int OverlayCompositor::Draw(void* commandBufferHandle, void* targetHandle, uint3
+     }
+     if (anyOver)
+     {
+-        [encoder setRenderPipelineState:overPipeline];
+         for (const auto& overlay : overlays)
+         {
+             if (!overlay.underlay && (overlay.eyeMask & (1u << eyeIndex)) != 0)
+diff --git a/runtime/src/Session.cpp b/runtime/src/Session.cpp
+index 26219ae..66d2547 100644
+--- a/runtime/src/Session.cpp
++++ b/runtime/src/Session.cpp
+@@ -842,9 +842,28 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
+                 }
+                 break;
+             }
++            case XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR:
++            {
++                XrResult result = ValidateEquirect2Layer(
++                    *reinterpret_cast<const XrCompositionLayerEquirect2KHR*>(layer));
++                if (result != XR_SUCCESS)
++                {
++                    return result;
++                }
++                break;
++            }
++            case XR_TYPE_COMPOSITION_LAYER_CUBE_KHR:
++            {
++                XrResult result = ValidateCubeLayer(*reinterpret_cast<const XrCompositionLayerCubeKHR*>(layer));
++                if (result != XR_SUCCESS)
++                {
++                    return result;
++                }
++                break;
++            }
+             default:
+             {
+-                // Layer types we cannot draw (equirect, cube, vendor layers) are
++                // Layer types we cannot draw (equirect v1, vendor layers) are
+                 // skipped instead of failing the whole frame: an application that
+                 // submits one still shows its scene and its other layers.
+                 static std::mutex loggedTypesMutex;
+@@ -1447,6 +1466,61 @@ XrResult Session::ValidateCylinderLayer(const XrCompositionLayerCylinderKHR& lay
+     return ValidateSwapchainSubImage(layer.subImage);
+ }
+ 
++XrResult Session::ValidateEquirect2Layer(const XrCompositionLayerEquirect2KHR& layer) const
++{
++    auto* space = Runtime::Get().FromHandle<Space>(reinterpret_cast<uint64_t>(layer.space));
++    if (space == nullptr || space->GetSession() != this)
++    {
++        return XR_ERROR_HANDLE_INVALID;
++    }
++    if (!IsValidPose(layer.pose))
++    {
++        return XR_ERROR_POSE_INVALID;
++    }
++    const float halfPi = 0.5f * static_cast<float>(M_PI);
++    if (std::isnan(layer.radius) || layer.radius < 0.0f ||
++        !std::isfinite(layer.centralHorizontalAngle) || layer.centralHorizontalAngle < 0.0f ||
++        layer.centralHorizontalAngle > 2.0f * static_cast<float>(M_PI) ||
++        !std::isfinite(layer.upperVerticalAngle) || layer.upperVerticalAngle < -halfPi ||
++        layer.upperVerticalAngle > halfPi ||
++        !std::isfinite(layer.lowerVerticalAngle) || layer.lowerVerticalAngle < -halfPi ||
++        layer.lowerVerticalAngle > halfPi)
++    {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++
++    return ValidateSwapchainSubImage(layer.subImage);
++}
++
++XrResult Session::ValidateCubeLayer(const XrCompositionLayerCubeKHR& layer) const
++{
++    auto* space = Runtime::Get().FromHandle<Space>(reinterpret_cast<uint64_t>(layer.space));
++    if (space == nullptr || space->GetSession() != this)
++    {
++        return XR_ERROR_HANDLE_INVALID;
++    }
++    XrPosef pose = {};
++    pose.orientation = layer.orientation;
++    if (!IsValidPose(pose))
++    {
++        return XR_ERROR_POSE_INVALID;
++    }
++    auto* swapchain = Runtime::Get().FromHandle<Swapchain>(reinterpret_cast<uint64_t>(layer.swapchain));
++    if (swapchain == nullptr || !OwnsSwapchain(swapchain))
++    {
++        return XR_ERROR_HANDLE_INVALID;
++    }
++    if (!swapchain->HasReleasedImage())
++    {
++        return XR_ERROR_LAYER_INVALID;
++    }
++    if (layer.imageArrayIndex >= swapchain->GetArraySize())
++    {
++        return XR_ERROR_VALIDATION_FAILURE;
++    }
++    return XR_SUCCESS;
++}
++
+ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t projectionLayerIndex,
+                                   FrameSource& frameSource) const
+ {
+@@ -1470,7 +1544,7 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+     static std::atomic_bool loggedUnderlay{false};
+     static std::atomic_bool loggedFirstUnderlay{false};
+     static std::atomic_bool loggedInfiniteCylinder{false};
+-    static std::atomic_bool loggedFirstOverlay{false};
++    static std::atomic_bool loggedFirstOverlay[4] = {}; // per FrameOverlayLayer::Shape
+     static std::atomic_bool loggedViewSpaceOverlay{false};
+ 
+     for (uint32_t i = 0; i < frameEndInfo.layerCount; ++i)
+@@ -1478,16 +1552,19 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+         const XrCompositionLayerBaseHeader* layer = frameEndInfo.layers[i];
+         const bool isQuad = layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD;
+         const bool isCylinder = layer->type == XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR;
+-        if (!isQuad && !isCylinder)
++        const bool isEquirect = layer->type == XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR;
++        const bool isCube = layer->type == XR_TYPE_COMPOSITION_LAYER_CUBE_KHR;
++        if (!isQuad && !isCylinder && !isEquirect && !isCube)
+         {
+             continue;
+         }
++        const char* kindName = isQuad ? "quad" : isCylinder ? "cylinder" : isEquirect ? "equirect" : "cube";
+         const bool underlay = i < projectionLayerIndex;
+         if (underlay && !projectionShowsUnderlays)
+         {
+             if (!loggedUnderlay.exchange(true))
+             {
+-                spdlog::info("OXRSys: a quad/cylinder layer submitted before the projection layer is not drawn ({})",
++                spdlog::info("OXRSys: a composition layer submitted before the projection layer is not drawn ({})",
+                              underlaysEnabled ? "the projection layer is opaque, so it hides it"
+                                               : "OXRSYS_OVERLAY_UNDERLAYS=0");
+             }
+@@ -1500,7 +1577,42 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+         XrPosef layerPose = {};
+         XrEyeVisibility eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+         XrSwapchainSubImage subImage = {};
+-        if (isQuad)
++        bool wholeImage = false; // cube: the whole cube, no subImage rect
++        if (isEquirect)
++        {
++            const auto& equirect = *reinterpret_cast<const XrCompositionLayerEquirect2KHR*>(layer);
++            if (!oxrsys::runtime::IsDrawableEquirect(equirect.radius, equirect.centralHorizontalAngle,
++                                                      equirect.upperVerticalAngle, equirect.lowerVerticalAngle))
++            {
++                continue;
++            }
++            overlay.shape = FrameOverlayLayer::Shape::Equirect;
++            // +inf is infinite like 0; the shader takes 0 as infinitely far
++            overlay.radius = oxrsys::runtime::IsInfiniteEquirectRadius(equirect.radius) ? 0.0f : equirect.radius;
++            overlay.centralAngle = equirect.centralHorizontalAngle;
++            overlay.upperVerticalAngle = equirect.upperVerticalAngle;
++            overlay.lowerVerticalAngle = equirect.lowerVerticalAngle;
++            overlay.sourceAlpha = (equirect.layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
++            overlay.unpremultipliedAlpha = (equirect.layerFlags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) != 0;
++            layerSpaceHandle = equirect.space;
++            layerPose = equirect.pose;
++            eyeVisibility = equirect.eyeVisibility;
++            subImage = equirect.subImage;
++        }
++        else if (isCube)
++        {
++            const auto& cube = *reinterpret_cast<const XrCompositionLayerCubeKHR*>(layer);
++            overlay.shape = FrameOverlayLayer::Shape::Cube;
++            overlay.sourceAlpha = (cube.layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
++            overlay.unpremultipliedAlpha = (cube.layerFlags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) != 0;
++            layerSpaceHandle = cube.space;
++            layerPose.orientation = cube.orientation; // a cube has no position: it is infinitely far
++            eyeVisibility = cube.eyeVisibility;
++            subImage.swapchain = cube.swapchain;
++            subImage.imageArrayIndex = cube.imageArrayIndex;
++            wholeImage = true;
++        }
++        else if (isQuad)
+         {
+             const auto& quad = *reinterpret_cast<const XrCompositionLayerQuad*>(layer);
+             if (quad.size.width <= 0.0f || quad.size.height <= 0.0f)
+@@ -1561,15 +1673,28 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+         {
+             continue;
+         }
++        if ((swapchain->GetFaceCount() == 6) != isCube)
++        {
++            static std::atomic_bool loggedFaceMismatch{false};
++            if (!loggedFaceMismatch.exchange(true))
++            {
++                spdlog::warn("OXRSys: a {} layer on a swapchain with {} face(s) is not drawn", kindName,
++                             swapchain->GetFaceCount());
++            }
++            continue;
++        }
+         overlay.image = swapchain->GetLastReleasedFrameImageSource(subImage.imageArrayIndex);
+         if (!overlay.image.IsValid())
+         {
+             continue;
+         }
+-        overlay.image.sourceX = static_cast<uint32_t>(subImage.imageRect.offset.x);
+-        overlay.image.sourceY = static_cast<uint32_t>(subImage.imageRect.offset.y);
+-        overlay.image.sourceWidth = static_cast<uint32_t>(subImage.imageRect.extent.width);
+-        overlay.image.sourceHeight = static_cast<uint32_t>(subImage.imageRect.extent.height);
++        if (!wholeImage)
++        {
++            overlay.image.sourceX = static_cast<uint32_t>(subImage.imageRect.offset.x);
++            overlay.image.sourceY = static_cast<uint32_t>(subImage.imageRect.offset.y);
++            overlay.image.sourceWidth = static_cast<uint32_t>(subImage.imageRect.extent.width);
++            overlay.image.sourceHeight = static_cast<uint32_t>(subImage.imageRect.extent.height);
++        }
+ 
+         switch (eyeVisibility)
+         {
+@@ -1593,6 +1718,8 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+             }
+             const glm::mat4 clip = oxrsys::runtime::OverlayClipFromLayer(view.pose, fov, location.pose, layerPose);
+             std::memcpy(overlay.clipFromLayer[eye], &clip[0][0], sizeof(overlay.clipFromLayer[eye]));
++            const glm::mat4 layerFromClip = glm::inverse(clip);
++            std::memcpy(overlay.layerFromClip[eye], &layerFromClip[0][0], sizeof(overlay.layerFromClip[eye]));
+         }
+ 
+         if (layerSpace->GetType() == Space::Type::Reference &&
+@@ -1602,19 +1729,30 @@ void Session::AppendOverlayLayers(const XrFrameEndInfo& frameEndInfo, uint32_t p
+             // Baked into the eye image, a head-locked layer is re-aimed by the headset's rotation warp like the
+             // scene, so during a head turn it trails the head by the warp angle and settles when the head stops.
+             spdlog::info("OXRSys: a {} layer is in VIEW space (head-locked); it is composited with the scene, so it trails head turns by the stream latency",
+-                         isQuad ? "quad" : "cylinder");
++                         kindName);
+         }
+         if (underlay && !loggedFirstUnderlay.exchange(true))
+         {
+             spdlog::info("OXRSys: compositing a {} layer under the source-alpha projection layer (an underlay)",
+-                         isQuad ? "quad" : "cylinder");
++                         kindName);
+         }
+-        if (!underlay && !loggedFirstOverlay.exchange(true))
++        if (!underlay && !loggedFirstOverlay[static_cast<uint32_t>(overlay.shape)].exchange(true))
+         {
+-            spdlog::info("OXRSys: compositing {} layer into the eye images ({}x{} m, image {}x{}, alpha={})",
+-                         isQuad ? "quad" : "cylinder",
+-                         isQuad ? overlay.width : overlay.radius * overlay.centralAngle, overlay.height,
+-                         overlay.image.sourceWidth, overlay.image.sourceHeight, overlay.sourceAlpha);
++            if (isEquirect || isCube)
++            {
++                spdlog::info("OXRSys: compositing {} layer into the eye images (radius {} m, angles {}/{}/{} rad, "
++                             "image {}x{}, alpha={})",
++                             kindName, overlay.radius, overlay.centralAngle, overlay.upperVerticalAngle,
++                             overlay.lowerVerticalAngle, overlay.image.sourceWidth, overlay.image.sourceHeight,
++                             overlay.sourceAlpha);
++            }
++            else
++            {
++                spdlog::info("OXRSys: compositing {} layer into the eye images ({}x{} m, image {}x{}, alpha={})",
++                             kindName, isQuad ? overlay.width : overlay.radius * overlay.centralAngle,
++                             overlay.height, overlay.image.sourceWidth, overlay.image.sourceHeight,
++                             overlay.sourceAlpha);
++            }
+         }
+         frameSource.overlays.push_back(std::move(overlay));
+     }
+diff --git a/runtime/src/Session.h b/runtime/src/Session.h
+index 856235f..816c519 100644
+--- a/runtime/src/Session.h
++++ b/runtime/src/Session.h
+@@ -124,6 +124,8 @@ class Session
+                                 FrameDepthSource& depth) const;
+     XrResult ValidateQuadLayer(const XrCompositionLayerQuad& layer) const;
+     XrResult ValidateCylinderLayer(const XrCompositionLayerCylinderKHR& layer) const;
++    XrResult ValidateEquirect2Layer(const XrCompositionLayerEquirect2KHR& layer) const;
++    XrResult ValidateCubeLayer(const XrCompositionLayerCubeKHR& layer) const;
+     // Turns the quad and cylinder layers into overlays drawn into each eye before
+     // encode: those after the projection layer over it, those before it under it
+     // (only when the projection layer blends by source alpha; otherwise they are
+diff --git a/tests/TestCompositionOverlay.cpp b/tests/TestCompositionOverlay.cpp
+index 5997c12..b9b7500 100644
+--- a/tests/TestCompositionOverlay.cpp
++++ b/tests/TestCompositionOverlay.cpp
+@@ -129,3 +129,70 @@ TEST_CASE("A cylinder puts its image centre ahead and its right edge to the righ
+     REQUIRE_FALSE(IsDrawableCylinder(INFINITY, angle, 1.0f));
+     REQUIRE(IsDrawableCylinder(radius, angle, 1.0f));
+ }
++
++TEST_CASE("An eye pixel's ray leaves the eye through that pixel, in layer space", "[runtime][overlay]")
++{
++    // Eye at the origin looking down -Z with a 45 degree half-fov; the layer 1 m to the right.
++    const glm::mat4 clip = OverlayClipFromLayer(Pose(0, 0, 0), SymmetricFov(kPi / 4), Pose(0, 0, 0), Pose(1, 0, 0));
++    glm::vec3 origin;
++    glm::vec3 direction;
++    OverlayRayFromClip(glm::inverse(clip), 0.5f, 0.0f, origin, direction);
++    // The eye sits 1 m to the layer's left; NDC x 0.5 at tan 45 = 1 is the direction (0.5, 0, -1).
++    REQUIRE(origin.x == Approx(-1.0f).margin(1e-4));
++    REQUIRE(origin.y == Approx(0.0f).margin(1e-4));
++    REQUIRE(origin.z == Approx(0.0f).margin(1e-4));
++    REQUIRE(direction.x == Approx(0.4472f).margin(1e-3));
++    REQUIRE(direction.y == Approx(0.0f).margin(1e-4));
++    REQUIRE(direction.z == Approx(-0.8944f).margin(1e-3));
++}
++
++TEST_CASE("An equirect sphere is seen from inside, off its centre", "[runtime][overlay]")
++{
++    glm::vec3 fromCentre;
++    // Infinite: the direction itself.
++    REQUIRE(EquirectSphereDirection({-1, 0, 0}, {0, 0, -1}, 0.0f, fromCentre));
++    REQUIRE(fromCentre.z == Approx(-1.0f));
++    REQUIRE(EquirectSphereDirection({-1, 0, 0}, {0, 0, -1}, INFINITY, fromCentre));
++    REQUIRE(fromCentre.z == Approx(-1.0f));
++    // Radius 2, eye 1 m left of the centre looking ahead: the far hit is (-1, 0, -sqrt 3), 30 degrees left.
++    REQUIRE(EquirectSphereDirection({-1, 0, 0}, {0, 0, -1}, 2.0f, fromCentre));
++    REQUIRE(fromCentre.x == Approx(-0.5f).margin(1e-4));
++    REQUIRE(fromCentre.z == Approx(-0.8660f).margin(1e-4));
++    // Outside a 0.5 m sphere, looking away from it or past it: no hit.
++    REQUIRE_FALSE(EquirectSphereDirection({-1, 0, 0}, {-1, 0, 0}, 0.5f, fromCentre));
++    REQUIRE_FALSE(EquirectSphereDirection({-1, 0, 0}, {0, 0, -1}, 0.5f, fromCentre));
++}
++
++TEST_CASE("Equirect image coordinates: longitude 0 ahead, top row at the upper angle", "[runtime][overlay]")
++{
++    float s = 0.0f;
++    float t = 0.0f;
++    // Full sphere: 30 degrees right of ahead on the horizon is 30/360 right of the image centre.
++    const glm::vec3 right30(0.5f, 0.0f, -0.8660254f);
++    REQUIRE(EquirectImageCoords(right30, 2 * kPi, kPi / 2, -kPi / 2, s, t));
++    REQUIRE(s == Approx(0.5f + 30.0f / 360.0f));
++    REQUIRE(t == Approx(0.5f));
++    // Straight behind is the image's left/right edge; straight up its top row.
++    REQUIRE(EquirectImageCoords({0, 0, 1}, 2 * kPi, kPi / 2, -kPi / 2, s, t));
++    REQUIRE(std::fabs(s - 0.5f) == Approx(0.5f));
++    REQUIRE(EquirectImageCoords({0, 1, 0}, 2 * kPi, kPi / 2, -kPi / 2, s, t));
++    REQUIRE(t == Approx(0.0f).margin(1e-6));
++    // 90 x 90 degree window: 30 right is 30/90 right of centre; 20 up of a +45..-45 range is 25/90 down.
++    REQUIRE(EquirectImageCoords(right30, kPi / 2, kPi / 4, -kPi / 4, s, t));
++    REQUIRE(s == Approx(0.5f + 30.0f / 90.0f));
++    const glm::vec3 up20(0.0f, std::sin(20.0f * kPi / 180), -std::cos(20.0f * kPi / 180));
++    REQUIRE(EquirectImageCoords(up20, kPi / 2, kPi / 4, -kPi / 4, s, t));
++    REQUIRE(t == Approx(25.0f / 90.0f).margin(1e-4));
++    // An asymmetric range, the upper half only (90 down to 0): 20 up is 70/90 of the way down.
++    REQUIRE(EquirectImageCoords(up20, 2 * kPi, kPi / 2, 0.0f, s, t));
++    REQUIRE(t == Approx(70.0f / 90.0f).margin(1e-4));
++    const glm::vec3 down20(0.0f, -std::sin(20.0f * kPi / 180), -std::cos(20.0f * kPi / 180));
++    REQUIRE_FALSE(EquirectImageCoords(down20, 2 * kPi, kPi / 2, 0.0f, s, t));
++    // Outside the window: not drawn.
++    const glm::vec3 right60(0.8660254f, 0.0f, -0.5f);
++    REQUIRE_FALSE(EquirectImageCoords(right60, kPi / 2, kPi / 4, -kPi / 4, s, t));
++
++    REQUIRE(IsDrawableEquirect(0.0f, 2 * kPi, kPi / 2, -kPi / 2));
++    REQUIRE_FALSE(IsDrawableEquirect(1.0f, 0.0f, kPi / 2, -kPi / 2));
++    REQUIRE_FALSE(IsDrawableEquirect(1.0f, kPi, 0.1f, 0.1f));
++}
+diff --git a/tests/TestOverlayCompositor.mm b/tests/TestOverlayCompositor.mm
+index 28e6d9a..37103a7 100644
+--- a/tests/TestOverlayCompositor.mm
++++ b/tests/TestOverlayCompositor.mm
+@@ -401,6 +401,271 @@ TEST_CASE("A layer's sub-image does not bleed its neighbour in the atlas", "[ove
+     }
+ }
+ 
++namespace
++{
++
++void SetLayerFromClip(FrameOverlayLayer& o)
++{
++    glm::mat4 clip;
++    std::memcpy(&clip[0][0], o.clipFromLayer[0], sizeof(o.clipFromLayer[0]));
++    const glm::mat4 inverse = glm::inverse(clip);
++    std::memcpy(o.layerFromClip[0], &inverse[0][0], sizeof(o.layerFromClip[0]));
++}
++
++// 64 x 32 full-sphere test image: left half (longitude < 0) red, right half green; the top half adds blue.
++id<MTLTexture> HemispheresImage(id<MTLDevice> device)
++{
++    std::vector<Bgra> pixels(64 * 32);
++    for (uint32_t y = 0; y < 32; ++y)
++    {
++        for (uint32_t x = 0; x < 64; ++x)
++        {
++            pixels[y * 64 + x] =
++                Bgra{uint8_t(y < 16 ? 255 : 0), uint8_t(x < 32 ? 0 : 255), uint8_t(x < 32 ? 255 : 0), 255};
++        }
++    }
++    return MakeTexture(device, MTLPixelFormatBGRA8Unorm, 64, 32, pixels);
++}
++
++FrameOverlayLayer Equirect(id<MTLTexture> image, const XrFovf& fov, const XrPosef& pose, float radius,
++                           float central, float upper, float lower)
++{
++    FrameOverlayLayer o = Overlay(image, fov, pose);
++    o.shape = FrameOverlayLayer::Shape::Equirect;
++    o.radius = radius;
++    o.centralAngle = central;
++    o.upperVerticalAngle = upper;
++    o.lowerVerticalAngle = lower;
++    SetLayerFromClip(o);
++    return o;
++}
++
++// One colour per face in Metal's (and Vulkan's) slice order +X -X +Y -Y +Z -Z, as BGRA.
++const Bgra kFaceColours[6] = {{0, 0, 255, 255},   {0, 255, 0, 255},     {255, 0, 0, 255},
++                              {0, 255, 255, 255}, {255, 255, 255, 255}, {255, 0, 255, 255}};
++
++id<MTLTexture> FacesCube(id<MTLDevice> device, uint32_t size = 4)
++{
++    MTLTextureDescriptor* d = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
++                                                                                    size:size
++                                                                               mipmapped:NO];
++    d.usage = MTLTextureUsageShaderRead;
++    d.storageMode = MTLStorageModeShared;
++    id<MTLTexture> cube = [device newTextureWithDescriptor:d];
++    for (uint32_t face = 0; face < 6; ++face)
++    {
++        std::vector<Bgra> pixels(size * size, kFaceColours[face]);
++        [cube replaceRegion:MTLRegionMake2D(0, 0, size, size)
++                mipmapLevel:0
++                      slice:face
++                  withBytes:pixels.data()
++                bytesPerRow:size * 4
++              bytesPerImage:size * size * 4];
++    }
++    return cube;
++}
++
++bool Is(const Bgra& p, const Bgra& want)
++{
++    return std::abs(int(p.r) - int(want.r)) < 8 && std::abs(int(p.g) - int(want.g)) < 8 &&
++           std::abs(int(p.b) - int(want.b)) < 8;
++}
++
++} // namespace
++
++TEST_CASE("An infinite equirect puts longitude 0 ahead and its top row up", "[overlay][metal]")
++{
++    @autoreleasepool
++    {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        OverlayCompositor compositor;
++        const XrFovf fov = {-kPi / 4, kPi / 4, kPi / 4, -kPi / 4};
++        id<MTLTexture> eye = MakeTexture(device, MTLPixelFormatBGRA8Unorm, kEye, kEye,
++                                         std::vector<Bgra>(kEye * kEye, Bgra{0, 0, 0, 255}));
++        id<MTLTexture> image = HemispheresImage(device);
++
++        // The layer 5 m away: an infinite sphere ignores where it is, only how it is turned.
++        Draw(queue, compositor, eye, {Equirect(image, fov, At(3, 1, -4), 0.0f, 2 * kPi, kPi / 2, -kPi / 2)}, 1);
++        CHECK(Is(ReadPixel(eye, 150, 50), {255, 255, 0, 255}));  // right and up: green + blue
++        CHECK(Is(ReadPixel(eye, 50, 50), {255, 0, 255, 255}));   // left and up: red + blue
++        CHECK(Is(ReadPixel(eye, 150, 150), {0, 255, 0, 255}));   // right and down: green
++        CHECK(Is(ReadPixel(eye, 50, 150), {0, 0, 255, 255}));    // left and down: red
++
++        [eye release];
++        [image release];
++        [queue release];
++    }
++}
++
++TEST_CASE("An equirect window covers only its angles", "[overlay][metal]")
++{
++    @autoreleasepool
++    {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        OverlayCompositor compositor;
++        // 60 degree half-fov, as the cylinder test: 45 degrees off-axis lands at NDC 0.577.
++        const XrFovf fov = {-kPi / 3, kPi / 3, kPi / 3, -kPi / 3};
++        id<MTLTexture> eye = MakeTexture(device, MTLPixelFormatBGRA8Unorm, kEye, kEye,
++                                         std::vector<Bgra>(kEye * kEye, Bgra{0, 0, 0, 255}));
++        id<MTLTexture> white = MakeTexture(device, MTLPixelFormatBGRA8Unorm, 1, 1, {Bgra{255, 255, 255, 255}});
++
++        // 90 degrees wide, 22.5 up and down: NDC tan(22.5)/tan(60) = 0.239, 24 px, on the centre column.
++        Draw(queue, compositor, eye, {Equirect(white, fov, Identity(), 0.0f, kPi / 2, kPi / 8, -kPi / 8)}, 1);
++        CHECK(ReadPixel(eye, 100, 100).r == 255);
++        CHECK(ReadPixel(eye, 100 + 54, 100).r == 255);
++        CHECK(ReadPixel(eye, 100 + 61, 100).r == 0);
++        CHECK(ReadPixel(eye, 100 - 54, 100).r == 255);
++        CHECK(ReadPixel(eye, 100 - 61, 100).r == 0);
++        CHECK(ReadPixel(eye, 100, 100 - 21).r == 255);
++        CHECK(ReadPixel(eye, 100, 100 - 27).r == 0);
++        CHECK(ReadPixel(eye, 100, 100 + 21).r == 255);
++        CHECK(ReadPixel(eye, 100, 100 + 27).r == 0);
++
++        [eye release];
++        [white release];
++        [queue release];
++    }
++}
++
++TEST_CASE("A finite equirect sphere is seen from where the eye is", "[overlay][metal]")
++{
++    @autoreleasepool
++    {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        OverlayCompositor compositor;
++        const XrFovf fov = {-kPi / 4, kPi / 4, kPi / 4, -kPi / 4};
++        id<MTLTexture> eye = MakeTexture(device, MTLPixelFormatBGRA8Unorm, kEye, kEye,
++                                         std::vector<Bgra>(kEye * kEye, Bgra{0, 0, 0, 255}));
++        id<MTLTexture> image = HemispheresImage(device);
++
++        // Radius 2 centred 1 m to the right. Ahead hits the sphere 30 degrees left of its centre (red); NDC 0.4
++        // (21.8 degrees right of ahead) still hits 5.9 degrees left (red; green if it were infinite); NDC 0.6
++        // hits 5.6 degrees right (green). Row 120 is below the horizon, so no blue.
++        Draw(queue, compositor, eye, {Equirect(image, fov, At(1, 0, 0), 2.0f, 2 * kPi, kPi / 2, -kPi / 2)}, 1);
++        CHECK(Is(ReadPixel(eye, 100, 120), {0, 0, 255, 255}));
++        CHECK(Is(ReadPixel(eye, 140, 120), {0, 0, 255, 255}));
++        CHECK(Is(ReadPixel(eye, 160, 120), {0, 255, 0, 255}));
++
++        [eye release];
++        [image release];
++        [queue release];
++    }
++}
++
++TEST_CASE("A cube layer shows the face its direction picks, turned by its orientation", "[overlay][metal]")
++{
++    @autoreleasepool
++    {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        OverlayCompositor compositor;
++        // 60 degree half-fov: NDC 0.9 is 57 degrees off-axis, past the 45 degree face edge.
++        const XrFovf fov = {-kPi / 3, kPi / 3, kPi / 3, -kPi / 3};
++        id<MTLTexture> eye = MakeTexture(device, MTLPixelFormatBGRA8Unorm, kEye, kEye,
++                                         std::vector<Bgra>(kEye * kEye, Bgra{0, 0, 0, 255}));
++        id<MTLTexture> cube = FacesCube(device);
++
++        FrameOverlayLayer layer = Overlay(cube, fov, Identity());
++        layer.shape = FrameOverlayLayer::Shape::Cube;
++        SetLayerFromClip(layer);
++        Draw(queue, compositor, eye, {layer}, 1);
++        CHECK(Is(ReadPixel(eye, 100, 100), kFaceColours[5])); // ahead: -Z
++        CHECK(Is(ReadPixel(eye, 195, 100), kFaceColours[0])); // right: +X
++        CHECK(Is(ReadPixel(eye, 5, 100), kFaceColours[1]));   // left: -X
++        CHECK(Is(ReadPixel(eye, 100, 5), kFaceColours[2]));   // up: +Y
++        CHECK(Is(ReadPixel(eye, 100, 195), kFaceColours[3])); // down: -Y
++
++        // Turned 90 degrees to the left about +Y, the cube's +X face is ahead; its position is ignored.
++        XrPosef turned = At(5, 5, 5);
++        turned.orientation = {0.0f, std::sin(kPi / 4), 0.0f, std::cos(kPi / 4)};
++        layer = Overlay(cube, fov, turned);
++        layer.shape = FrameOverlayLayer::Shape::Cube;
++        SetLayerFromClip(layer);
++        Draw(queue, compositor, eye, {layer}, 1);
++        CHECK(Is(ReadPixel(eye, 100, 100), kFaceColours[0]));
++
++        // A cube layer on a 2D image draws nothing (the swapchain was not a cube).
++        id<MTLTexture> flat = MakeTexture(device, MTLPixelFormatBGRA8Unorm, 1, 1, {Bgra{1, 2, 3, 255}});
++        layer = Overlay(flat, fov, Identity());
++        layer.shape = FrameOverlayLayer::Shape::Cube;
++        SetLayerFromClip(layer);
++        Draw(queue, compositor, eye, {layer}, 0);
++
++        [flat release];
++        [eye release];
++        [cube release];
++        [queue release];
++    }
++}
++
++// GPU cost of an equirect and a cube layer on a Frame-sized eye (run with "[.overlay-bench]"):
++// a full-sphere 4096 x 2048 equirect and a 1024-texel cube, each covering the whole eye.
++TEST_CASE("Equirect and cube GPU time on a Frame-sized eye", "[.overlay-bench]")
++{
++    @autoreleasepool
++    {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        OverlayCompositor compositor;
++        constexpr uint32_t kFrameEye = 2048;
++        const XrFovf fov = {-kPi / 4, kPi / 4, kPi / 4, -kPi / 4};
++        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
++                                                                                     width:kFrameEye
++                                                                                    height:kFrameEye
++                                                                                 mipmapped:NO];
++        d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
++        d.storageMode = MTLStorageModePrivate;
++        id<MTLTexture> eye = [device newTextureWithDescriptor:d];
++        d.width = 4096;
++        d.height = 2048;
++        id<MTLTexture> panorama = [device newTextureWithDescriptor:d];
++        MTLTextureDescriptor* c = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
++                                                                                        size:1024
++                                                                                   mipmapped:NO];
++        c.usage = MTLTextureUsageShaderRead;
++        c.storageMode = MTLStorageModePrivate;
++        id<MTLTexture> cube = [device newTextureWithDescriptor:c];
++
++        for (bool under : {false, true})
++        for (int kind : {0, 1})
++        {
++            FrameOverlayLayer layer = kind == 0
++                ? Equirect(panorama, fov, Identity(), 0.0f, 2 * kPi, kPi / 2, -kPi / 2)
++                : Overlay(cube, fov, Identity());
++            if (kind == 1)
++            {
++                layer.shape = FrameOverlayLayer::Shape::Cube;
++                SetLayerFromClip(layer);
++            }
++            layer.sourceAlpha = true;
++            layer.underlay = under;
++            std::vector<double> ms;
++            for (int i = 0; i < 300; ++i)
++            {
++                id<MTLCommandBuffer> cb = [queue commandBuffer];
++                compositor.Draw((void*)cb, (void*)eye, 0, {layer});
++                [cb commit];
++                [cb waitUntilCompleted];
++                if (i >= 20)
++                {
++                    ms.push_back((cb.GPUEndTime - cb.GPUStartTime) * 1000.0);
++                }
++            }
++            std::sort(ms.begin(), ms.end());
++            printf("overlay bench: %s %s over the whole %u px eye, GPU p50 %.3f ms p95 %.3f ms\n",
++                   under ? "underlay" : "overlay ", kind == 0 ? "equirect 4096x2048" : "cube 1024         ",
++                   kFrameEye, ms[ms.size() / 2], ms[ms.size() * 95 / 100]);
++        }
++        [eye release];
++        [panorama release];
++        [cube release];
++        [queue release];
++    }
++}
++
+ // GPU cost of the overlay pass on a Frame-sized eye, not run by default:
+ //   oxrsys_videotoolbox_encoder_tests "[.overlay-bench]" -s
+ // with OXRSYS_OVERLAY_MINIFY_TAPS=1 for the one-tap baseline.
+-- 
+2.43.0
+

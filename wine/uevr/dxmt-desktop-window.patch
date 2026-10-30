@@ -1,0 +1,32 @@
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 5e9404d..124640c 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -1096,6 +1096,27 @@ CreateSwapChain(
+     return DXGI_ERROR_INVALID_CALL;
+   InitReturnPtr(ppSwapChain);
+ 
++  // Hookers (UEVR, ReShade, RTSS, Special K) make a throwaway swapchain on GetDesktopWindow() only to read
++  // IDXGISwapChain's vtable. Under Wine the desktop window belongs to explorer.exe, so the check below
++  // refuses it, and winemac has no view on it to hang a layer from. Give them a hidden top-level window of
++  // the calling thread instead: the swapchain class, and so the vtable, is the same.
++  if (hWnd == GetDesktopWindow()) {
++    static thread_local HWND dummy = nullptr;
++    if (!dummy || !IsWindow(dummy)) {
++      WNDCLASSEXW wc = {sizeof(wc)};
++      wc.lpfnWndProc = DefWindowProcW;
++      wc.hInstance = GetModuleHandleW(nullptr);
++      wc.lpszClassName = L"DXMT_DESKTOP_STANDIN";
++      RegisterClassExW(&wc); // fails harmlessly once the class exists
++      dummy = CreateWindowExW(0, wc.lpszClassName, L"DXMT desktop stand-in", WS_OVERLAPPEDWINDOW, 0, 0, 16, 16,
++                              nullptr, nullptr, wc.hInstance, nullptr);
++    }
++    if (dummy) {
++      WARN("CreateSwapChain: swapchain on the desktop window, using a hidden window of this thread");
++      hWnd = dummy;
++    }
++  }
++
+   DWORD window_process_id;
+   GetWindowThreadProcessId(hWnd, &window_process_id);
+   if (GetProcessId(GetCurrentProcess()) != window_process_id) {

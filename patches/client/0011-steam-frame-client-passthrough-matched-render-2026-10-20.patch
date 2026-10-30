@@ -1,0 +1,111 @@
+From ebeb8668d97f220b10ea397578d9ea227a63f5a3 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 09:53:08 +0000
+Subject: [PATCH] steam-frame client: passthrough-matched render
+ (FRAME_CLIENT_PASSTHROUGH / /dev/shm/frame-passthrough): render from the
+ camera positions through a plane-scaled fov, stamp the eye fov
+
+---
+ clients/steam-frame/src/main.cpp | 65 +++++++++++++++++++++++++++++++-
+ 1 file changed, 64 insertions(+), 1 deletion(-)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index ed17f3b..661c9d2 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -878,6 +878,7 @@ static void LogArrivals(const char* who)
+ }
+ static LatencyWindow g_lat;
+ static float g_sentIpd = 0.0f;   // the eye separation last sent upstream (the server renders with it)
++static bool g_ptOn = false; static float g_ptBase = 0.0639f, g_ptFovScale = 1.0f, g_ptShiftX = 0.0f, g_ptShiftY = 0.0f;   // passthrough-matched render (patch 0011)
+ static std::chrono::steady_clock::time_point g_presentedReceivedAt{};   // of the frame on screen
+ static bool g_presentedValid = false;
+ static inline double MsSince(const std::chrono::steady_clock::time_point& t0)
+@@ -1253,6 +1254,60 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+                      (hv.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) ? "valid" : "none");
+         }
+     }
++    // Passthrough-matched rendering (2026-10-20, patch 0011). Worn, with the stream's geometry proven against
++    // the WayVR keyboard: very close to the can, the VR can looked smaller than the real can, and far away,
++    // bigger; the real can's top and bottom poked out with head pitch. That is the passthrough, not us:
++    // its cameras sit FORWARD of the eyes (and slightly apart from them) and the compositor re-projects their image
++    // as if everything were on one plane at depth D, so a real object at depth d is shown magnified by
++    // d(D-f)/(D(d-f)). To overlay a virtual object on that picture, render it the same way: from the camera
++    // positions (head + forward/down offset, camera baseline as the eye separation), through a fov whose tangents
++    // are the eye's scaled by D/(D-f) and shifted by the camera-eye offset over D - and stamp the layer with the
++    // EYE fov, so the compositor shows the wider render compressed into the eye's view, which is exactly the
++    // plane re-projection. FRAME_CLIENT_PASSTHROUGH="forward down baseline depth" (metres) turns it on;
++    // /dev/shm/frame-passthrough with the same four numbers (or "off"), read once a second, retunes it live
++    // during a wear - D is where the real and virtual sizes agree, f is tuned on the residual up close.
++    {
++        static bool ptOn = false; static float ptF = 0.08f, ptDown = 0.0f, ptBase = 0.0639f, ptDepth = 1.5f;
++        static bool ptInit = false; static uint32_t ptPoll = 0;
++        auto parse = [&](const char* txt, const char* src) {
++            float a, b, c, d;
++            if (sscanf(txt, "%f %f %f %f", &a, &b, &c, &d) == 4 && d > 0.2f && d > a + 0.05f && c > 0.03f && c < 0.09f) {
++                if (!ptOn || a != ptF || b != ptDown || c != ptBase || d != ptDepth) {
++                    ptOn = true; ptF = a; ptDown = b; ptBase = c; ptDepth = d;
++                    LOG_INFO("passthrough-matched render ON (%s): cameras %.3f m forward, %.3f m down, baseline %.1f mm, plane depth %.2f m; fov tangents x%.3f",
++                             src, ptF, ptDown, ptBase * 1000.0f, ptDepth, ptDepth / (ptDepth - ptF));
++                }
++            } else if (strncmp(txt, "off", 3) == 0 || strncmp(txt, "0", 1) == 0) {
++                if (ptOn) { ptOn = false; LOG_INFO("passthrough-matched render OFF (%s): eye geometry again", src); }
++            } else {
++                LOG_WARN("passthrough-matched render: cannot parse '%s' from %s (want: forward down baseline depth, metres)", txt, src);
++            }
++        };
++        if (!ptInit) { ptInit = true; if (const char* e = getenv("FRAME_CLIENT_PASSTHROUGH")) parse(e, "FRAME_CLIENT_PASSTHROUGH"); }
++        if (ptPoll++ % 90 == 0) {
++            if (FILE* pf = fopen("/dev/shm/frame-passthrough", "r")) {
++                char line[128] = {0};
++                if (fgets(line, sizeof line, pf)) { static char last[128] = {0}; if (strcmp(line, last) != 0) { strncpy(last, line, sizeof last - 1); parse(line, "/dev/shm/frame-passthrough"); } }
++                fclose(pf);
++            }
++        }
++        g_ptOn = ptOn; g_ptBase = ptBase;
++        if (ptOn) {
++            // move the render head to the cameras: head + R * (0, -down, -forward)   (OpenXR: -Z forward, +Y up)
++            const float qx = head.orientation.x, qy = head.orientation.y, qz = head.orientation.z, qw = head.orientation.w;
++            const float vx = 0.0f, vy = -ptDown, vz = -ptF;
++            // q * v * q^-1
++            const float tx = 2.0f * (qy * vz - qz * vy), ty = 2.0f * (qz * vx - qx * vz), tz = 2.0f * (qx * vy - qy * vx);
++            head.position.x += vx + qw * tx + (qy * tz - qz * ty);
++            head.position.y += vy + qw * ty + (qz * tx - qx * tz);
++            head.position.z += vz + qw * tz + (qx * ty - qy * tx);
++            g_ptFovScale = ptDepth / (ptDepth - ptF);
++            // left eye: camera at -base/2, eye at -ipd/2  ->  camera is (ipd-base)/2 to the right of the eye
++            const float ipd = g_sentIpd > 0.0f ? g_sentIpd : 0.064f;
++            g_ptShiftX = ((ipd - ptBase) * 0.5f) / ptDepth;
++            g_ptShiftY = -ptDown / ptDepth;
++        }
++    }
+     pkt.headPosition[0] = head.position.x;
+     pkt.headPosition[1] = head.position.y;
+     pkt.headPosition[2] = head.position.z;
+@@ -1266,6 +1321,14 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+     pkt.eyeFov[1] = views[0].fov.angleRight;
+     pkt.eyeFov[2] = views[0].fov.angleUp;
+     pkt.eyeFov[3] = views[0].fov.angleDown;
++    if (g_ptOn) {
++        // rendered tangent = (eye tangent - shift) * D/(D-f); the stamp keeps the eye fov (see the submit)
++        const float k = g_ptFovScale;
++        pkt.eyeFov[0] = atanf((tanf(views[0].fov.angleLeft)  - g_ptShiftX) * k);
++        pkt.eyeFov[1] = atanf((tanf(views[0].fov.angleRight) - g_ptShiftX) * k);
++        pkt.eyeFov[2] = atanf((tanf(views[0].fov.angleUp)    - g_ptShiftY) * k);
++        pkt.eyeFov[3] = atanf((tanf(views[0].fov.angleDown)  - g_ptShiftY) * k);
++    }
+     // IPD (2026-10-19). The server derives the two eyes from the head pose with ITS OWN eye separation, and
+     // this field was never filled, so every wear so far rendered at the runtime's 63 mm default (Mac log
+     // "InputManager: Using default FOV/IPD ... IPD=63.0mm", never a "Quest IPD=" line). Worn, the streamed
+@@ -1278,7 +1341,7 @@ static void FillHeadTracking(App& app, XrTime t, const XrView* views,
+         const float dy = views[1].pose.position.y - views[0].pose.position.y;
+         const float dz = views[1].pose.position.z - views[0].pose.position.z;
+         const float sep = sqrtf(dx * dx + dy * dy + dz * dz);
+-        pkt.ipd = (sep > 0.045f && sep < 0.085f) ? sep : 0.0f;
++        pkt.ipd = g_ptOn ? g_ptBase : ((sep > 0.045f && sep < 0.085f) ? sep : 0.0f);
+         if (pkt.ipd > 0.0f) g_sentIpd = pkt.ipd;
+         static bool ipdLogged = false;
+         if (!ipdLogged && pkt.ipd > 0.0f) {
+-- 
+2.44.0
+

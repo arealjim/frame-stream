@@ -1,0 +1,503 @@
+From 8c9398179e4c9f14f6a72bcd129ffb205b9efa53 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 22:29:12 +0000
+Subject: [PATCH] steam-frame client: the Frame's controllers as themselves,
+ and the aim pose
+
+The client now enables XR_VALVE_frame_controller_interaction when SteamVR offers it and suggests
+/interaction_profiles/valve/frame_controller_valve bindings, so SteamVR stops emulating Oculus Touch
+for it. Through that emulation right B, X and Y arrived as one button, three of the left d-pad's four
+directions as another, and the bumper as the trigger. Bound natively, each input arrives on its own.
+
+Wire: TrackingPacket gains controllerProfile (1 = Frame) and touchState after gazeDirection, plus
+ButtonFlags bits from 0x0800 for each Frame input. The A/B/X/Y bits keep the meaning SteamVR's own
+Frame-to-Touch remap gives them, so a server that knows only Touch sees what it saw before.
+
+Also fills the aim pose, which no Frame client sent: every app's pointer ray was the grip pose, about
+40 degrees off where the controller points.
+
+---
+ clients/steam-frame/src/main.cpp              |  16 +-
+ clients/steam-frame/src/xr_input.cpp          | 178 +++++++++++++++++-
+ clients/steam-frame/src/xr_input.h            |  36 +++-
+ .../include/oxrsys/protocol/Protocol.h        |  28 +++
+ tests/TestProtocolLayout.cpp                  |   9 +-
+ 5 files changed, 252 insertions(+), 15 deletions(-)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 0e07edd..6da85d1 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -89,6 +89,7 @@ struct App {
+     std::vector<XrViewConfigurationView> configViews;
+     bool hasHandTracking = false;
+     bool hasEyeGaze = false;
++    bool hasFrameController = false;   // XR_VALVE_frame_controller_interaction: the controllers as themselves, not as Touch
+     bool hasRefreshRate = false;
+     float panelHz = 0.0f;          // what the panel actually runs (xrGetDisplayRefreshRateFB), 0 = unknown
+     PFN_xrGetDisplayRefreshRateFB pfnGetRefresh = nullptr;   // per instance, not a static (review L9)
+@@ -231,6 +232,11 @@ static bool CreateInstance(App& app)
+         enabled.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+         app.hasEyeGaze = true;
+     }
++    // Spelled out: the extension is newer than the OpenXR headers SteamOS ships.
++    if (has("XR_VALVE_frame_controller_interaction")) {
++        enabled.push_back("XR_VALVE_frame_controller_interaction");
++        app.hasFrameController = true;
++    }
+     if (has(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) {
+         enabled.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+         app.hasRefreshRate = true;
+@@ -256,9 +262,10 @@ static bool CreateInstance(App& app)
+         }
+         XR_CHECK(r);
+     }
+-    LOG_INFO("hand tracking: %s, eye gaze: %s",
++    LOG_INFO("hand tracking: %s, eye gaze: %s, frame controller profile: %s",
+              app.hasHandTracking ? "enabled" : "unavailable",
+-             app.hasEyeGaze ? "enabled" : "unavailable");
++             app.hasEyeGaze ? "enabled" : "unavailable",
++             app.hasFrameController ? "enabled" : "unavailable");
+ 
+     XrInstanceProperties props = {XR_TYPE_INSTANCE_PROPERTIES};
+     if (XR_SUCCEEDED(xrGetInstanceProperties(app.instance, &props))) {
+@@ -1291,6 +1298,8 @@ static void PollEvents(App& app)
+             } else if (ssc->state == XR_SESSION_STATE_EXITING) {
+                 app.exitRequested = true;
+             }
++        } else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
++            g_xrInput.ProfileChanged();
+         } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
+             auto* ilp = (XrEventDataInstanceLossPending*)&ev;
+             LOG_ERROR("instance LOSS_PENDING at %lld: the runtime is going away; exiting 3", (long long)ilp->lossTime);
+@@ -2260,7 +2269,8 @@ int main(int argc, char** argv)
+         return 1;
+     }
+ 
+-    g_xrInput.Init(app.instance, app.session, app.stageSpace, app.hasHandTracking, app.hasEyeGaze);
++    g_xrInput.Init(app.instance, app.session, app.stageSpace, app.hasHandTracking, app.hasEyeGaze,
++                   app.hasFrameController);
+ 
+     if (g_streamMode) {
+         if (!g_decoder.OpenStream(VideoDecoder::Codec::H265)) {
+diff --git a/clients/steam-frame/src/xr_input.cpp b/clients/steam-frame/src/xr_input.cpp
+index d473e0a..4593ecd 100644
+--- a/clients/steam-frame/src/xr_input.cpp
++++ b/clients/steam-frame/src/xr_input.cpp
+@@ -8,6 +8,8 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <string>
++#include <utility>
+ #include <vector>
+ 
+ #define LOG_INF(fmt, ...) fprintf(stderr, "[INFO] XrInput: " fmt "\n", ##__VA_ARGS__)
+@@ -28,8 +30,10 @@ static bool proc(XrInstance inst, const char* name, T* out)
+     return XR_SUCCEEDED(xrGetInstanceProcAddr(inst, name, (PFN_xrVoidFunction*)out));
+ }
+ 
++static const char* kFrameProfile = "/interaction_profiles/valve/frame_controller_valve";
++
+ bool XrInput::Init(XrInstance instance, XrSession session, XrSpace baseSpace,
+-                   bool handTracking, bool eyeGaze)
++                   bool handTracking, bool eyeGaze, bool frameController)
+ {
+     instance_ = instance;
+     session_ = session;
+@@ -52,6 +56,7 @@ bool XrInput::Init(XrInstance instance, XrSession session, XrSpace baseSpace,
+         return XR_SUCCEEDED(xrCreateAction(actionSet_, &ci, out));
+     };
+     if (!mkAction("grip_pose", XR_ACTION_TYPE_POSE_INPUT, &poseAction_) ||
++        !mkAction("aim_pose", XR_ACTION_TYPE_POSE_INPUT, &aimAction_) ||
+         !mkAction("trigger", XR_ACTION_TYPE_FLOAT_INPUT, &triggerAction_) ||
+         !mkAction("squeeze", XR_ACTION_TYPE_FLOAT_INPUT, &squeezeAction_) ||
+         !mkAction("thumbstick", XR_ACTION_TYPE_VECTOR2F_INPUT, &thumbAction_) ||
+@@ -76,6 +81,8 @@ bool XrInput::Init(XrInstance instance, XrSession session, XrSpace baseSpace,
+     suggest("/interaction_profiles/khr/simple_controller", {
+         B(poseAction_, "/user/hand/left/input/grip/pose"),
+         B(poseAction_, "/user/hand/right/input/grip/pose"),
++        B(aimAction_, "/user/hand/left/input/aim/pose"),
++        B(aimAction_, "/user/hand/right/input/aim/pose"),
+         B(primaryAction_, "/user/hand/left/input/select/click"),
+         B(primaryAction_, "/user/hand/right/input/select/click"),
+         B(secondaryAction_, "/user/hand/left/input/menu/click"),
+@@ -96,10 +103,12 @@ bool XrInput::Init(XrInstance instance, XrSession session, XrSpace baseSpace,
+         }
+     }
+ 
+-    // Oculus Touch — the Frame's controllers emulate this. Full input surface.
++    // Oculus Touch — what SteamVR emulates on the Frame when the app has no Frame bindings.
+     suggest("/interaction_profiles/oculus/touch_controller", {
+         B(poseAction_, "/user/hand/left/input/grip/pose"),
+         B(poseAction_, "/user/hand/right/input/grip/pose"),
++        B(aimAction_, "/user/hand/left/input/aim/pose"),
++        B(aimAction_, "/user/hand/right/input/aim/pose"),
+         B(triggerAction_, "/user/hand/left/input/trigger/value"),
+         B(triggerAction_, "/user/hand/right/input/trigger/value"),
+         B(squeezeAction_, "/user/hand/left/input/squeeze/value"),
+@@ -112,6 +121,88 @@ bool XrInput::Init(XrInstance instance, XrSession session, XrSpace baseSpace,
+         B(secondaryAction_, "/user/hand/right/input/b/click"),
+     });
+ 
++    // The Frame's own profile. Through the Touch emulation SteamVR folds right B, X and Y into one
++    // button and three of the left d-pad's four directions into another, and drops the bumper into
++    // the trigger; bound natively, every input arrives on its own. SteamVR prefers a native binding,
++    // so with this one suggested the Touch bindings above go idle on the Frame.
++    if (frameController) {
++        using namespace protocol;
++        static FrameButton buttons[] = {
++            {"a/click", 1, BUTTON_FRAME_A, 0, false, XR_NULL_HANDLE},
++            {"a/touch", 1, BUTTON_FRAME_A, 0, true, XR_NULL_HANDLE},
++            {"b/click", 1, BUTTON_FRAME_B, 0, false, XR_NULL_HANDLE},
++            {"b/touch", 1, BUTTON_FRAME_B, 0, true, XR_NULL_HANDLE},
++            {"x/click", 1, BUTTON_FRAME_X, 0, false, XR_NULL_HANDLE},
++            {"x/touch", 1, BUTTON_FRAME_X, 0, true, XR_NULL_HANDLE},
++            {"y/click", 1, BUTTON_FRAME_Y, 0, false, XR_NULL_HANDLE},
++            {"y/touch", 1, BUTTON_FRAME_Y, 0, true, XR_NULL_HANDLE},
++            {"menu/click", 1, BUTTON_FRAME_RIGHT_MENU, 0, false, XR_NULL_HANDLE},
++            {"menu/touch", 1, BUTTON_FRAME_RIGHT_MENU, 0, true, XR_NULL_HANDLE},
++            {"dpad_up/click", 0, BUTTON_FRAME_DPAD_UP, 0, false, XR_NULL_HANDLE},
++            {"dpad_up/touch", 0, BUTTON_FRAME_DPAD_UP, 0, true, XR_NULL_HANDLE},
++            {"dpad_down/click", 0, BUTTON_FRAME_DPAD_DOWN, 0, false, XR_NULL_HANDLE},
++            {"dpad_down/touch", 0, BUTTON_FRAME_DPAD_DOWN, 0, true, XR_NULL_HANDLE},
++            {"dpad_left/click", 0, BUTTON_FRAME_DPAD_LEFT, 0, false, XR_NULL_HANDLE},
++            {"dpad_left/touch", 0, BUTTON_FRAME_DPAD_LEFT, 0, true, XR_NULL_HANDLE},
++            {"dpad_right/click", 0, BUTTON_FRAME_DPAD_RIGHT, 0, false, XR_NULL_HANDLE},
++            {"dpad_right/touch", 0, BUTTON_FRAME_DPAD_RIGHT, 0, true, XR_NULL_HANDLE},
++            {"view/click", 0, BUTTON_MENU, 0, false, XR_NULL_HANDLE},
++            {"view/touch", 0, BUTTON_MENU, 0, true, XR_NULL_HANDLE},
++            {"bumper/click", -1, BUTTON_LEFT_BUMPER, BUTTON_RIGHT_BUMPER, false, XR_NULL_HANDLE},
++            {"bumper/touch", -1, BUTTON_LEFT_BUMPER, BUTTON_RIGHT_BUMPER, true, XR_NULL_HANDLE},
++            {"squeeze/click", -1, BUTTON_LEFT_GRIP, BUTTON_RIGHT_GRIP, false, XR_NULL_HANDLE},
++            {"squeeze/touch", -1, BUTTON_LEFT_GRIP, BUTTON_RIGHT_GRIP, true, XR_NULL_HANDLE},
++            {"trigger/click", -1, BUTTON_LEFT_TRIGGER, BUTTON_RIGHT_TRIGGER, false, XR_NULL_HANDLE},
++            {"trigger/touch", -1, BUTTON_LEFT_TRIGGER, BUTTON_RIGHT_TRIGGER, true, XR_NULL_HANDLE},
++            {"thumbstick/click", -1, BUTTON_LEFT_THUMBSTICK, BUTTON_RIGHT_THUMBSTICK, false, XR_NULL_HANDLE},
++            {"thumbstick/touch", -1, BUTTON_LEFT_THUMBSTICK, BUTTON_RIGHT_THUMBSTICK, true, XR_NULL_HANDLE},
++        };
++        const char* handName[2] = {"left", "right"};
++        std::vector<std::string> paths;   // keeps the strings alive until the suggest call
++        std::vector<std::pair<XrAction, size_t>> pending;
++        bool ok = true;
++        for (FrameButton& fb : buttons) {
++            char name[XR_MAX_ACTION_NAME_SIZE];
++            snprintf(name, sizeof(name), "frame_%s", fb.component);
++            for (char* c = name; *c; c++) if (*c == '/') *c = '_';
++            if (!mkAction(name, XR_ACTION_TYPE_BOOLEAN_INPUT, &fb.action)) { ok = false; break; }
++            for (int h = 0; h < 2; h++) {
++                if (fb.hand != -1 && fb.hand != h) continue;
++                paths.push_back(std::string("/user/hand/") + handName[h] + "/input/" + fb.component);
++                pending.push_back({fb.action, paths.size() - 1});
++            }
++        }
++        if (ok) {
++            std::vector<XrActionSuggestedBinding> b = {
++                B(poseAction_, "/user/hand/left/input/grip/pose"),
++                B(poseAction_, "/user/hand/right/input/grip/pose"),
++                B(aimAction_, "/user/hand/left/input/aim/pose"),
++                B(aimAction_, "/user/hand/right/input/aim/pose"),
++                B(triggerAction_, "/user/hand/left/input/trigger/value"),
++                B(triggerAction_, "/user/hand/right/input/trigger/value"),
++                B(squeezeAction_, "/user/hand/left/input/squeeze/value"),
++                B(squeezeAction_, "/user/hand/right/input/squeeze/value"),
++                B(thumbAction_, "/user/hand/left/input/thumbstick"),
++                B(thumbAction_, "/user/hand/right/input/thumbstick"),
++            };
++            for (const auto& pa : pending) b.push_back(B(pa.first, paths[pa.second].c_str()));
++            XrInteractionProfileSuggestedBinding sb = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
++            sb.interactionProfile = frameProfilePath_ = path(instance, kFrameProfile);
++            sb.countSuggestedBindings = (uint32_t)b.size();
++            sb.suggestedBindings = b.data();
++            const XrResult r = xrSuggestInteractionProfileBindings(instance, &sb);
++            if (XR_SUCCEEDED(r)) {
++                frameController_ = true;
++                frameButtons_ = buttons;
++                frameButtonCount_ = (int)(sizeof(buttons) / sizeof(buttons[0]));
++            } else {
++                LOG_ERR("Frame controller bindings refused (%d): staying on the Touch emulation", (int)r);
++            }
++        } else {
++            LOG_ERR("Frame controller actions not created: staying on the Touch emulation");
++        }
++    }
++
+     XrSessionActionSetsAttachInfo ai = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+     ai.countActionSets = 1;
+     ai.actionSets = &actionSet_;
+@@ -123,6 +214,8 @@ bool XrInput::Init(XrInstance instance, XrSession session, XrSpace baseSpace,
+         sci.subactionPath = handPath_[h];
+         sci.poseInActionSpace.orientation.w = 1.0f;
+         xrCreateActionSpace(session, &sci, &poseSpace_[h]);
++        sci.action = aimAction_;
++        xrCreateActionSpace(session, &sci, &aimSpace_[h]);
+     }
+     if (eyeGaze_ && gazeAction_) {
+         XrActionSpaceCreateInfo sci = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
+@@ -151,15 +244,55 @@ bool XrInput::Init(XrInstance instance, XrSession session, XrSpace baseSpace,
+         if (!handTracker_[0] && !handTracker_[1]) handTracking_ = false;
+     }
+ 
+-    LOG_INF("input ready (hand tracking %s, eye gaze %s)",
+-            handTracking_ ? "on" : "off", eyeGaze_ ? "on" : "off");
++    LOG_INF("input ready (hand tracking %s, eye gaze %s, frame controller bindings %s)",
++            handTracking_ ? "on" : "off", eyeGaze_ ? "on" : "off", frameController_ ? "on" : "off");
+     return true;
+ }
+ 
++void XrInput::RefreshProfiles()
++{
++    for (int h = 0; h < 2; h++) {
++        XrInteractionProfileState st = {XR_TYPE_INTERACTION_PROFILE_STATE};
++        if (XR_FAILED(xrGetCurrentInteractionProfile(session_, handPath_[h], &st))) continue;
++        const bool frame = frameProfilePath_ != XR_NULL_PATH && st.interactionProfile == frameProfilePath_;
++        static XrPath logged[2] = {XR_NULL_PATH, XR_NULL_PATH};
++        static bool loggedOnce[2] = {false, false};
++        if (!loggedOnce[h] || st.interactionProfile != logged[h]) {
++            loggedOnce[h] = true;
++            logged[h] = st.interactionProfile;
++            char name[XR_MAX_PATH_LENGTH] = "none";
++            uint32_t n = 0;
++            if (st.interactionProfile != XR_NULL_PATH)
++                xrPathToString(instance_, st.interactionProfile, sizeof(name), &n, name);
++            LOG_INF("%s hand interaction profile: %s", h ? "right" : "left", name);
++        }
++        frameProfileActive_[h] = frame;
++    }
++}
++
++// The Touch emulation's meaning of the Frame's buttons, as SteamVR's own remap gives it
++// (frame_controller_remapping.json, oculus_touch layout): A = A, B = B|X|Y, X = d-pad down,
++// Y = the other three directions. Keeps a server that knows only Touch working unchanged.
++static uint32_t TouchCompatBits(uint32_t m)
++{
++    using namespace protocol;
++    uint32_t out = 0;
++    if (m & BUTTON_FRAME_A) out |= BUTTON_A;
++    if (m & (BUTTON_FRAME_B | BUTTON_FRAME_X | BUTTON_FRAME_Y)) out |= BUTTON_B;
++    if (m & BUTTON_FRAME_DPAD_DOWN) out |= BUTTON_X;
++    if (m & (BUTTON_FRAME_DPAD_UP | BUTTON_FRAME_DPAD_LEFT | BUTTON_FRAME_DPAD_RIGHT)) out |= BUTTON_Y;
++    return out;
++}
++
+ void XrInput::Update(XrTime displayTime, protocol::TrackingPacket& pkt)
+ {
+     if (!actionSet_) return;
+ 
++    if (frameController_ && --profilePollFrames_ < 0) {
++        RefreshProfiles();
++        profilePollFrames_ = 90;   // about once a second
++    }
++
+     XrActiveActionSet active = {actionSet_, XR_NULL_PATH};
+     XrActionsSyncInfo si = {XR_TYPE_ACTIONS_SYNC_INFO};
+     si.countActiveActionSets = 1;
+@@ -200,6 +333,27 @@ void XrInput::Update(XrTime displayTime, protocol::TrackingPacket& pkt)
+             }
+         }
+ 
++        // Aim pose: where the controller points. On the Frame it is ~40 degrees from the grip's -Z,
++        // so a ray built from the grip misses. Left zero when unavailable: the server falls back to grip.
++        float* aimPos[2] = {pkt.leftControllerAimPos, pkt.rightControllerAimPos};
++        float* aimRot[2] = {pkt.leftControllerAimRot, pkt.rightControllerAimRot};
++        gi.action = aimAction_;
++        XrActionStatePose as = {XR_TYPE_ACTION_STATE_POSE};
++        if (aimSpace_[h] && XR_SUCCEEDED(xrGetActionStatePose(session_, &gi, &as)) && as.isActive) {
++            XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
++            if (XR_SUCCEEDED(xrLocateSpace(aimSpace_[h], baseSpace_, displayTime, &loc)) &&
++                (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
++                (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
++                aimPos[h][0] = loc.pose.position.x;
++                aimPos[h][1] = loc.pose.position.y;
++                aimPos[h][2] = loc.pose.position.z;
++                aimRot[h][0] = loc.pose.orientation.x;
++                aimRot[h][1] = loc.pose.orientation.y;
++                aimRot[h][2] = loc.pose.orientation.z;
++                aimRot[h][3] = loc.pose.orientation.w;
++            }
++        }
++
+         auto getFloat = [&](XrAction a, float* out) {
+             gi.action = a;
+             XrActionStateFloat s = {XR_TYPE_ACTION_STATE_FLOAT};
+@@ -223,6 +377,21 @@ void XrInput::Update(XrTime displayTime, protocol::TrackingPacket& pkt)
+         if (getBool(primaryAction_)) pkt.buttonState |= primaryBit[h];
+         if (getBool(secondaryAction_)) pkt.buttonState |= secondaryBit[h];
+         if (*trig[h] > 0.6f) pkt.buttonState |= trigBit[h];
++
++        if (frameProfileActive_[h]) {
++            for (int i = 0; i < frameButtonCount_; i++) {
++                const FrameButton& fb = frameButtons_[i];
++                if (fb.hand != -1 && fb.hand != h) continue;
++                if (!getBool(fb.action)) continue;
++                const uint32_t bit = (fb.hand == -1 && h == 1) ? fb.bitRight : fb.bit;
++                (fb.touch ? pkt.touchState : pkt.buttonState) |= bit;
++            }
++        }
++    }
++    if (frameProfileActive_[0] || frameProfileActive_[1]) {
++        pkt.controllerProfile = protocol::CONTROLLER_PROFILE_VALVE_FRAME;
++        pkt.buttonState |= TouchCompatBits(pkt.buttonState);
++        pkt.touchState |= TouchCompatBits(pkt.touchState);
+     }
+ 
+     // Eye gaze: locate the gaze pose; forward direction = -Z rotated by the pose.
+@@ -322,6 +491,7 @@ void XrInput::Destroy()
+     for (int h = 0; h < 2; h++) {
+         if (handTracker_[h] && pfnDestroyHandTracker_) pfnDestroyHandTracker_(handTracker_[h]);
+         if (poseSpace_[h]) xrDestroySpace(poseSpace_[h]);
++        if (aimSpace_[h]) xrDestroySpace(aimSpace_[h]);
+     }
+     if (gazeSpace_) xrDestroySpace(gazeSpace_);
+     if (actionSet_) xrDestroyActionSet(actionSet_);
+diff --git a/clients/steam-frame/src/xr_input.h b/clients/steam-frame/src/xr_input.h
+index bf0f0b5..3d0bf7d 100644
+--- a/clients/steam-frame/src/xr_input.h
++++ b/clients/steam-frame/src/xr_input.h
+@@ -1,11 +1,11 @@
+ // Frame VR client — OpenXR input (V4): controllers + hand tracking
+ // SPDX-License-Identifier: BSL-1.0
+ //
+-// Sets up an action set (poses, trigger, squeeze, thumbstick, A/B) bound for
+-// the KHR simple controller (universal) and Oculus Touch (the Frame's
+-// controllers emulate Touch), plus XR_EXT_hand_tracking joints. Each frame,
+-// fills the oxrsys Trackingpacket's controller + input + hand fields so the
+-// server (and the game) receive the player's hands.
++// Sets up an action set (grip + aim poses, trigger, squeeze, thumbstick, buttons) bound for
++// the Frame's own controller profile (XR_VALVE_frame_controller_interaction), Oculus Touch
++// (what SteamVR emulates when that extension is missing) and the KHR simple controller, plus
++// XR_EXT_hand_tracking joints. Each frame, fills the oxrsys TrackingPacket's controller + input +
++// hand fields so the server (and the game) receive the player's hands.
+ 
+ #pragma once
+ #include <openxr/openxr.h>
+@@ -15,7 +15,7 @@ namespace oxr { namespace protocol { struct TrackingPacket; } }
+ class XrInput {
+ public:
+     bool Init(XrInstance instance, XrSession session, XrSpace baseSpace,
+-              bool handTracking, bool eyeGaze);
++              bool handTracking, bool eyeGaze, bool frameController);
+     // Sync + locate everything for displayTime; fills controller/input/hand
+     // fields (and trackingFlags) of `pkt`. Head fields are left to the caller.
+     void Update(XrTime displayTime, oxr::protocol::TrackingPacket& pkt);
+@@ -26,6 +26,9 @@ class XrInput {
+     // gaze-aware server/runtime would center the fovea here.
+     bool GazeDirection(float outDir[3]) const;
+ 
++    // Call on XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED: the next Update re-reads the profiles.
++    void ProfileChanged() { profilePollFrames_ = 0; }
++
+     void Destroy();
+ 
+ private:
+@@ -35,6 +38,7 @@ class XrInput {
+ 
+     XrActionSet actionSet_ = XR_NULL_HANDLE;
+     XrAction poseAction_ = XR_NULL_HANDLE;     // grip pose, L+R
++    XrAction aimAction_ = XR_NULL_HANDLE;      // aim pose, L+R: where the controller points
+     XrAction triggerAction_ = XR_NULL_HANDLE;  // float, L+R
+     XrAction squeezeAction_ = XR_NULL_HANDLE;  // float, L+R
+     XrAction thumbAction_ = XR_NULL_HANDLE;    // vector2f, L+R
+@@ -43,6 +47,26 @@ class XrInput {
+ 
+     XrPath handPath_[2] = {XR_NULL_PATH, XR_NULL_PATH}; // left, right
+     XrSpace poseSpace_[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
++    XrSpace aimSpace_[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
++
++    // Frame-native buttons: one boolean action per input component, read per hand.
++    struct FrameButton {
++        const char* component;      // e.g. "a/click", "dpad_up/touch"
++        int hand;                   // 0 left, 1 right, -1 both
++        uint32_t bit;               // ButtonFlags bit (for a /touch component: its bit in touchState)
++        uint32_t bitRight;          // bit for the right hand when hand == -1
++        bool touch;
++        XrAction action;
++    };
++    bool frameController_ = false;
++    FrameButton* frameButtons_ = nullptr;
++    int frameButtonCount_ = 0;
++    // Which hands SteamVR currently reports on the Frame profile; re-read on
++    // XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED (ProfileChanged()) and once a second.
++    bool frameProfileActive_[2] = {false, false};
++    XrPath frameProfilePath_ = XR_NULL_PATH;
++    int profilePollFrames_ = 0;
++    void RefreshProfiles();
+ 
+     bool handTracking_ = false;
+     XrHandTrackerEXT handTracker_[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+diff --git a/common/protocol/include/oxrsys/protocol/Protocol.h b/common/protocol/include/oxrsys/protocol/Protocol.h
+index b934a98..76de12e 100644
+--- a/common/protocol/include/oxrsys/protocol/Protocol.h
++++ b/common/protocol/include/oxrsys/protocol/Protocol.h
+@@ -367,6 +367,19 @@ struct TrackingPacket
+     // TRACKING_FLAG_EYE_GAZE_ACTIVE is set. Appended at the end so shorter packets from clients
+     // that predate this field stay readable.
+     float gazeDirection[3];
++
++    // The controller the client's own runtime reports (see ControllerProfile). 0 = unknown, and the
++    // server picks a profile from the client name as before. Appended at the end, like the fields above.
++    uint32_t controllerProfile;
++    // Capacitive touch, one bit per input in the ButtonFlags layout (a set BUTTON_A bit = A is touched).
++    uint32_t touchState;
++};
++
++enum ControllerProfile : uint32_t
++{
++    CONTROLLER_PROFILE_UNKNOWN = 0,
++    // /interaction_profiles/valve/frame_controller_valve (XR_VALVE_frame_controller_interaction)
++    CONTROLLER_PROFILE_VALVE_FRAME = 1,
+ };
+ 
+ enum ButtonFlags : uint32_t
+@@ -382,6 +395,21 @@ enum ButtonFlags : uint32_t
+     BUTTON_RIGHT_TRIGGER = 0x0100,
+     BUTTON_LEFT_GRIP = 0x0200,
+     BUTTON_RIGHT_GRIP = 0x0400,
++    // Steam Frame controllers (controllerProfile == CONTROLLER_PROFILE_VALVE_FRAME): the right hand has
++    // A, B, X and Y and a menu button, the left a four-way d-pad and a view button (sent as BUTTON_MENU).
++    // These bits carry each input on its own. The A/B/X/Y bits above keep the Oculus Touch meaning that
++    // SteamVR's own Frame-to-Touch remap gives: A = A, B = B|X|Y, X = d-pad down, Y = the other three.
++    BUTTON_FRAME_A = 0x0800,
++    BUTTON_FRAME_B = 0x1000,
++    BUTTON_FRAME_X = 0x2000,
++    BUTTON_FRAME_Y = 0x4000,
++    BUTTON_FRAME_DPAD_UP = 0x8000,
++    BUTTON_FRAME_DPAD_DOWN = 0x10000,
++    BUTTON_FRAME_DPAD_LEFT = 0x20000,
++    BUTTON_FRAME_DPAD_RIGHT = 0x40000,
++    BUTTON_FRAME_RIGHT_MENU = 0x80000,
++    BUTTON_LEFT_BUMPER = 0x100000,
++    BUTTON_RIGHT_BUMPER = 0x200000,
+ };
+ 
+ enum TrackingFlags : uint32_t
+diff --git a/tests/TestProtocolLayout.cpp b/tests/TestProtocolLayout.cpp
+index ceed200..8e6af96 100644
+--- a/tests/TestProtocolLayout.cpp
++++ b/tests/TestProtocolLayout.cpp
+@@ -65,8 +65,8 @@ TEST_CASE("C++ protocol layouts match the documented wire format", "[protocol]")
+     STATIC_REQUIRE(SERVER_FEATURE_FEC_INTERLEAVED == 0x00000400);
+     STATIC_REQUIRE(CLIENT_CAPABILITY_FEC_INTERLEAVED == 0x00001000);
+ 
+-    // 1080, not 1076: gazeDirection ends at 1076 and the struct's int64 alignment pads to 8.
+-    STATIC_REQUIRE(sizeof(TrackingPacket) == 1080);
++    // 1088, not 1084: touchState ends at 1084 and the struct's int64 alignment pads to 8.
++    STATIC_REQUIRE(sizeof(TrackingPacket) == 1088);
+     STATIC_REQUIRE(offsetof(TrackingPacket, headLinearVelocity) == 152);
+     STATIC_REQUIRE(offsetof(TrackingPacket, headAngularVelocity) == 164);
+     STATIC_REQUIRE(offsetof(TrackingPacket, leftHandJoints) == 176);
+@@ -78,6 +78,11 @@ TEST_CASE("C++ protocol layouts match the documented wire format", "[protocol]")
+     // TrackingReceiver accepts (kMinTrackingPacketSize) and zero-fills; the Swift client cannot
+     // supply gaze at all, since visionOS never exposes a raw gaze ray to applications.
+     STATIC_REQUIRE(offsetof(TrackingPacket, gazeDirection) == 1064);
++    // The controller profile and touch bits follow gaze. A client from before them sent 1080 bytes, the
++    // last four of them padding, so a receiver trusts controllerProfile only from a packet of at least
++    // offsetof(touchState) + 4 bytes.
++    STATIC_REQUIRE(offsetof(TrackingPacket, controllerProfile) == 1076);
++    STATIC_REQUIRE(offsetof(TrackingPacket, touchState) == 1080);
+     STATIC_REQUIRE(offsetof(TrackingPacket, rightControllerAimPos) == 1036);
+     STATIC_REQUIRE(offsetof(TrackingPacket, rightControllerAimRot) == 1048);
+     STATIC_REQUIRE(TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE == 0x0004);
+-- 
+2.43.0
+

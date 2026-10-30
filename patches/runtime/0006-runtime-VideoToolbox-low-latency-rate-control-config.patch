@@ -1,0 +1,233 @@
+From 5c421073dca410ab6cae9e72a55b45efa2ad8f0e Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 18:01:37 +0000
+Subject: [PATCH 06/23] runtime: VideoToolbox low-latency rate control, config
+ encoder_low_latency (default on)
+
+The in-process hardware session asks VideoToolbox for low-latency rate control
+(kVTVideoEncoderSpecification_EnableLowLatencyRateControl). Measured on an M5 Pro at
+2272x1264 H.265 72 Hz: encode callback 12.6 ms -> 8.0 ms, and that 8 ms does not move
+with bitrate (25/50), resolution scale (0.5/0.75), codec (H.264/H.265), preset
+(speed/balanced), refresh (72/90), a real frame duration, CompleteFrames after each
+frame, or pre-converted 4:2:0 input - it is the encoder pipeline floor. Low-latency
+mode has no periodic IDR; keyframes come from ForceKeyFrame (client requests). The
+relaxed retry drops the flag with the hardware requirement. Config test covers the
+default and both values; the init log line says low_latency=on/off.
+---
+ AGENTS.md                   |  3 +++
+ CHANGES.md                  |  6 ++++++
+ runtime/oxrsys-runtime.toml |  5 +++++
+ runtime/src/Config.cpp      | 11 ++++++++---
+ runtime/src/Config.h        |  5 +++++
+ runtime/src/VideoEncoder.mm | 25 +++++++++++++++++++------
+ tests/TestConfig.cpp        | 17 +++++++++++++++++
+ 7 files changed, 63 insertions(+), 9 deletions(-)
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 30d213a..a81d8df 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -67,6 +67,9 @@ ## Core Runtime Contracts
+ - The WiFi control thread admits one client at a time: a `ClientConnect` from a second address
+   while a client is connected is refused (logged at most every 5 s per address); the connected
+   address may always reconnect. `ClientAdmission.h` holds the pure decision and its tests.
++- The in-process hardware VideoToolbox session runs with low-latency rate control
++  (`encoder_low_latency`, default true): no look-ahead and no periodic IDR, keyframes come from
++  `ForceKeyFrame`. The relaxed retry drops it together with the hardware requirement.
+ - Vulkan streaming snapshots released color images with application-dispatched Vulkan functions
+   into bounded exportable images. Queue submission is non-blocking; fence waits belong to the
+   encoder worker. Missing export support, exhausted slots, or wait failures drop the streaming frame
+diff --git a/CHANGES.md b/CHANGES.md
+index b77a903..6fc03f0 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -46,6 +46,12 @@ ### Added
+ 
+ ### Changed
+ 
++- The in-process hardware VideoToolbox session enables low-latency rate control
++  (`kVTVideoEncoderSpecification_EnableLowLatencyRateControl`), new config key
++  `encoder_low_latency` (default true). Measured on an M5 Pro at 2272x1264 H.265 72 Hz: the
++  encode callback fell from 12.6 ms to 8.0 ms, and that 8 ms is flat against bitrate (25/50),
++  resolution scale (0.5/0.75), codec (H.264/H.265), preset and refresh rate (72/90). Low-latency
++  mode has no periodic IDR; keyframes come from client requests via `ForceKeyFrame`.
+ - The in-process VideoToolbox session now requires the hardware encoder when VideoToolbox reports
+   one for the negotiated codec, retrying without the requirement only if that create fails, and the
+   runtime log states whether the session it got is hardware or software.
+diff --git a/runtime/oxrsys-runtime.toml b/runtime/oxrsys-runtime.toml
+index aa56c62..b9400f5 100644
+--- a/runtime/oxrsys-runtime.toml
++++ b/runtime/oxrsys-runtime.toml
+@@ -48,6 +48,11 @@ video_codec = "h265"
+ # quality  = best visual quality, slightly higher latency
+ encoder_preset = "balanced"
+ 
++# VideoToolbox low-latency rate control for the hardware encoder: no look-ahead and no
++# periodic keyframes (clients request them on loss). Cuts the encode callback from ~12.6 ms
++# to ~8.0 ms at 2272x1264 H.265 (M5 Pro, 2026-10-17). Set false to compare.
++encoder_low_latency = true
++
+ # Encode HEVC Main10 for H.265 clients that advertise 10-bit decode support.
+ # H.264 and clients without the capability continue to receive 8-bit video.
+ encoder_10bit = false
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index 5bb42db..083de58 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -399,6 +399,10 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             {
+                 values.encoder10Bit = ParseBool(value);
+             }
++            else if (key == "encoder_low_latency")
++            {
++                values.encoderLowLatency = ParseBool(value);
++            }
+             else if (key == "encoder_helper")
+             {
+                 // Tri-state: "auto" (decide from the measured hardware-encoder
+@@ -626,7 +630,7 @@ bool Config::ReloadIfChangedLocked(bool force)
+     if (!force)
+     {
+         spdlog::info(
+-            "OXRSys: Reloaded config from {} (runtime_enabled={} bitrate={}Mbps fov={} refresh={}Hz res_scale={:.2f} render_device={} dyn_min={:.2f} keyframe={}s codec={} preset={} transport={} ffe={} client_ffr={} upscaling={} sharpen={:.2f} reprojection={} abr={} passthrough={} app_alpha_blend={} occlusion={} spatial={}/{}/{}/{} audio={} quest_logcat={})",
++            "OXRSys: Reloaded config from {} (runtime_enabled={} bitrate={}Mbps fov={} refresh={}Hz res_scale={:.2f} render_device={} dyn_min={:.2f} keyframe={}s codec={} preset={} low_latency={} transport={} ffe={} client_ffr={} upscaling={} sharpen={:.2f} reprojection={} abr={} passthrough={} app_alpha_blend={} occlusion={} spatial={}/{}/{}/{} audio={} quest_logcat={})",
+             configFilePath,
+             newValues.runtimeEnabled,
+             newValues.bitrateMbps,
+@@ -638,6 +642,7 @@ bool Config::ReloadIfChangedLocked(bool force)
+             newValues.keyframeIntervalSec,
+             newValues.videoCodec,
+             newValues.encoderPreset,
++            newValues.encoderLowLatency,
+             newValues.streamingTransport,
+             newValues.foveatedEncodingPreset,
+             newValues.clientFoveationPreset,
+@@ -751,11 +756,11 @@ void Config::SetupLogging()
+     spdlog::info("OXRSys Runtime starting (config from {})", configFilePath);
+     spdlog::info("  runtime_enabled={} file_logging={} quest_logcat={}",
+                   values_.runtimeEnabled, values_.fileLogging, values_.questLogcat);
+-    spdlog::info("  bitrate={}Mbps fov={}° refresh={}Hz res_scale={:.2f} dyn_min={:.2f} keyframe={}s preset={} transport={} ffe={} client_ffr={} upscaling={} sharpen={:.2f} reprojection={} abr={} passthrough={} app_alpha_blend={} occlusion={} spatial={}/{}/{}/{} audio={}",
++    spdlog::info("  bitrate={}Mbps fov={}° refresh={}Hz res_scale={:.2f} dyn_min={:.2f} keyframe={}s preset={} low_latency={} transport={} ffe={} client_ffr={} upscaling={} sharpen={:.2f} reprojection={} abr={} passthrough={} app_alpha_blend={} occlusion={} spatial={}/{}/{}/{} audio={}",
+                   values_.bitrateMbps, values_.fovDegrees, values_.refreshRateHz,
+                   values_.resolutionScale, values_.dynamicResolutionMinScale,
+                   values_.keyframeIntervalSec,
+-                  values_.encoderPreset, values_.streamingTransport,
++                  values_.encoderPreset, values_.encoderLowLatency, values_.streamingTransport,
+                   values_.foveatedEncodingPreset, values_.clientFoveationPreset,
+                   values_.clientUpscaling, values_.clientSharpening, values_.clientReprojectionMode,
+                   values_.abrMode, values_.passthroughEnabled,
+diff --git a/runtime/src/Config.h b/runtime/src/Config.h
+index d74018a..e8ba995 100644
+--- a/runtime/src/Config.h
++++ b/runtime/src/Config.h
+@@ -24,6 +24,11 @@ struct ConfigValues
+     std::string videoCodec = "h265"; // "h265", "h264", "auto"
+     std::string encoderPreset = "balanced"; // "quality", "balanced", "speed"
+     bool encoder10Bit = false;      // Encode HEVC Main10 for capable H.265 clients
++    // VideoToolbox low-latency rate control for the in-process hardware session
++    // (kVTVideoEncoderSpecification_EnableLowLatencyRateControl): no look-ahead,
++    // no periodic IDR (keyframes come from ForceKeyFrame, i.e. client requests).
++    // Measured 2026-10-17, M5 Pro, 2272x1264 HEVC @72: encode callback 12.6 -> 8.0 ms.
++    bool encoderLowLatency = true;
+ 
+     // Out-of-process native-arm64 hardware encoder helper. When the runtime
+     // dylib is loaded by an x86_64/Rosetta host it cannot reach VideoToolbox's
+diff --git a/runtime/src/VideoEncoder.mm b/runtime/src/VideoEncoder.mm
+index 78e0e48..d24c0e5 100644
+--- a/runtime/src/VideoEncoder.mm
++++ b/runtime/src/VideoEncoder.mm
+@@ -992,12 +992,22 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+     // unconditional is what made a Rosetta host silently get the ~27-40ms/frame
+     // software HEVC encoder; now that path is entered knowingly, logged, and
+     // (when the helper covers the codec) only as the fallback behind it.
+-    NSDictionary* encoderSpec = @{
++    NSMutableDictionary* encoderSpec = [@{
+         (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder:
+             forceSoftware ? @NO : @YES,
+         (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:
+             hardwareInProcess ? @YES : @NO,
+-    };
++    } mutableCopy];
++    // Low-latency rate control is a property of the hardware encoder: no
++    // look-ahead, no periodic IDR, output as soon as the frame is coded. The
++    // relaxed retry below drops it with the hardware requirement, so a session
++    // whose encoder cannot do it still comes up, loudly.
++    const bool lowLatencyRequested = initialConfig.encoderLowLatency && !forceSoftware;
++    if (lowLatencyRequested)
++    {
++        encoderSpec[(NSString*)kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = @YES;
++    }
++    bool lowLatencyActive = lowLatencyRequested;
+ 
+     VTCompressionSessionRef compressionSession = nullptr;
+     OSStatus status = VTCompressionSessionCreate(
+@@ -1017,8 +1027,10 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+         // Retry without the requirement rather than failing the session: a slow
+         // encoder beats no video. Loudly, because it should not happen.
+         spdlog::warn("VideoEncoder: hardware-required compression session failed ({}) although a "
+-                     "hardware {} encoder was reported - retrying without the requirement",
+-                     status, VideoCodecName(codec_));
++                     "hardware {} encoder was reported - retrying without the requirement{}",
++                     status, VideoCodecName(codec_),
++                     lowLatencyRequested ? " (and without low-latency rate control)" : "");
++        lowLatencyActive = false;
+         NSDictionary* relaxedSpec = @{
+             (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+             (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @NO,
+@@ -1188,8 +1200,9 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+ 
+     initialized_ = true;
+ 
+-    spdlog::info("VideoEncoder: Initialized {} encoder {}x{} @ {}fps, {}Mbps (slots={}, keyframe={}s, preset={})",
+-                  VideoCodecName(codec_), width, height, fps, bitrateMbps, SlotCount, keyframeIntervalSec, preset);
++    spdlog::info("VideoEncoder: Initialized {} encoder {}x{} @ {}fps, {}Mbps (slots={}, keyframe={}s, preset={}, low_latency={})",
++                  VideoCodecName(codec_), width, height, fps, bitrateMbps, SlotCount, keyframeIntervalSec, preset,
++                  lowLatencyActive ? "on" : "off");
+     return true;
+ }
+ 
+diff --git a/tests/TestConfig.cpp b/tests/TestConfig.cpp
+index b0a7021..9a115a1 100644
+--- a/tests/TestConfig.cpp
++++ b/tests/TestConfig.cpp
+@@ -23,6 +23,7 @@ keyframe_interval_sec = 4
+ video_codec = "h264"
+ encoder_preset = "quality"
+ encoder_10bit = true
++encoder_low_latency = false
+ encoder_helper = true
+ encoder_helper_path = "/opt/oxrsys/oxrsys-encoder-helper"
+ foveated_encoding_preset = "medium"
+@@ -58,6 +59,7 @@ quest_logcat = yes
+     CHECK(values.videoCodec == "h264");
+     CHECK(values.encoderPreset == "quality");
+     CHECK(values.encoder10Bit == true);
++    CHECK(values.encoderLowLatency == false);
+     CHECK(values.encoderHelperMode == "true");
+     CHECK(values.encoderHelperPath == "/opt/oxrsys/oxrsys-encoder-helper");
+     CHECK(values.foveatedEncodingPreset == "medium");
+@@ -164,6 +166,21 @@ stage_height_offset_m = 1.5
+     CHECK(preserved.stageHeightOffsetM == -0.25f);
+ }
+ 
++TEST_CASE("Config parser enables encoder low-latency rate control by default", "[config]")
++{
++    CHECK(ConfigValues{}.encoderLowLatency == true);
++    std::istringstream on(R"TOML(
++[streaming]
++encoder_low_latency = true
++)TOML");
++    CHECK(ParseConfigToml(on).encoderLowLatency == true);
++    std::istringstream off(R"TOML(
++[streaming]
++encoder_low_latency = false
++)TOML");
++    CHECK(ParseConfigToml(off).encoderLowLatency == false);
++}
++
+ TEST_CASE("Config parser keeps encoder_helper tri-state with an automatic default", "[config]")
+ {
+     // Default: the runtime decides from the measured hardware-encoder
+-- 
+2.43.0
+

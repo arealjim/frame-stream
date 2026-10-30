@@ -1,0 +1,487 @@
+From da2f605ef8c877505094f177fa2bb42c94d8eb30 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 13:34:36 +0000
+Subject: [PATCH 12/23] runtime: encoded bytes per frame on the encode queue
+ line, oxrsys_encoder_bench
+
+The encode queue log line now ends with frameBytes(min/med/max)=a/b/c small=k/n,
+the encoded size of each frame in the window and the count under 20 % of the
+median, so duplicate frames reaching the encoder can be counted from the log.
+SummarizeEncodedFrameBytes lives in EncodedFrameStats.h with a unit test.
+
+oxrsys_encoder_bench drives the runtime VideoEncoder (real VideoToolbox setup,
+Metal compose, video-range conversion) with a GPU-rendered moving pattern and
+prints submit-to-callback latency percentiles. Measured 2026-10-18 on the M5 Pro
+beside a live 2560x1120 rtvc stream, sparse 15 Hz submission: 2560x1120 callback
+p10 9.2 ms with encoder_low_latency on (rtvc), 5.8 ms with it off (ave);
+3456x1536 13.7 vs 8.3 ms. Not switched: the October 17 isolated runs measured
+the ave session at 12.6 ms (72 Hz, 2272x1264), so the off number may depend on
+the live rtvc stream sharing the engine - a live A/B decides it.
+
+---
+ CHANGES.md                      |   6 +
+ CMakeLists.txt                  |  35 +++++
+ runtime/src/EncodedFrameStats.h |  38 ++++++
+ runtime/src/StreamingServer.cpp |  26 +++-
+ tests/TestEncodedFrameStats.cpp |  33 +++++
+ tools/EncoderBench.mm           | 221 ++++++++++++++++++++++++++++++++
+ 6 files changed, 357 insertions(+), 2 deletions(-)
+ create mode 100644 runtime/src/EncodedFrameStats.h
+ create mode 100644 tests/TestEncodedFrameStats.cpp
+ create mode 100644 tools/EncoderBench.mm
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 4d9aeba..37a20d3 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -6,6 +6,12 @@ ## 1.3.0 - TBD
+ 
+ ### Added
+ 
++- The streaming "encode queue" log line ends with frameBytes(min/med/max)=a/b/c small=k/n: encoded
++  bytes per frame over the window and how many of its n frames were under 20 % of the median (a
++  duplicate frame reaching the encoder shows up there).
++- Added oxrsys_encoder_bench (tools/EncoderBench.mm): the runtime VideoEncoder with its real
++  VideoToolbox setup fed a GPU-rendered moving pattern, printing submit-to-callback latency
++  percentiles; --submit-hz measures without adding a second full-rate stream to the media engine.
+ - Added first-class macOS `arm64` and `x86_64` CI lanes plus universal release packaging with
+   architecture validation for the runtime and OXRSys Home.
+ - Added a macOS/iOS simulator build lane covering the Cardboard-style stereo viewer and ARKit
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3eaa1d6..7f2fed5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -173,6 +173,7 @@ add_executable(oxrsys_runtime_tests
+     tests/TestClientAdmission.cpp
+     tests/TestClientLiveness.cpp
+     tests/TestConfig.cpp
++    tests/TestEncodedFrameStats.cpp
+     tests/TestEncoderHelperIpc.cpp
+     tests/TestEncoderPathPolicy.cpp
+     tests/TestEncoderSessionKind.cpp
+@@ -355,6 +356,40 @@ set_tests_properties(oxrsys_videotoolbox_encoder_tests PROPERTIES
+ )
+ list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_videotoolbox_encoder_tests)
+ 
++# Encoder latency bench (not a test): the runtime VideoEncoder, its real
++# VideoToolbox setup and Metal compose, fed a GPU-rendered moving pattern at a
++# fixed rate. Prints submit->callback latency percentiles. See tools/EncoderBench.mm.
++add_executable(oxrsys_encoder_bench
++    tools/EncoderBench.mm
++    runtime/src/VideoEncoder.mm
++    runtime/src/EncoderHelperClient.mm
++    runtime/src/EncoderPathPolicy.cpp
++    runtime/src/Config.cpp
++    runtime/src/RuntimePlatform.cpp
++)
++target_include_directories(oxrsys_encoder_bench PRIVATE
++    runtime/src
++    runtime/encoder_helper
++    common/protocol/include
++    ${openxr_SOURCE_DIR}/include
++)
++target_link_libraries(oxrsys_encoder_bench PRIVATE
++    spdlog::spdlog
++    "-framework Metal"
++    "-framework MetalPerformanceShaders"
++    "-framework Foundation"
++    "-framework VideoToolbox"
++    "-framework CoreMedia"
++    "-framework CoreVideo"
++    "-framework IOSurface"
++)
++target_compile_definitions(oxrsys_encoder_bench PRIVATE
++    XR_USE_GRAPHICS_API_METAL
++    OXRSYS_VERSION_MAJOR=${OXRSYS_VERSION_MAJOR}
++    OXRSYS_VERSION_MINOR=${OXRSYS_VERSION_MINOR}
++    OXRSYS_VERSION_PATCH=${OXRSYS_VERSION_PATCH}
++)
++
+ add_dependencies(oxrsys_runtime_sync_compile_commands
+     ${OXRSYS_RUNTIME_TEST_TARGETS}
+ )
+diff --git a/runtime/src/EncodedFrameStats.h b/runtime/src/EncodedFrameStats.h
+new file mode 100644
+index 0000000..cc6c1cb
+--- /dev/null
++++ b/runtime/src/EncodedFrameStats.h
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <vector>
++
++// Encoded size of each frame over one telemetry window, for the "encode queue"
++// log line. A frame far below the median is almost always one whose content did
++// not change - a duplicate the app or the compose handed the encoder twice - so
++// the line counts them: "small" is the number of frames under 20 % of the median.
++struct EncodedFrameBytesSummary
++{
++    size_t count = 0;
++    size_t min = 0;
++    size_t median = 0;
++    size_t max = 0;
++    size_t small = 0;
++};
++
++inline EncodedFrameBytesSummary SummarizeEncodedFrameBytes(std::vector<size_t> bytes)
++{
++    EncodedFrameBytesSummary summary = {};
++    if (bytes.empty())
++    {
++        return summary;
++    }
++    std::sort(bytes.begin(), bytes.end());
++    summary.count = bytes.size();
++    summary.min = bytes.front();
++    summary.max = bytes.back();
++    summary.median = bytes[(bytes.size() - 1) / 2];
++    // Integer form of bytes < 0.2 * median.
++    summary.small = static_cast<size_t>(std::count_if(bytes.begin(), bytes.end(),
++        [&](size_t value) { return value * 5 < summary.median; }));
++    return summary;
++}
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index 9c5028f..34df0eb 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -3,6 +3,7 @@
+ #include "StreamingServer.h"
+ #include "ClientLiveness.h"
+ #include "Config.h"
++#include "EncodedFrameStats.h"
+ #include "RuntimePlatform.h"
+ #include "RuntimeSockets.h"
+ #include "RuntimeStatus.h"
+@@ -509,6 +510,8 @@ struct EncodeTelemetry
+     TelemetryWindow encodeSubmitMs;
+     TelemetryWindow callbackLatencyMs;
+     TelemetryWindow totalPipelineMs;
++    std::mutex frameBytesMutex;
++    std::vector<size_t> frameBytes;
+     std::mutex logMutex;
+     Clock::time_point lastLogTime = Clock::now();
+ };
+@@ -1461,6 +1464,15 @@ void StreamingServer::EncodeThread()
+ 
+                 if (!metrics.frameDropped && !encodedFrame->nals.empty())
+                 {
++                    size_t encodedBytes = 0;
++                    for (const EncodedNalUnit& nal : encodedFrame->nals)
++                    {
++                        encodedBytes += nal.tcpPayload.size() - sizeof(oxr::protocol::TcpVideoNalHeader);
++                    }
++                    {
++                        std::lock_guard<std::mutex> bytesLock(telemetry->frameBytesMutex);
++                        telemetry->frameBytes.push_back(encodedBytes);
++                    }
+                     server->QueueEncodedVideoFrame(std::move(*encodedFrame));
+                 }
+                 else if (metrics.frameDropped)
+@@ -1490,6 +1502,13 @@ void StreamingServer::EncodeThread()
+                     MetricSummary submitSummary = telemetry->encodeSubmitMs.Consume();
+                     MetricSummary callbackSummary = telemetry->callbackLatencyMs.Consume();
+                     MetricSummary totalSummary = telemetry->totalPipelineMs.Consume();
++                    std::vector<size_t> frameBytes;
++                    {
++                        std::lock_guard<std::mutex> bytesLock(telemetry->frameBytesMutex);
++                        frameBytes.swap(telemetry->frameBytes);
++                    }
++                    const EncodedFrameBytesSummary bytesSummary =
++                        SummarizeEncodedFrameBytes(std::move(frameBytes));
+ 
+                     const uint32_t replacedFrames = server->replacedFrameCount_.exchange(0);
+                     const uint32_t encoderDrops = encoder->GetDroppedFrameCount();
+@@ -1615,7 +1634,8 @@ void StreamingServer::EncodeThread()
+                         "StreamingServer: encode queue(avg/p95={:.2f}/{:.2f}ms) gpu({:.2f}/{:.2f}) "
+                         "submit({:.3f}/{:.3f}) callback({:.2f}/{:.2f}) total({:.2f}/{:.2f}) "
+                         "replaced={} encDrops={} keyframeReq={} depthMax={} sendDepth={} sendDrops={} "
+-                        "tcpFail={} udpRetrans={} abr={}/{} profile={} displayedAge={:.2f}ms reproj={} stale={} poseFallbacks={}",
++                        "tcpFail={} udpRetrans={} abr={}/{} profile={} displayedAge={:.2f}ms reproj={} stale={} poseFallbacks={} "
++                        "frameBytes(min/med/max)={}/{}/{} small={}/{}",
+                         queueSummary.average, queueSummary.p95,
+                         gpuSummary.average, gpuSummary.p95,
+                         submitSummary.average, submitSummary.p95,
+@@ -1635,7 +1655,9 @@ void StreamingServer::EncodeThread()
+                         server->clientDisplayedFrameAgeMs_.load(),
+                         server->clientReprojectedFramesDelta_.load(),
+                         server->clientStaleFrameReusesDelta_.load(),
+-                        server->clientRenderPoseFallbacksDelta_.load());
++                        server->clientRenderPoseFallbacksDelta_.load(),
++                        bytesSummary.min, bytesSummary.median, bytesSummary.max,
++                        bytesSummary.small, bytesSummary.count);
+ 
+                     telemetry->lastLogTime = now;
+                 }
+diff --git a/tests/TestEncodedFrameStats.cpp b/tests/TestEncodedFrameStats.cpp
+new file mode 100644
+index 0000000..5fbbe47
+--- /dev/null
++++ b/tests/TestEncodedFrameStats.cpp
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include <catch2/catch_test_macros.hpp>
++
++#include "EncodedFrameStats.h"
++
++TEST_CASE("Encoded frame byte summary: min, median, max and frames under 20 percent of the median",
++          "[streaming][telemetry]")
++{
++    SECTION("empty window")
++    {
++        const EncodedFrameBytesSummary s = SummarizeEncodedFrameBytes({});
++        CHECK(s.count == 0);
++        CHECK(s.small == 0);
++    }
++    SECTION("duplicates show up as small frames")
++    {
++        // Median 50000: the 9999 frame is under 20 % (10000), the 10000 one is not.
++        const EncodedFrameBytesSummary s =
++            SummarizeEncodedFrameBytes({50000, 9999, 60000, 10000, 50000, 240000, 40000});
++        CHECK(s.count == 7);
++        CHECK(s.min == 9999);
++        CHECK(s.median == 50000);
++        CHECK(s.max == 240000);
++        CHECK(s.small == 1);
++    }
++    SECTION("even count takes the lower middle")
++    {
++        const EncodedFrameBytesSummary s = SummarizeEncodedFrameBytes({4, 1, 3, 2});
++        CHECK(s.median == 2);
++        CHECK(s.small == 0);
++    }
++}
+diff --git a/tools/EncoderBench.mm b/tools/EncoderBench.mm
+new file mode 100644
+index 0000000..98bccbb
+--- /dev/null
++++ b/tools/EncoderBench.mm
+@@ -0,0 +1,221 @@
++// SPDX-License-Identifier: MPL-2.0
++// Encoder latency bench: drives the runtime's own VideoEncoder (its real
++// VideoToolbox session setup, Metal compose and colour conversion) with a
++// GPU-rendered moving pattern at a fixed frame rate, and prints the
++// submit->callback latency distribution the "encode queue" log line reports.
++//
++//   oxrsys_encoder_bench [--preset medium|light|high|off] [--eye 2160] [--fps 90]
++//                        [--mbps 50] [--frames 900] [--submit-hz N]
++//                        [--codec h265|h264] [--ten-bit]
++//
++// It reads the runtime config from $HOME/Library/Application Support/OXRSys,
++// like the runtime, so run it with HOME pointing at a scratch directory whose
++// oxrsys-runtime.toml holds the encoder keys under test (encoder_low_latency,
++// encoder_full_range, encoder_preset).
++//
++// --submit-hz spaces submissions out while timestamps still advance at --fps,
++// so rate control budgets bits per frame as it does live. Sparse submission
++// (e.g. 15) measures per-frame latency without adding a second full-rate
++// stream to the media engine.
++//
++// The media engine is shared by every process on the Mac: a run beside a live
++// stream measures both, and slows the live one (a 3456x1536 run at 90 Hz beside
++// a live 2560x1120 stream made it drop 68 frames, 2026-10-18).
++
++#include "VideoEncoder.h"
++#include <oxrsys/protocol/Foveation.h>
++
++#import <Metal/Metal.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace
++{
++const char* kPatternSource = R"(
++#include <metal_stdlib>
++using namespace metal;
++kernel void pattern(texture2d<float, access::write> out [[texture(0)]],
++                    constant float& t [[buffer(0)]],
++                    uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
++    float2 p = float2(gid) / float2(out.get_width(), out.get_height());
++    float2 q = p + float2(t * 0.11, t * 0.07);
++    float bars = 0.5 + 0.5 * sin((q.x * 40.0) + t * 3.0);
++    float rings = 0.5 + 0.5 * sin(length(p - float2(0.5 + 0.3 * sin(t), 0.5)) * 90.0 - t * 6.0);
++    float checker = fmod(floor(q.x * 24.0) + floor(q.y * 24.0), 2.0);
++    uint h = gid.x * 1973u + gid.y * 9277u + uint(t * 90.0) * 26699u;
++    h = (h ^ (h >> 13)) * 1274126177u;
++    float noise = float(h & 255u) / 255.0;
++    float3 c = float3(bars, rings, checker) * 0.8 + noise * 0.08;
++    out.write(float4(c, 1.0), gid);
++}
++)";
++
++std::shared_ptr<void> Retained(id object)
++{
++    return std::shared_ptr<void>((void*)[object retain], [](void* v) { [(id)v release]; });
++}
++
++double Pct(std::vector<double> v, double p)
++{
++    if (v.empty()) return 0.0;
++    std::sort(v.begin(), v.end());
++    size_t i = std::min(v.size() - 1, (size_t)(p * (v.size() - 1) + 0.5));
++    return v[i];
++}
++} // namespace
++
++int main(int argc, char** argv)
++{
++    @autoreleasepool
++    {
++        std::string preset = "medium";
++        uint32_t eye = 2160, fps = 90, mbps = 50, frames = 900, submitHz = 0;
++        std::string codecName = "h265";
++        bool tenBit = false;
++        for (int i = 1; i < argc; ++i)
++        {
++            std::string a = argv[i];
++            auto next = [&]() { return std::string(i + 1 < argc ? argv[++i] : ""); };
++            if (a == "--preset") preset = next();
++            else if (a == "--eye") eye = std::stoul(next());
++            else if (a == "--fps") fps = std::stoul(next());
++            else if (a == "--mbps") mbps = std::stoul(next());
++            else if (a == "--frames") frames = std::stoul(next());
++            else if (a == "--codec") codecName = next();
++            else if (a == "--ten-bit") tenBit = true;
++            else if (a == "--submit-hz") submitHz = std::stoul(next());
++        }
++        oxr::protocol::FoveationPreset fp = oxr::protocol::FoveationPreset::Off;
++        if (preset == "light") fp = oxr::protocol::FoveationPreset::Light;
++        else if (preset == "medium") fp = oxr::protocol::FoveationPreset::Medium;
++        else if (preset == "high") fp = oxr::protocol::FoveationPreset::High;
++        const auto layout = oxr::protocol::CalculateFoveationLayout(eye, eye, fp);
++        const uint32_t encW = layout.optimizedEyeWidth * 2;
++        const uint32_t encH = layout.optimizedEyeHeight;
++
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> renderQueue = [device newCommandQueue];
++        id<MTLCommandQueue> encodeQueue = [device newCommandQueue];
++        NSError* error = nil;
++        id<MTLLibrary> lib = [device newLibraryWithSource:@(kPatternSource) options:nil error:&error];
++        id<MTLComputePipelineState> pso =
++            [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"pattern"] error:&error];
++        if (pso == nil) { std::fprintf(stderr, "pipeline failed\n"); return 1; }
++
++        // A small ring of eye textures, like a swapchain.
++        constexpr int kRing = 3;
++        id<MTLTexture> eyes[kRing][2];
++        MTLTextureDescriptor* d = [MTLTextureDescriptor
++            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:eye height:eye mipmapped:NO];
++        d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
++        d.storageMode = MTLStorageModePrivate;
++        for (auto& pair : eyes) { pair[0] = [device newTextureWithDescriptor:d]; pair[1] = [device newTextureWithDescriptor:d]; }
++
++        VideoEncoder encoder;
++        VideoEncoder::FoveationSettings fs = {};
++        fs.enabled = fp != oxr::protocol::FoveationPreset::Off;
++        fs.targetEyeWidth = layout.targetEyeWidth;
++        fs.targetEyeHeight = layout.targetEyeHeight;
++        fs.eyeWidthRatio = layout.eyeWidthRatio;
++        fs.eyeHeightRatio = layout.eyeHeightRatio;
++        fs.centerSizeX = layout.parameters.centerSizeX;
++        fs.centerSizeY = layout.parameters.centerSizeY;
++        fs.centerShiftX = layout.parameters.centerShiftX;
++        fs.centerShiftY = layout.parameters.centerShiftY;
++        fs.edgeRatioX = layout.parameters.edgeRatioX;
++        fs.edgeRatioY = layout.parameters.edgeRatioY;
++        encoder.SetFoveationSettings(fs);
++        encoder.SetTenBitEncoding(tenBit);
++        const auto codec = codecName == "h264" ? oxr::protocol::VideoCodec::H264 : oxr::protocol::VideoCodec::H265;
++        if (!encoder.Initialize(encW, encH, fps, mbps, GraphicsContext::Metal((__bridge void*)device, (__bridge void*)encodeQueue), codec))
++        {
++            std::fprintf(stderr, "Initialize failed\n");
++            return 1;
++        }
++
++        std::mutex m;
++        std::vector<double> cb, total, submit, gpu;
++        std::map<int64_t, size_t> bytesByTs;
++        std::vector<size_t> frameBytes;
++        uint32_t dropped = 0, done = 0;
++        const uint32_t warmup = std::min<uint32_t>(30, frames / 10);
++
++        const auto period = std::chrono::nanoseconds(1'000'000'000LL / fps);
++        // Timestamps always advance at the session rate, so rate control budgets
++        // bits per frame as live; --submit-hz only spaces the submissions out.
++        const auto submitPeriod = std::chrono::nanoseconds(1'000'000'000LL / (submitHz ? submitHz : fps));
++        auto start = std::chrono::steady_clock::now();
++        auto next = start;
++        float t = 0.0f;
++        for (uint32_t f = 0; f < frames; ++f)
++        {
++            std::this_thread::sleep_until(next);
++            next += submitPeriod;
++            id<MTLTexture> l = eyes[f % kRing][0], r = eyes[f % kRing][1];
++            id<MTLCommandBuffer> cmd = [renderQueue commandBuffer];
++            id<MTLComputeCommandEncoder> ce = [cmd computeCommandEncoder];
++            [ce setComputePipelineState:pso];
++            for (int e = 0; e < 2; ++e)
++            {
++                float te = t + e * 0.01f;
++                [ce setTexture:(e ? r : l) atIndex:0];
++                [ce setBytes:&te length:sizeof(te) atIndex:0];
++                [ce dispatchThreads:MTLSizeMake(eye, eye, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
++            }
++            [ce endEncoding];
++            [cmd commit];
++            [cmd waitUntilCompleted]; // the app's frame is finished before xrEndFrame hands it over
++            t += 1.0f / fps;
++
++            FrameSource src = {};
++            for (int e = 0; e < 2; ++e)
++            {
++                FrameImageSource& s = e ? src.right : src.left;
++                s.image = Retained(e ? r : l);
++                s.sourceWidth = s.imageWidth = eye;
++                s.sourceHeight = s.imageHeight = eye;
++            }
++            const int64_t ts = (int64_t)f * period.count();
++            const bool measured = f >= warmup;
++            encoder.EncodeStereo(std::move(src), ts,
++                [&, ts](const uint8_t*, size_t size, bool, int64_t) {
++                    std::lock_guard<std::mutex> lock(m);
++                    bytesByTs[ts] += size;
++                },
++                [&, measured](const VideoEncoder::FrameMetrics& mt) {
++                    std::lock_guard<std::mutex> lock(m);
++                    ++done;
++                    if (mt.frameDropped) { ++dropped; return; }
++                    if (!measured) return;
++                    cb.push_back(mt.callbackLatencyMs);
++                    total.push_back(mt.totalLatencyMs);
++                    submit.push_back(mt.encodeSubmitMs);
++                    gpu.push_back(mt.gpuCopyMs);
++                    auto it = bytesByTs.find(mt.timestampNs);
++                    if (it != bytesByTs.end()) frameBytes.push_back(it->second);
++                });
++        }
++        encoder.FlushPendingFrames();
++        const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++        std::lock_guard<std::mutex> lock(m);
++        std::vector<double> kb;
++        for (size_t b : frameBytes) kb.push_back(b / 1024.0);
++        std::printf("RESULT %ux%u %s fps=%u hz=%u mbps=%u n=%zu cb min=%.2f p10=%.2f p50=%.2f p95=%.2f max=%.2f | total p50=%.2f p95=%.2f | submit p50=%.2f | gpu p50=%.2f | fps_out=%.1f drops=%u inflight_end=%u | KB/frame p50=%.0f\n",
++                    encW, encH, codecName.c_str(), fps, submitHz ? submitHz : fps, mbps, cb.size(), Pct(cb, 0.0), Pct(cb, 0.1), Pct(cb, 0.5), Pct(cb, 0.95), Pct(cb, 1.0),
++                    Pct(total, 0.5), Pct(total, 0.95), Pct(submit, 0.5), Pct(gpu, 0.5), done / wall, dropped,
++                    encoder.GetInFlightFrameCount(), Pct(kb, 0.5));
++        encoder.Shutdown();
++    }
++    return 0;
++}
+-- 
+2.43.0
+

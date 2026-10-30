@@ -1,0 +1,456 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 17fd03e..da237c6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -64,7 +64,7 @@ else ()
+ 	# In general using private symbols is a great idea, and it's something we'd want to do anyway.
+ 	# There is also -Bsymbolic set when linking the final shared library, see the bottom of this file
+ 	# FIXME the Vulkan functions still get exported, hopefully they won't fight with the application's ones.
+-    add_definitions(-fvisibility=hidden)
++    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fvisibility=hidden>)
+ 	add_compile_options(-Wall -Wextra -Wpedantic -pedantic-errors -Wno-unused-parameter -Wno-missing-field-initializers -Wno-format-security)
+ 	set(ERROR_ON_WARNING_FLAG -Werror)
+ endif ()
+@@ -421,6 +421,9 @@ target_include_directories(OCCore PRIVATE BundledLibs OpenVRHeaders)
+ target_compile_definitions(OCCore PRIVATE ${GRAPHICS_API_SUPPORT_FLAGS})
+ 
+ target_link_libraries(OCCore PRIVATE OpenVR Vulkan ${XrLib} ${glmLib})
++if (MINGW)
++	target_link_libraries(OCCore PRIVATE shlwapi)
++endif ()
+ 
+ if (NOT WIN32 AND NOT ANDROID)
+ 	find_package(OpenGL REQUIRED) # for glGetError()
+@@ -518,7 +521,11 @@ if (NOT WIN32)
+ 	target_link_libraries(OCOVR PUBLIC -Wl,--start-group OCCore DrvOpenXR -Wl,--end-group)
+ else ()
+ 	# On Windows this isn't a problem since the linker knows how to figure this stuff out
++	if (MINGW)
++		target_link_libraries(OCOVR PUBLIC -Wl,--start-group OCCore DrvOpenXR -Wl,--end-group d3d11 d3d12 dxgi d3dcompiler shlwapi)
++	else ()
+ 	target_link_libraries(OCOVR OCCore DrvOpenXR)
++	endif ()
+ endif ()
+ 
+ # If we're on Linux, compile everything as position-independent
+@@ -565,7 +572,7 @@ file(GLOB stub-deps CONFIGURE_DEPENDS LIST_DIRECTORIES false ${CMAKE_SOURCE_DIR}
+ # Command for running header splitting script
+ add_custom_command(
+ 	OUTPUT ${GENERATED_DIR}/interfaces/vrtypes.h
+-	COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/split_headers.py ${CMAKE_SOURCE_DIR}/OpenVRHeaders ${GENERATED_DIR}
++	COMMAND ${CMAKE_COMMAND} -E env OOVR_MSVC_AGGREGATE_RETURNS=$<BOOL:${MINGW}> ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/split_headers.py ${CMAKE_SOURCE_DIR}/OpenVRHeaders ${GENERATED_DIR}
+ 	DEPENDS ${CMAKE_SOURCE_DIR}/scripts/split_headers.py ${openvr-headers}
+ 	COMMENT "Splitting headers..."
+ 	)
+diff --git a/DrvOpenXR/DrvOpenXR.cpp b/DrvOpenXR/DrvOpenXR.cpp
+index 8e3bd9c..7af1576 100644
+--- a/DrvOpenXR/DrvOpenXR.cpp
++++ b/DrvOpenXR/DrvOpenXR.cpp
+@@ -3,6 +3,9 @@
+ //
+ 
+ #include "DrvOpenXR.h"
++#ifdef _WIN32
++#include <shlwapi.h>
++#endif
+ 
+ #include "../OpenOVR/Misc/Config.h"
+ #include "../OpenOVR/Misc/android_api.h"
+diff --git a/OCOVR/openvr_api.cpp b/OCOVR/openvr_api.cpp
+index a49444a..bf89eae 100644
+--- a/OCOVR/openvr_api.cpp
++++ b/OCOVR/openvr_api.cpp
+@@ -90,6 +90,14 @@ VR_INTERFACE void* VR_CALLTYPE VR_GetGenericInterface(const char* interfaceVersi
+ 	// Hack for Half-Life: Alyx
+ 	// This is an interface that is enabled or not by what seems to be a compile-time
+ 	// switch inside SteamVR, disabled on the public build I was looking at.
++	// Half-Life: Alyx (2025 builds) also asks for SteamVR's internal IPC resource manager; it carries on without one,
++	// as it does under XRizer, which has none either
++	if (!strncmp("IVRIPCResourceManagerClient_", interfaceVersion, strlen("IVRIPCResourceManagerClient_"))) {
++		if (error)
++			*error = VRInitError_Init_InterfaceNotFound;
++		return NULL;
++	}
++
+ 	if (!strcmp("IXrProto_001", interfaceVersion)) {
+ 		if (error)
+ 			*error = VRInitError_Init_InterfaceNotFound;
+@@ -136,6 +144,17 @@ VR_INTERFACE void* VR_CALLTYPE VR_GetGenericInterface(const char* interfaceVersi
+ #undef INTERFACE
+ }
+ 
++// Valve's openvr_api.dll also exports this accessor, and Half-Life: Alyx's vr.dll imports it
++VR_INTERFACE void* VR_CALLTYPE VRControlPanel()
++{
++	static void* controlPanel = nullptr;
++	if (!controlPanel) {
++		EVRInitError error = VRInitError_None;
++		controlPanel = VR_GetGenericInterface("IVRControlPanel_006", &error);
++	}
++	return controlPanel;
++}
++
+ VR_INTERFACE uint32_t VR_CALLTYPE VR_GetInitToken()
+ {
+ 	return current_init_token;
+diff --git a/OpenOVR/Compositor/dx11compositor.cpp b/OpenOVR/Compositor/dx11compositor.cpp
+index 2ed44d2..67d68b7 100644
+--- a/OpenOVR/Compositor/dx11compositor.cpp
++++ b/OpenOVR/Compositor/dx11compositor.cpp
+@@ -309,7 +309,7 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 	OOVR_FAILED_XR_ABORT(res = xrWaitSwapchainImage(chain, &waitInfo));
+ 
+ 	if (res == XR_TIMEOUT_EXPIRED)
+-		OOVR_ABORTF("xrWaitSwapchainImage timeout");
++		OOVR_ABORT("xrWaitSwapchainImage timeout");
+ 
+ 	// Copy the source to the destination image
+ 	D3D11_BOX sourceRegion;
+@@ -350,7 +350,9 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 		context->RSGetState(&pRSState);
+ 		context->RSSetState(nullptr);
+ 
+-		D3D11_VIEWPORT viewport = CD3D11_VIEWPORT(src, swapchain_rtvs[currentIndex]);
++		D3D11_TEXTURE2D_DESC srcDesc;
++		src->GetDesc(&srcDesc);
++		D3D11_VIEWPORT viewport = { 0.0f, 0.0f, (FLOAT)srcDesc.Width, (FLOAT)srcDesc.Height, 0.0f, 1.0f };
+ 		context->RSSetViewports(1, &viewport);
+ 		D3D11_RECT rects[1];
+ 		rects[0].top = 0;
+diff --git a/OpenOVR/Compositor/dx12compositor.cpp b/OpenOVR/Compositor/dx12compositor.cpp
+index ff2fedd..c8d9f35 100644
+--- a/OpenOVR/Compositor/dx12compositor.cpp
++++ b/OpenOVR/Compositor/dx12compositor.cpp
+@@ -213,7 +213,7 @@ void DX12Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 	OOVR_FAILED_XR_ABORT(res = xrWaitSwapchainImage(chain, &waitInfo));
+ 
+ 	if (res == XR_TIMEOUT_EXPIRED)
+-		OOVR_ABORTF("xrWaitSwapchainImage timeout");
++		OOVR_ABORT("xrWaitSwapchainImage timeout");
+ 
+ 	// Copy the source to the destination image
+ 	D3D12_BOX sourceRegion;
+diff --git a/OpenOVR/Reimpl/BaseChaperoneSetup.cpp b/OpenOVR/Reimpl/BaseChaperoneSetup.cpp
+index 42cc309..61b08a6 100644
+--- a/OpenOVR/Reimpl/BaseChaperoneSetup.cpp
++++ b/OpenOVR/Reimpl/BaseChaperoneSetup.cpp
+@@ -119,7 +119,7 @@ bool BaseChaperoneSetup::ImportFromBufferToWorking(const char* pBuffer, uint32_t
+ {
+ 	STUBBED();
+ }
+-void BaseChaperoneSetup::SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) HmdVector2_t* pPointBuffer, uint32_t unPointCount)
++void BaseChaperoneSetup::SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) const HmdVector2_t* pPointBuffer, uint32_t unPointCount)
+ {
+ 	STUBBED();
+ }
+diff --git a/OpenOVR/Reimpl/BaseChaperoneSetup.h b/OpenOVR/Reimpl/BaseChaperoneSetup.h
+index a2fba31..19a5572 100644
+--- a/OpenOVR/Reimpl/BaseChaperoneSetup.h
++++ b/OpenOVR/Reimpl/BaseChaperoneSetup.h
+@@ -77,7 +77,7 @@ public:
+ 	bool ImportFromBufferToWorking(const char* pBuffer, uint32_t nImportFlags);
+ 
+ 	/** Sets the Collision Bounds in the working copy. */
+-	void SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) vr::HmdVector2_t* pPointBuffer, uint32_t unPointCount);
++	void SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) const vr::HmdVector2_t* pPointBuffer, uint32_t unPointCount);
+ 
+ 	/** Shows the chaperone data in the working set to preview in the compositor.*/
+ 	void ShowWorkingSetPreview();
+diff --git a/OpenOVR/Reimpl/BaseClientCore.cpp b/OpenOVR/Reimpl/BaseClientCore.cpp
+index 5f06605..5859cb7 100644
+--- a/OpenOVR/Reimpl/BaseClientCore.cpp
++++ b/OpenOVR/Reimpl/BaseClientCore.cpp
+@@ -18,7 +18,8 @@ using namespace vr;
+ static std::wstring_convert<std::codecvt_utf8<wchar_t>> CHAR_CONV;
+ 
+ #ifdef _WIN32
+-#define APISTR(str) (str)
++#include <filesystem>
++#define APISTR(str) (std::filesystem::path(str))
+ #else
+ #define APISTR(str) (CHAR_CONV.to_bytes(str))
+ #endif
+diff --git a/OpenOVR/Reimpl/BaseCompositor.h b/OpenOVR/Reimpl/BaseCompositor.h
+index 458cc6a..0aa3b15 100644
+--- a/OpenOVR/Reimpl/BaseCompositor.h
++++ b/OpenOVR/Reimpl/BaseCompositor.h
+@@ -80,6 +80,12 @@ enum OOVR_EVRCompositorTimingMode {
+ 	VRCompositorTimingMode_Explicit_ApplicationPerformsPostPresentHandoff = 2,
+ };
+ 
++enum OOVR_EVRCompositorTextureUsage {
++	VRCompositorTextureUsage_Left = vr::Eye_Left,
++	VRCompositorTextureUsage_Right = vr::Eye_Right,
++	VRCompositorTextureUsage_Both,
++};
++
+ struct OOVR_Compositor_StageRenderSettings {
+ 	/** Primary color is applied as a tint to (i.e. multiplied with) the model's texture */
+ 	vr::HmdColor_t m_PrimaryColor = { 1, 1, 1, 1 };
+@@ -182,6 +188,13 @@ public:
+ 	 *	- AlreadySubmitted (app has submitted two left textures or two right textures in a single frame - i.e. before calling WaitGetPoses again)
+ 	 */
+ 	ovr_enum_t Submit(vr::EVREye eEye, const vr::Texture_t* pTexture, const vr::VRTextureBounds_t* pBounds, vr::EVRSubmitFlags nSubmitFlags = vr::Submit_Default);
++	// OpenVR 2.x (IVRCompositor_029), stubbed: 1 = VRCompositorError_RequestFailed
++	ovr_enum_t GetSubmitTexture(vr::Texture_t*, bool* pNeedsFlush, OOVR_EVRCompositorTextureUsage, const vr::Texture_t*, const vr::VRTextureBounds_t*, vr::EVRSubmitFlags)
++	{
++		if (pNeedsFlush)
++			*pNeedsFlush = false;
++		return 1;
++	}
+ 	ovr_enum_t SubmitWithArrayIndex(vr::EVREye eEye, const vr::Texture_t* pTexture, uint32_t unTextureArrayIndex, const vr::VRTextureBounds_t* pBounds, vr::EVRSubmitFlags nSubmitFlags = vr::Submit_Default);
+ 
+ 	/** Clears the frame that was sent with the last call to Submit. This will cause the
+diff --git a/OpenOVR/Reimpl/BaseInput.cpp b/OpenOVR/Reimpl/BaseInput.cpp
+index 1091a21..288e794 100644
+--- a/OpenOVR/Reimpl/BaseInput.cpp
++++ b/OpenOVR/Reimpl/BaseInput.cpp
+@@ -78,7 +78,7 @@ static bool ReadJson(const std::wstring& path, Json::Value& result)
+ #endif
+ 
+ #ifndef ANDROID
+-	std::ifstream in(real_path, std::ios::binary);
++	std::ifstream in(std::filesystem::path(real_path), std::ios::binary);
+ 	if (in) {
+ 		std::stringstream contents;
+ 		contents << in.rdbuf();
+diff --git a/OpenOVR/Reimpl/BaseInput.h b/OpenOVR/Reimpl/BaseInput.h
+index 09286c4..2a09ed8 100644
+--- a/OpenOVR/Reimpl/BaseInput.h
++++ b/OpenOVR/Reimpl/BaseInput.h
+@@ -252,6 +252,9 @@ public:
+ 	/** Reads the state of a pose action given its handle. The returned values will match the values returned
+ 	 * by the last call to IVRCompositor::WaitGetPoses(). */
+ 	EVRInputError GetPoseActionDataForNextFrame(VRActionHandle_t action, ETrackingUniverseOrigin eOrigin, InputPoseActionData_t* pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice);
++	// OpenVR 2.x (IVRInput_011), stubbed: no eye tracking
++	EVRInputError GetEyeTrackingDataRelativeToNow(VRActionHandle_t, ETrackingUniverseOrigin, float, vr::VREyeTrackingData_t*, uint32_t) { return vr::VRInputError_NoData; }
++	EVRInputError GetEyeTrackingDataForNextFrame(VRActionHandle_t, ETrackingUniverseOrigin, vr::VREyeTrackingData_t*, uint32_t) { return vr::VRInputError_NoData; }
+ 
+ 	/** Reads the state of a skeletal action given its handle. */
+ 	EVRInputError GetSkeletalActionData(VRActionHandle_t action, InputSkeletalActionData_t* pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice);
+diff --git a/OpenOVR/Reimpl/BaseOverlay.h b/OpenOVR/Reimpl/BaseOverlay.h
+index cb01dba..e6bab68 100644
+--- a/OpenOVR/Reimpl/BaseOverlay.h
++++ b/OpenOVR/Reimpl/BaseOverlay.h
+@@ -212,6 +212,9 @@ public:
+ 
+ 	/** Creates a new named overlay. All overlays start hidden and with default settings. */
+ 	vr::EVROverlayError CreateOverlay(const char* pchOverlayKey, const char* pchOverlayName, vr::VROverlayHandle_t* pOverlayHandle);
++	// OpenVR 2.x (IVROverlay_028), stubbed: no subview overlays
++	vr::EVROverlayError CreateSubviewOverlay(vr::VROverlayHandle_t, const char*, const char*, vr::VROverlayHandle_t*) { return vr::VROverlayError_RequestFailed; }
++	vr::EVROverlayError SetSubviewPosition(vr::VROverlayHandle_t, float, float) { return vr::VROverlayError_RequestFailed; }
+ 
+ 	/** Destroys the specified overlay. When an application calls VR_Shutdown all overlays created by that app are
+ 	 * automatically destroyed. */
+diff --git a/OpenOVR/Reimpl/BaseSystem.h b/OpenOVR/Reimpl/BaseSystem.h
+index 53ec201..945a82f 100644
+--- a/OpenOVR/Reimpl/BaseSystem.h
++++ b/OpenOVR/Reimpl/BaseSystem.h
+@@ -267,6 +267,18 @@ public:
+ 	* This pose will always be older than the call to this function and should not be used to render the device.
+ 	uncbVREvent should be the size in bytes of the VREvent_t struct */
+ 	bool PollNextEventWithPose(vr::ETrackingUniverseOrigin eOrigin, vr::VREvent_t* pEvent, uint32_t uncbVREvent, vr::TrackedDevicePose_t* pTrackedDevicePose);
++	// OpenVR 2.x (IVRSystem_026), stubbed: no eye tracking or distortion sets here
++	vr::EVRInitError SetSDKVersion(uint32_t, uint32_t, uint32_t) { return vr::VRInitError_None; }
++	bool GetEyeTrackedFoveationCenterForProjection(const vr::HmdMatrix44_t*, vr::HmdVector2_t*) { return false; }
++	bool GetEyeTrackedFoveationCenter(vr::HmdVector2_t*, vr::HmdVector2_t*) { return false; }
++	bool PollNextEventWithPoseAndOverlays(vr::ETrackingUniverseOrigin eOrigin, vr::VREvent_t* pEvent, uint32_t uncbVREvent,
++	    vr::TrackedDevicePose_t* pTrackedDevicePose, vr::VROverlayHandle_t* pulOverlayHandle)
++	{
++		if (pulOverlayHandle)
++			*pulOverlayHandle = vr::k_ulOverlayHandleInvalid;
++		return PollNextEventWithPose(eOrigin, pEvent, uncbVREvent, pTrackedDevicePose);
++	}
++	bool ComputeDistortionSet(vr::EVREye, uint32_t, bool, uint32_t, const vr::DistortionCoordinate_t*, vr::DistortionCoordinate_t*) { return false; }
+ 
+ 	/** returns the name of an EVREvent enum value */
+ 	const char* GetEventTypeNameFromEnum(vr::EVREventType eType);
+diff --git a/OpenOVR/Reimpl/CVRCompositor.cpp b/OpenOVR/Reimpl/CVRCompositor.cpp
+index dc0cab9..cf67eb4 100644
+--- a/OpenOVR/Reimpl/CVRCompositor.cpp
++++ b/OpenOVR/Reimpl/CVRCompositor.cpp
+@@ -20,6 +20,7 @@ GEN_INTERFACE("Compositor", "024")
+ GEN_INTERFACE("Compositor", "026")
+ GEN_INTERFACE("Compositor", "027")
+ GEN_INTERFACE("Compositor", "028")
++GEN_INTERFACE("Compositor", "029")
+ 
+ #include "generated/GVRCompositor.gen.h"
+ 
+diff --git a/OpenOVR/Reimpl/CVRInput.cpp b/OpenOVR/Reimpl/CVRInput.cpp
+index 816dd78..9ae1e9d 100644
+--- a/OpenOVR/Reimpl/CVRInput.cpp
++++ b/OpenOVR/Reimpl/CVRInput.cpp
+@@ -8,6 +8,7 @@ GEN_INTERFACE("Input", "006")
+ GEN_INTERFACE("Input", "007")
+ // version 8 and 9 are skipped
+ GEN_INTERFACE("Input", "010")
++GEN_INTERFACE("Input", "011")
+ 
+ #include "generated/GVRInput.gen.h"
+ 
+diff --git a/OpenOVR/Reimpl/CVROverlay.cpp b/OpenOVR/Reimpl/CVROverlay.cpp
+index faeea0e..49414b4 100644
+--- a/OpenOVR/Reimpl/CVROverlay.cpp
++++ b/OpenOVR/Reimpl/CVROverlay.cpp
+@@ -21,6 +21,7 @@ GEN_INTERFACE("Overlay", "024")
+ GEN_INTERFACE("Overlay", "025")
+ GEN_INTERFACE("Overlay", "026")
+ GEN_INTERFACE("Overlay", "027")
++GEN_INTERFACE("Overlay", "028")
+ 
+ #include "generated/GVROverlay.gen.h"
+ 
+diff --git a/OpenOVR/Reimpl/CVRSystem.cpp b/OpenOVR/Reimpl/CVRSystem.cpp
+index d0e0a5d..f425085 100644
+--- a/OpenOVR/Reimpl/CVRSystem.cpp
++++ b/OpenOVR/Reimpl/CVRSystem.cpp
+@@ -15,6 +15,7 @@ GEN_INTERFACE("System", "019")
+ GEN_INTERFACE("System", "020")
+ GEN_INTERFACE("System", "021")
+ GEN_INTERFACE("System", "022")
++GEN_INTERFACE("System", "026")
+ 
+ #include "generated/GVRSystem.gen.h"
+ 
+diff --git a/OpenOVR/logging.cpp b/OpenOVR/logging.cpp
+index 11b88c5..30424e8 100644
+--- a/OpenOVR/logging.cpp
++++ b/OpenOVR/logging.cpp
+@@ -1,3 +1,6 @@
++#ifdef _WIN32
++#include <io.h>
++#endif
+ #include "stdafx.h"
+ 
+ #include "Misc/backtrace.h"
+@@ -135,7 +138,13 @@ std::string GetEnv(const std::string& var)
+ #ifdef ANDROID
+ #include <android/log.h>
+ #else
+-static std::ofstream stream;
++// Built on first use: other files static initialisers log before this one runs under MinGW (MSVC orders them differently)
++static std::ofstream& oovr_log_stream()
++{
++	static std::ofstream s;
++	return s;
++}
++#define stream oovr_log_stream()
+ 
+ #ifdef __GLIBCXX__
+ #include <ext/stdio_filebuf.h>
+@@ -240,7 +249,11 @@ void oovr_flush_safe()
+ 
+ 	int r;
+ 	do {
++#ifdef _WIN32
++		r = _commit(fd);
++#else
+ 		r = fsync(fd);
++#endif
+ 	} while (r < 0 && errno == EINTR);
+ #endif
+ }
+diff --git a/scripts/split_headers.py b/scripts/split_headers.py
+index 3fc98b3..9664a11 100644
+--- a/scripts/split_headers.py
++++ b/scripts/split_headers.py
+@@ -45,6 +45,7 @@ versions = [
+     "1.16.8",
+     "1.23.7",
+     "2.5.1",
++    "2.15.6",
+ ]
+ 
+ driver_versions = [
+@@ -229,6 +230,24 @@ def write_interface(target: str, result: str, usingiface: bool, interface_checke
+         outfile.write(result.encode())
+ 
+ 
++# MinGW builds (OOVR_MSVC_AGGREGATE_RETURNS=1): MinGW GCC passes a method's hidden struct-return pointer before `this`,
++# MSVC after it, so a struct-returning method is declared with an explicit return pointer, as Wine's widl does
++# (WIDL_EXPLICIT_AGGREGATE_RETURNS). Application interfaces only: drivers call the other way.
++aggregate_returns = os.environ.get("OOVR_MSVC_AGGREGATE_RETURNS") == "1"
++aggregate_types = set()
++
++
++def explicit_aggregate_return(line: str) -> str:
++    if not aggregate_returns:
++        return line
++    m = re.match(r"(\s*virtual\s+)(\w+)\s+(\w+)\s*\(\s*(.*)$", line, re.S)
++    if not m or m.group(2) not in aggregate_types:
++        return line
++    pre, typ, name, rest = m.groups()
++    sep = " " if rest.startswith(")") else ", "
++    return f"{pre}{typ} *{name}( {typ} *_ret{sep}{rest}"
++
++
+ def split_header(headerfile: TextIO, interface_checker: Callable = None,
+                  out_dir: Path = output_dir / "interfaces", imports=None):
+     """
+@@ -286,7 +305,7 @@ def split_header(headerfile: TextIO, interface_checker: Callable = None,
+         if niceline == "namespace vr":
+             outbuff.write("%%REPLACE%NS%START%%\n")
+         else:
+-            outbuff.write(line)
++            outbuff.write(explicit_aggregate_return(line))
+ 
+     # Write the last interface
+     if targetfile:
+@@ -315,8 +334,12 @@ for version in versions[::-1]:
+     print("Reading: " + feed)
+ 
+     with open(input_dir / feed, "r") as headerfile:
++        aggregate_types.update(re.findall(r"^(?:typedef )?struct (\w+)", headerfile.read(), re.M))
++        headerfile.seek(0)
+         appapi_imports = split_header(headerfile)
+ 
++aggregate_returns = False  # driver interfaces keep their declarations
++
+ # Does the same thing with driver versions.
+ for version in driver_versions[::-1]:
+     feed = "openvr-%s-driver.h" % version
+diff --git a/scripts/stubs/codegen.py b/scripts/stubs/codegen.py
+index 39cebd4..0397d0a 100644
+--- a/scripts/stubs/codegen.py
++++ b/scripts/stubs/codegen.py
+@@ -104,10 +104,17 @@ std::shared_ptr<{cls}> GetCreate{getter_name}() {{
+             if namespace in f.return_type:
+                 return_str += f" ({f.return_type})"
+ 
++            call = f"\t{return_str} base->{f.name}({nargs});\n"
++            if f.args and f.args[0].name == "_ret":
++                # An explicit struct return (see split_headers.py): the base returns the struct by value
++                call = (f"\tauto _r = base->{f.name}({nargs.split(', ', 1)[1] if ', ' in nargs else ''});\n"
++                        "\tstatic_assert(sizeof(_r) == sizeof(*_ret), \"aggregate return size\");\n"
++                        "\tmemcpy((void*)_ret, &_r, sizeof(*_ret));\n\treturn _ret;\n")
++
+             fi.write(f"{f.return_type} {cname}::{f.name}({f.args_str()}) {{\n"
+                      "\tif (oovr_global_configuration.LogAllOpenVRCalls())\n"
+                      f"\t\tOOVR_LOG(\"Entered function (from interface {ver.namespace()})\");\n"
+-                     f"\t{return_str} base->{f.name}({nargs});\n}}\n")
++                     f"{call}}}\n")
+ 
+         # Generate the fntable
+         _build_fntable(fi, ver)
+diff --git a/mingw.cmake b/mingw.cmake
+new file mode 100644
+index 0000000..bb259c9
+--- /dev/null
++++ b/mingw.cmake
+@@ -0,0 +1,8 @@
++set(CMAKE_SYSTEM_NAME Windows)
++set(CMAKE_SYSTEM_PROCESSOR x86_64)
++set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)
++set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++)
++set(CMAKE_RC_COMPILER x86_64-w64-mingw32-windres)
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+diff --git a/mingw-shim/atlbase.h b/mingw-shim/atlbase.h
+new file mode 100644
+index 0000000..6f70f09
+--- /dev/null
++++ b/mingw-shim/atlbase.h
+@@ -0,0 +1 @@
++#pragma once

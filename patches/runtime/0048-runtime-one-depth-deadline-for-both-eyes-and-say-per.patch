@@ -1,0 +1,94 @@
+From 9862528a25edaadea7f1ab984c4a714d0354bb2f Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 03:31:00 +0000
+Subject: [PATCH 48/48] runtime: one depth deadline for both eyes, and say per
+ eye why a grid was not made
+
+The depth copy runs on the GPU after the app's frame, so on a heavy scene it lands several ms after the encoder
+asks. 4 ms per eye dropped the left eye's grid on 15-57 of 90 frames a second on the comparison scene, and the
+client, which needs both eyes fresh, turned depth on and off several times a second. Both eyes now share one
+12 ms deadline, and the once-a-second line counts per eye: no source, late, refused.
+---
+ runtime/src/StreamingServer.cpp | 29 +++++++++++++++++++++--------
+ runtime/src/StreamingServer.h   |  4 ++++
+ 2 files changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index 07e7fe3..3016ce1 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -3420,9 +3420,12 @@ void StreamingServer::SendRenderPosePacket(const EncodedVideoFrame& frame)
+ void StreamingServer::ReduceFrameDepth(const FrameSource& source, uint32_t grid,
+                                        EncodedVideoFrame& out)
+ {
+-    // The depth copy was submitted at the depth image's release, before the colour image's, so it
+-    // is normally done by now; never hold the encoder for long on it.
+-    constexpr uint64_t kDepthWaitNs = 4'000'000;
++    // The depth copy is submitted at the depth image's release, but it runs on the GPU after the app's frame, so on
++    // a heavy scene it lands several ms after the encoder gets here. One deadline for both eyes (one copy usually
++    // holds both layers): the first eye waits for it, the second finds it done. 4 ms per eye dropped the left eye's
++    // grid on 15-57 of 90 frames a second on the comparison scene (2026-10-29), and the client, which needs both
++    // eyes fresh, flipped depth on and off several times a second.
++    constexpr int64_t kDepthWaitNs = 12'000'000;
+     constexpr float kNearM = 0.25f; // DepthGridHeader::nearMm default
+     const int64_t startNs = SteadyClockNowNs();
+     bool any = false;
+@@ -3430,15 +3433,18 @@ void StreamingServer::ReduceFrameDepth(const FrameSource& source, uint32_t grid,
+     {
+         const FrameDepthSource& depth = source.depth[eye];
+         oxrsys::depthgrid::RowsView rows;
+-        if (depth.IsValid() && depth.rows.waitRows(kDepthWaitNs, rows) &&
+-            oxrsys::depthgrid::Reduce(rows, depth.rectX, depth.rectY, depth.rectWidth,
+-                                      depth.rectHeight, depth.range, grid, kNearM, out.depth[eye]))
++        const bool valid = depth.IsValid();
++        const int64_t leftNs = std::max<int64_t>(0, startNs + kDepthWaitNs - SteadyClockNowNs());
++        const bool ready = valid && depth.rows.waitRows(static_cast<uint64_t>(leftNs), rows);
++        if (ready && oxrsys::depthgrid::Reduce(rows, depth.rectX, depth.rectY, depth.rectWidth,
++                                               depth.rectHeight, depth.range, grid, kNearM, out.depth[eye]))
+         {
+             any = true;
+         }
+         else
+         {
+             out.depth[eye].clear();
++            ++(!valid ? depthEyeNoSource_ : !ready ? depthEyeLate_ : depthEyeRefused_)[eye];
+         }
+     }
+     out.depthGrid = any ? grid : 0;
+@@ -3457,9 +3463,16 @@ void StreamingServer::ReduceFrameDepth(const FrameSource& source, uint32_t grid,
+     }
+     if (nowNs - depthGridLogNs_ >= 1'000'000'000)
+     {
+-        spdlog::info("StreamingServer: depth grid {}x{} frames={} misses={} reduce avg={:.2f}ms max={:.2f}ms",
++        spdlog::info("StreamingServer: depth grid {}x{} frames={} misses={} reduce avg={:.2f}ms max={:.2f}ms "
++                     "eye-misses left/right: no-source {}/{} late {}/{} refused {}/{}",
+                      grid, grid, depthGridFrames_, depthGridMisses_,
+-                     depthGridFrames_ ? depthGridMsSum_ / depthGridFrames_ : 0.0, depthGridMsMax_);
++                     depthGridFrames_ ? depthGridMsSum_ / depthGridFrames_ : 0.0, depthGridMsMax_,
++                     depthEyeNoSource_[0], depthEyeNoSource_[1], depthEyeLate_[0], depthEyeLate_[1],
++                     depthEyeRefused_[0], depthEyeRefused_[1]);
++        for (int e = 0; e < 2; ++e)
++        {
++            depthEyeNoSource_[e] = depthEyeLate_[e] = depthEyeRefused_[e] = 0;
++        }
+         depthGridFrames_ = 0;
+         depthGridMisses_ = 0;
+         depthGridMsSum_ = 0.0;
+diff --git a/runtime/src/StreamingServer.h b/runtime/src/StreamingServer.h
+index 45f4409..bc886f2 100644
+--- a/runtime/src/StreamingServer.h
++++ b/runtime/src/StreamingServer.h
+@@ -262,6 +262,10 @@ class StreamingServer
+     // Depth grid telemetry, logged once a second by the encode thread.
+     uint32_t depthGridFrames_ = 0;
+     uint32_t depthGridMisses_ = 0;
++    // Per eye, why a grid was not made: no depth source, the copy not done in time, the reduce refused it.
++    uint32_t depthEyeNoSource_[2] = {0, 0};
++    uint32_t depthEyeLate_[2] = {0, 0};
++    uint32_t depthEyeRefused_[2] = {0, 0};
+     double depthGridMsSum_ = 0.0;
+     double depthGridMsMax_ = 0.0;
+     int64_t depthGridLogNs_ = 0;
+-- 
+2.43.0
+

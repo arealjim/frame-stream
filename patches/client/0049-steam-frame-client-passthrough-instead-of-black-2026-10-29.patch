@@ -1,0 +1,103 @@
+From baad9c881eb5fa6b62908447f800c0cfb379208a Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 16:11:55 +0000
+Subject: [PATCH] steam-frame client: show the passthrough instead of black
+ when no real picture arrives
+
+When no real picture arrives for FRAME_CLIENT_BLACK_PASSTHROUGH_S seconds
+(default 2, 0 turns it off) - no frame yet, the app stopped sending, or only
+black frames (a sparse 24x24 grid of luma or colour never leaves black) - the
+client clears its layer transparent and submits it with environment alpha
+blend, so SteamVR shows the passthrough instead of a black screen. Without
+alpha blend it submits no layer. The first real frame brings the picture
+back. Both transitions are logged ("black passthrough: ...").
+
+Worn check on a Steam Frame: the app stopped for 8 s, passthrough within
+2.0 s, the picture back on resume.
+---
+ clients/steam-frame/src/main.cpp | 41 ++++++++++++++++++++++++++++++--
+ 1 file changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 6d06d0c..bcccad1 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -202,6 +202,23 @@ static uint32_t g_poseEpoch = 1;
+ // The displayed frame's own alpha-blend flag (review L7): set from the frame's FrameTiming when it is taken, kept
+ // across repaints of the same texture, so the layer blends the way THIS frame was composed.
+ static bool g_displayedAlpha = false;
++// Passthrough instead of black: a black screen in a headset is disorienting, the room is not. With no real picture for
++// FRAME_CLIENT_BLACK_PASSTHROUGH_S (default 2 s;
++// 0 = off): no frame yet, the app stopped sending, or only black frames arrive, the layer is cleared transparent and
++// blended over SteamVR's passthrough (environment ALPHA_BLEND). The first real frame brings the picture back.
++static bool g_ptFallback = false;
++// A decoded frame is black when a sparse grid of its luma (NV12) or colour (RGBA) never leaves black.
++static bool FrameIsBlack(const std::vector<uint8_t>& buf, int w, int h, bool nv12) {
++    if (w <= 0 || h <= 0) return true;
++    const size_t px = (size_t)w * h;
++    if (buf.size() < (nv12 ? px : px * 4)) return false;
++    for (int gy = 0; gy < 24; gy++) for (int gx = 0; gx < 24; gx++) {
++        const size_t i = (size_t)((gy * 2 + 1) * h / 48) * w + (size_t)((gx * 2 + 1) * w / 48);
++        if (nv12) { if (buf[i] > 24) return false; }   // limited-range black is 16, full-range 0
++        else if (buf[i * 4] > 10 || buf[i * 4 + 1] > 10 || buf[i * 4 + 2] > 10) return false;
++    }
++    return true;
++}
+ 
+ // ============================================================================
+ // OpenXR: instance + extension dump (the V0 deliverable)
+@@ -1296,6 +1313,7 @@ static bool RenderEye(App& app, uint32_t eye, uint32_t imageIndex)
+ 
+     VkClearValue clear = {};
+     clear.color = {{0.02f, 0.02f, 0.03f, 1.0f}};
++    if (g_ptFallback) clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}};   // nothing to show: transparent, the passthrough shows
+     VkRenderPassBeginInfo rpb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+     rpb.renderPass = app.renderPass;
+     rpb.framebuffer = sc.framebuffers[imageIndex];
+@@ -1304,7 +1322,7 @@ static bool RenderEye(App& app, uint32_t eye, uint32_t imageIndex)
+     rpb.pClearValues = &clear;
+     vkCmdBeginRenderPass(cmd, &rpb, VK_SUBPASS_CONTENTS_INLINE);
+ 
+-    if (app.videoImage != VK_NULL_HANDLE && app.descriptorWritten) {
++    if (app.videoImage != VK_NULL_HANDLE && app.descriptorWritten && !g_ptFallback) {
+         VkViewport vpst = {0, 0, (float)sc.width, (float)sc.height, 0.0f, 1.0f};
+         VkRect2D scst = {{0, 0}, {sc.width, sc.height}};
+         vkCmdSetViewport(cmd, 0, 1, &vpst);
+@@ -2005,6 +2023,25 @@ static void RenderFrame(App& app)
+                 g_displayedAlpha = frameTiming.alphaKnown ? frameTiming.alphaBlend : g_stream.AlphaBlend();
+                 alphaFrame = g_streamMode && g_alphaBlendSupported && g_displayedAlpha;
+             }
++            if (g_streamMode) {
++                static const double kBlackPtS = getenv("FRAME_CLIENT_BLACK_PASSTHROUGH_S") ? atof(getenv("FRAME_CLIENT_BLACK_PASSTHROUGH_S")) : 2.0;
++                static auto lastReal = std::chrono::steady_clock::now();   // from the session's start: no frame yet counts
++                static unsigned blackFrames = 0;
++                if (haveNew) {
++                    if (!FrameIsBlack(g_frameBuf, fw, fh, frameLayout == VideoDecoder::PixelLayout::NV12)) lastReal = std::chrono::steady_clock::now();
++                    else blackFrames++;
++                }
++                const double noPicture = MsSince(lastReal) / 1000.0;
++                const bool want = kBlackPtS > 0 && noPicture > kBlackPtS;
++                if (want != g_ptFallback) {
++                    g_ptFallback = want;
++                    if (want) LOG_INFO("black passthrough: no real picture for %.1f s (%u black frames since the last); showing the passthrough%s",
++                                       noPicture, blackFrames, g_alphaBlendSupported ? "" : " - NO alpha blend here, submitting no layer instead");
++                    else LOG_INFO("black passthrough: a real frame again; the picture is back");
++                    blackFrames = 0;
++                }
++                if (g_ptFallback && g_alphaBlendSupported) alphaFrame = true;
++            }
+             const bool frameNv12 = frameLayout == VideoDecoder::PixelLayout::NV12;
+             // Pose and foveation centre for the frame on screen, cached across repaints of the
+             // same texture. Matched by presentation time: the latest received metadata leads
+@@ -2302,7 +2339,7 @@ static void RenderFrame(App& app)
+                 layer.space = app.stageSpace;
+                 layer.viewCount = VIEW_COUNT;
+                 layer.views = projViews.data();
+-                submitLayer = acquired[0] && acquired[1];
++                submitLayer = acquired[0] && acquired[1] && !(g_ptFallback && !g_alphaBlendSupported);
+ 
+                 // Feed oxrsys's adaptive bitrate: the measured client pipeline, ~1/s.
+                 if (g_streamMode && submitLayer) {
+-- 
+2.43.0
+

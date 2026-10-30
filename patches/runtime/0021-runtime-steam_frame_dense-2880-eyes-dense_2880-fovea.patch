@@ -1,0 +1,92 @@
+From c8f73c4db98541a004685d2166065b7b6b40ac3b Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 09:58:59 +0000
+Subject: [PATCH 21/23] runtime: steam_frame_dense (2880 eyes) + dense_2880
+ foveation preset
+
+The Frame's lens magnifies the centre of view, so one render pixel per panel pixel
+(steam_frame_native, 2160) is under-sampled where the eye looks. steam_frame_dense renders
+2880x2880 eyes; dense_2880 keeps the foveation centre at the same pixel count as
+medium_plus at 2160 (0.375x0.3333 of 2880 = 1080x960, edges 6x8) so the encoded frame
+is 2816x1216 (+2 % pixels, encode total 9.7 ms at 90 Hz) while every centre pixel is
+one 2880-render pixel. The client must open a 2880 swapchain
+(FRAME_CLIENT_SWAPCHAIN_SCALE=1.6667). Measured 2026-10-19 on the rendered-eye dump:
+the card's 4-texel band reads 1.00 (0.83 at 2160), 3-texel 0.52 (0.41), 2-texel 0.58
+(0.49), with the card itself now 1.17 px per texel instead of 0.88.
+
+---
+ runtime/src/Config.cpp          | 14 ++++++++++++--
+ runtime/src/StreamingServer.cpp | 11 ++++++++++-
+ 2 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/src/Config.cpp b/runtime/src/Config.cpp
+index 0b2a377..956f093 100644
+--- a/runtime/src/Config.cpp
++++ b/runtime/src/Config.cpp
+@@ -358,7 +358,7 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             else if (key == "render_device")
+             {
+                 value = ParseString(value);
+-                if (value == "quest2" || value == "quest3" || value == "avp" || value == "steam_frame" || value == "steam_frame_native")
++                if (value == "quest2" || value == "quest3" || value == "avp" || value == "steam_frame" || value == "steam_frame_native" || value == "steam_frame_dense")
+                 {
+                     values.renderDevice = value;
+                 }
+@@ -477,7 +477,7 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
+             {
+                 value = ParseString(value);
+                 if (value == "off" || value == "light" || value == "medium" ||
+-                    value == "medium_plus" || value == "high")
++                    value == "medium_plus" || value == "dense_2880" || value == "high")
+                 {
+                     values.foveatedEncodingPreset = value;
+                 }
+@@ -747,6 +747,16 @@ EyeResolution DeviceBaseEyeResolution(const std::string& device)
+         // "raw ideal render target scale 0.64", vrcompositor log 2026-10-18).
+         return {1728, 1728};
+     }
++    if (device == "steam_frame_dense")
++    {
++        // 1.333x the Frame's panel: the lens magnifies the centre of view, so one render pixel per
++        // display pixel (steam_frame_native) is under-sampled where the eye looks. Pair it with the
++        // dense_2880 foveation preset, whose centre keeps the same pixel count as medium_plus at
++        // 2160 (the encoded frame stays 2816x1216, inside the 90 Hz budget) while the centre is
++        // one encoded pixel per RENDER pixel at 2880. The client must open a 2880 swapchain
++        // (FRAME_CLIENT_SWAPCHAIN_SCALE=1.6667) or the gain is resampled away. (2026-10-19)
++        return {2880, 2880};
++    }
+     if (device == "steam_frame_native")
+     {
+         // The Frame's panel, one render pixel per display pixel (encode cost at 72 Hz needs a
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index ded32e5..fabedbc 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -90,7 +90,7 @@ oxr::protocol::FoveationPreset ParseFoveationPreset(const std::string& value)
+     }
+     // medium_plus travels as Medium: clients read the centre/edge parameters the
+     // announce carries, and need only a non-Off preset.
+-    if (value == "medium" || value == "medium_plus")
++    if (value == "medium" || value == "medium_plus" || value == "dense_2880")
+     {
+         return oxr::protocol::FoveationPreset::Medium;
+     }
+@@ -111,6 +111,15 @@ oxr::protocol::FoveationPresetParameters FoveationParametersForConfig(const std:
+     {
+         return {0.50f, 0.45f, 0.0f, 0.0f, 4.0f, 5.0f};
+     }
++    // dense_2880: for a 2880x2880 eye (render_device steam_frame_dense). Centre 0.375x0.3333 is
++    // 1080x960 render pixels, the same count medium_plus keeps at 2160, so the encoded frame is
++    // 2816x1216 (+2 % pixels) and the encode cost is unchanged, while every centre pixel is one
++    // 2880-render pixel instead of one 2160 pixel. Edges 6x8 are coarser than medium_plus at the
++    // periphery (480 and 360 pixel-equivalents across against 540 and 432). (2026-10-19)
++    if (value == "dense_2880")
++    {
++        return {0.375f, 0.3333f, 0.0f, 0.0f, 6.0f, 8.0f};
++    }
+     return oxr::protocol::ParametersForPreset(ParseFoveationPreset(value));
+ }
+ 
+-- 
+2.43.0
+

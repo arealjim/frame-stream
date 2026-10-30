@@ -1,0 +1,186 @@
+From f415144cd18c3b4a6dce0530c81083275cf33b9e Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 19:50:11 +0000
+Subject: [PATCH] steam-frame client: passthrough alpha, the Quest way.
+ Advertise CLIENT_CAPABILITY_MIXED_REALITY_PASSTHROUGH, read
+ VIDEO_FLAG_ALPHA_BLEND per packet, key black to transparent in the shader,
+ submit the layer with source alpha and environment ALPHA_BLEND when the frame
+ is flagged; opaque frames unchanged; FRAME_CLIENT_PASSTHROUGH=0 withholds the
+ capability
+
+---
+ clients/steam-frame/shaders/sample.frag       |  6 ++++-
+ clients/steam-frame/src/NetworkReceiver.cpp   |  1 +
+ clients/steam-frame/src/NetworkReceiver.h     |  3 +++
+ clients/steam-frame/src/main.cpp              | 22 ++++++++++++++++++-
+ clients/steam-frame/src/stream_connection.cpp |  6 +++++
+ clients/steam-frame/src/stream_connection.h   |  2 ++
+ 6 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/clients/steam-frame/shaders/sample.frag b/clients/steam-frame/shaders/sample.frag
+index 6b5f492..c33d570 100644
+--- a/clients/steam-frame/shaders/sample.frag
++++ b/clients/steam-frame/shaders/sample.frag
+@@ -18,6 +18,7 @@ layout(push_constant) uniform Push {
+     int  foveated;       // 0 = plain SBS sampling
+     int  nv12;           // 1 = binding 0 is luma, binding 1 chroma; convert here
+     int  fullRange;      // 1 = the stream signals full range (encoder_full_range): no 16-235 scaling
++    int  alphaKey;       // 1 = passthrough frame: alpha from a black key, as oxrsys's Quest client does
+ } pc;
+ 
+ // Axis-aligned foveated-encoding forward map (matches oxrsys / ALVR AADT).
+@@ -92,5 +93,8 @@ void main() {
+     }
+     corrected = clamp(corrected, vec2(0.0), vec2(1.0));
+     vec2 sourceUv = mix(pc.sourceMin, pc.sourceMax, corrected);
+-    outColor = vec4(sampleVideo(sourceUv), 1.0);
++    vec3 c = sampleVideo(sourceUv);
++    float a = 1.0;
++    if (pc.alphaKey != 0) a = smoothstep(0.02, 0.10, max(c.r, max(c.g, c.b)));   // black = the app's transparent clear
++    outColor = vec4(c, a);
+ }
+diff --git a/clients/steam-frame/src/NetworkReceiver.cpp b/clients/steam-frame/src/NetworkReceiver.cpp
+index 7293e65..0fa2acf 100644
+--- a/clients/steam-frame/src/NetworkReceiver.cpp
++++ b/clients/steam-frame/src/NetworkReceiver.cpp
+@@ -391,6 +391,7 @@ void NetworkReceiver::ReceiveThread(OnNalUnitCallback callback)
+             continue;
+         }
+ 
++        alphaBlend_.store((header->flags & protocol::VIDEO_FLAG_ALPHA_BLEND) != 0);
+         assembler_.SetInterleaved(fecInterleaved_.load());
+         assembler_.ProcessPacket(*header, payload, payloadSize);
+     }
+diff --git a/clients/steam-frame/src/NetworkReceiver.h b/clients/steam-frame/src/NetworkReceiver.h
+index 7bdfe6a..8adbc5f 100644
+--- a/clients/steam-frame/src/NetworkReceiver.h
++++ b/clients/steam-frame/src/NetworkReceiver.h
+@@ -59,6 +59,8 @@ class NetworkReceiver
+     // CLIENT_CAPABILITY_FEC_INTERLEAVED in our ClientConnect. Atomic because it is set from
+     // the connection thread and read on the video receive thread.
+     void SetFecInterleaved(bool interleaved) { fecInterleaved_.store(interleaved); }
++    // The latest video packet carried VIDEO_FLAG_ALPHA_BLEND: the app submitted an alpha-blend frame (passthrough).
++    bool GetAlphaBlend() const { return alphaBlend_.load(); }
+ 
+     void Stop();
+ 
+@@ -108,6 +110,7 @@ class NetworkReceiver
+ 
+     // Set from SERVER_FEATURE_FEC_INTERLEAVED in the announce; selects the FEC group layout.
+     std::atomic<bool> fecInterleaved_{false};
++    std::atomic<bool> alphaBlend_{false};
+     int videoSocket_ = -1;
+     // Return-path hole punch: a datagram from the video socket to <server>:videoPort makes the
+     // server's video/pose packets replies to a client-initiated flow, which stateful firewalls
+diff --git a/clients/steam-frame/src/main.cpp b/clients/steam-frame/src/main.cpp
+index 747b734..76b58ea 100644
+--- a/clients/steam-frame/src/main.cpp
++++ b/clients/steam-frame/src/main.cpp
+@@ -145,6 +145,8 @@ struct App {
+     bool descriptorWritten = false;
+ };
+ 
++static bool g_alphaBlendSupported = false;   // the runtime enumerates XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
++
+ struct PushConstants {
+     float sourceMin[2];
+     float sourceMax[2];
+@@ -155,6 +157,7 @@ struct PushConstants {
+     int32_t foveated;
+     int32_t nv12;
+     int32_t fullRange;
++    int32_t alphaKey;    // 1 = passthrough frame: alpha from a black key (smoothstep 0.02..0.10 of max(rgb)), like oxrsys's Quest client
+ };
+ 
+ static VideoDecoder g_decoder;
+@@ -261,6 +264,14 @@ static bool GetSystem(App& app)
+     XrSystemGetInfo gi = {XR_TYPE_SYSTEM_GET_INFO};
+     gi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+     XR_CHECK(xrGetSystem(app.instance, &gi, &app.systemId));
++    {
++        uint32_t n = 0;
++        xrEnumerateEnvironmentBlendModes(app.instance, app.systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &n, nullptr);
++        std::vector<XrEnvironmentBlendMode> modes(n);
++        if (n) xrEnumerateEnvironmentBlendModes(app.instance, app.systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, n, &n, modes.data());
++        for (uint32_t i = 0; i < n; i++) if (modes[i] == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) g_alphaBlendSupported = true;
++        LOG_INFO("environment blend modes: %u, alpha blend %s", n, g_alphaBlendSupported ? "supported" : "NOT supported");
++    }
+ 
+     uint32_t count = 0;
+     XR_CHECK(xrEnumerateViewConfigurationViews(app.instance, app.systemId,
+@@ -1090,6 +1101,7 @@ static bool RenderEye(App& app, uint32_t eye, uint32_t imageIndex)
+         pc.foveated = (g_streamMode && fv.enabled) ? 1 : 0;
+         pc.nv12 = app.videoNv12 ? 1 : 0;
+         pc.fullRange = app.videoFullRange ? 1 : 0;
++        pc.alphaKey = (g_streamMode && g_alphaBlendSupported && g_stream.AlphaBlend()) ? 1 : 0;
+         pc.centerSize[0] = fv.centerSize[0]; pc.centerSize[1] = fv.centerSize[1];
+         pc.centerShift[0] = fv.centerShift[0]; pc.centerShift[1] = fv.centerShift[1];
+         pc.edgeRatio[0] = fv.edgeRatio[0]; pc.edgeRatio[1] = fv.edgeRatio[1];
+@@ -1317,6 +1329,13 @@ static void RenderFrame(App& app)
+         {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+     XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+     bool submitLayer = false;
++    // Passthrough (2026-10-19): a server frame flagged alpha-blend is submitted with source alpha over the
++    // headset's passthrough; the shader keys black to transparent. Opaque frames are unchanged.
++    const bool alphaFrame = g_streamMode && g_alphaBlendSupported && g_stream.AlphaBlend();
++    {
++        static bool alphaLogged = false;
++        if (alphaFrame && !alphaLogged) { alphaLogged = true; LOG_INFO("passthrough: first alpha-blend frame; layer blends source alpha (black key), environment ALPHA_BLEND"); }
++    }
+ 
+     if (g_streamMode && !fs.shouldRender) {
+         // The runtime is hiding us (SteamVR: headset idle or not on a head) but the
+@@ -1773,6 +1792,7 @@ static void RenderFrame(App& app)
+                     double ms = MsSince(compositorT0);
+                     g_rt.eyes += ms; if (ms > g_rt.eyesMax) g_rt.eyesMax = ms;
+                 }
++                layer.layerFlags = alphaFrame ? (XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) : 0;
+                 layer.space = app.stageSpace;
+                 layer.viewCount = VIEW_COUNT;
+                 layer.views = projViews.data();
+@@ -1826,7 +1846,7 @@ static void RenderFrame(App& app)
+     const XrCompositionLayerBaseHeader* layers[] = {(XrCompositionLayerBaseHeader*)&layer};
+     XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
+     ei.displayTime = fs.predictedDisplayTime;
+-    ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
++    ei.environmentBlendMode = alphaFrame ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+     ei.layerCount = submitLayer ? 1 : 0;
+     ei.layers = submitLayer ? layers : nullptr;
+     if (cmdOpen) { EndFrameCommands(app); cmdOpen = false; }   // an upload with nothing to show
+diff --git a/clients/steam-frame/src/stream_connection.cpp b/clients/steam-frame/src/stream_connection.cpp
+index bf7e551..e06921a 100644
+--- a/clients/steam-frame/src/stream_connection.cpp
++++ b/clients/steam-frame/src/stream_connection.cpp
+@@ -171,6 +171,10 @@ bool StreamConnection::Connect(VideoDecoder* decoder, int timeoutMs)
+     cc.clientCapabilities = protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING |
+                             protocol::CLIENT_CAPABILITY_FOVEATION_CENTER |
+                             protocol::CLIENT_CAPABILITY_FEC_INTERLEAVED;
++    // Passthrough (2026-10-19): tell the server we take alpha-blend frames (it flags them VIDEO_FLAG_ALPHA_BLEND and
++    // composes the app over black); FRAME_CLIENT_PASSTHROUGH=0 withholds the capability.
++    if (!(getenv("FRAME_CLIENT_PASSTHROUGH") && atoi(getenv("FRAME_CLIENT_PASSTHROUGH")) == 0))
++        cc.clientCapabilities |= protocol::CLIENT_CAPABILITY_MIXED_REALITY_PASSTHROUGH;
+     strncpy(cc.deviceName, "FrameClient", sizeof(cc.deviceName) - 1);
+     lastConnect_ = cc;
+     if (!SendClientConnect(cc, 1)) return false;
+@@ -310,3 +314,5 @@ void StreamConnection::Disconnect()
+     if (tracker_) tracker_->Disconnect();
+     if (controlSocket_ >= 0) { close(controlSocket_); controlSocket_ = -1; }
+ }
++
++bool StreamConnection::AlphaBlend() const { return net_ && net_->GetAlphaBlend(); }
+diff --git a/clients/steam-frame/src/stream_connection.h b/clients/steam-frame/src/stream_connection.h
+index 5f1f8d5..58429a1 100644
+--- a/clients/steam-frame/src/stream_connection.h
++++ b/clients/steam-frame/src/stream_connection.h
+@@ -41,6 +41,8 @@ class StreamConnection {
+     // Non-const: also refreshes the foveation centre to the value the server warped this
+     // frame with, so FoveationParams() and the pose describe the same frame.
+     bool LatestRenderPose(float outPos[3], float outOri[4]);
++    // True while the server flags its frames alpha-blend (the app asked for passthrough): key black to transparent.
++    bool AlphaBlend() const;
+     // Pose and foveation centre matched to the frame with this presentation timestamp; the
+     // per-frame centre is only ever applied through this path. False when no match is held
+     // (startup, metadata loss) - the caller keeps the previous frame's state.
+-- 
+2.44.0
+
