@@ -554,7 +554,7 @@ here stay on the upstream commit they were made against (`b41d892`, before the m
 
 ## Licence
 
-Our own code (the engine projects, `frame-stream`, the headset scripts, the tools, the `wine/` scripts) is MIT. The patches modify OXRSys
+`LICENSE` is MIT; `NOTICE` lists the files under other licences. Our own code (the engine projects, `frame-stream`, the headset scripts, the tools, the `wine/` scripts) is MIT. The patches modify OXRSys
 and carry the licence of the file they change: MPL-2.0 for the runtime and the shared streaming code, BSL-1.0 for the
 Steam Frame client files that came with Nick Burns's pull request #30 (main.cpp, video_decoder, stream_connection,
 xr_input, tests), which `patches/client` modifies. The Unreal plugin FrameXR is adapted from

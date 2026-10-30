@@ -14,13 +14,3 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-The files under patches/ modify OXRSys (https://github.com/demonixis/oxrsys) and carry the licence of the files they
-change: the Mozilla Public License 2.0 for the runtime and the shared streaming code, the Boost Software License 1.0
-for the Steam Frame client files that came with Nick Burns's OXRSys pull request #30 (main.cpp, video_decoder.*,
-stream_connection.*, xr_input.*, tests/); the files under patches/client modify that client and keep those licences. Each file states its own licence in an SPDX header. engines/unreal/Plugins/FrameXR is adapted from tether-unreal (MIT,
-see its LICENSE-tether.txt). In wine/, winemac-dxmt_compat.c is compiled into Wine and is LGPL-2.1-or-later like
-Wine, as is kernel32-isbadptr-guard-page.patch, which modifies Wine itself; opencomposite-mingw.patch modifies OpenComposite (https://gitlab.com/znixian/OpenOVR) and is GPL-3.0 like
-OpenComposite; the openvr_api.dll it builds is GPL-3.0 too. In wine/uevr/, dxmt-desktop-window.patch modifies DXMT
-(https://github.com/3Shain/dxmt) and is LGPL-2.1-or-later like DXMT. UEVR itself is not included: it is praydog's,
-all rights reserved; download it from his release.
