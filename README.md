@@ -205,7 +205,7 @@ These are open. Pick one, open an issue saying you are on it, and bring numbers.
 |---|---|---|
 | 120 Hz | an opt-in: `frame-stream up --rate 120` (back with `--rate 90`); about 39 ms against 50 at 90 on the stand, 0.05 % reprojected over ten minutes. One short worn run; heavy scenes need the Mac's GPU frame near 6 ms, and the 50 Mbit/s cap gives each frame three quarters of 90's budget (`--bitrate 67` restores it) | `bin/frame-stream` (`--rate`), `frame-stream bench --rate 120` |
 | Head translation | an opt-in: `frame-stream up --depth on`. The runtime sends the app's depth as a 64x64 grid per eye (patches 0047-0048), the client submits it as a depth layer (client 0047), and SteamVR moves the picture by it. One blind worn comparison, one person: with it on, "tracked a little better"; off-head it showed no added latency. That comparison ran before the Godot MSAA fix, when Godot's MSAA depth resolve failed every frame, so the depth it sent was never rendered: the comparison needs redoing. Godot's test project submits depth; Unity and Unreal depth submission is untested | `engines/godot/project.godot` (`openxr/submit_depth_buffer`), then Unity and Unreal |
-| Other headsets | the Mac side isn't Frame-specific: OXRSys already streams to Quest and Vision Pro, and our patches keep its protocol compatible, so Unreal via FrameXR and the free-Wine path should work there too. Untested: we have only run it on a Steam Frame. It should also enable the Galaxy XR, but we don't have one to test | "Other headsets" under Run, then an issue with what you saw |
+| Other headsets | the Mac side isn't Frame-specific: OXRSys already streams to Quest and Vision Pro, and our patches keep its protocol compatible, so Unreal via FrameXR and the free-Wine path should work there too. Untested: we have only run it on a Steam Frame. It should also enable the Galaxy XR, but we don't have one to test | a Quest 3: [QUEST.md](QUEST.md), one script; others: "Other headsets" under Run. Then an issue with what you saw |
 | Other Macs and routers | everything is measured on one M5 and two networks | `bin/frame-stream bench`, then an issue with its JSON line |
 | Godot on MoltenVK | Godot 4.7 on Vulkan occasionally loses the Mac's GPU ("Vulkan device lost") and quits, about one session in 70; the cause is not known. Start it again with `frame-stream up --app godot`, or run Godot on Metal instead (`FRAME_STREAM_GODOT_DRIVER=metal`, MSAA off), which has not shown it | `docs/troubleshooting.md` "Godot quits during a session"; then a repro and a Metal GPU trace of the hang |
 | Wine | more games: each one is a recipe (launch arguments, an OpenXR or OpenVR path, controller bindings). Try yours and add a row to `wine/README.md` "What has been tried" | `wine/README.md` |
@@ -429,6 +429,9 @@ The first run of each engine needs the Mac's firewall to let it in: `docs/troubl
 traps (72 Hz, "no server found", Unity's invisible dialogs, a wedged port).
 
 ### Other headsets (untested)
+
+**Have a Quest 3 or 3S?** [QUEST.md](QUEST.md) is a test anyone with an Apple Silicon Mac can run: one script
+(`quest/quest-test.sh`) sets up both sides, with no Android tools, and compares frame-stream with stock OXRSys.
 
 `frame-stream`, the doctor, the install script and game sound are Frame-only. On a Quest or a Vision Pro, run the
 patched runtime from `mac/` with OXRSys's own headset app (`clients/android-vr` for Quest, the visionOS client for

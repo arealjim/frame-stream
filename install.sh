@@ -14,8 +14,9 @@
 #   6. optional: game sound (BlackHole 2ch and sox)
 #   7. frame-stream doctor, which checks the whole setup and changes nothing
 #
-# Options: --mac (steps 1-4 and 6 only), --headset (step 5 only), --yes (answer yes to every question; Homebrew and
-# Xcode can still ask for your password), --check (report what is missing, change nothing).
+# Options: --mac (steps 1-4 and 6 only), --headset (step 5 only), --quest (steps 1-4 only, for a Meta Quest: QUEST.md),
+# --yes (answer yes to every question; Homebrew and Xcode can still ask for your password), --check (report what is
+# missing, change nothing).
 # Bash 3.2 (the one macOS ships): no associative arrays, no ${x,,}.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -24,10 +25,10 @@ BASE=b41d892137f2e4ac71ccca6b2ea472e74968d8ce   # OXRSys main when the runtime p
 GODOT_VER=4.7.2
 GODOT_ZIP=Godot_v${GODOT_VER}-stable_macos.universal.zip
 GODOT_SHA=c58a24e31d720be9d62f60cb5627c4e695fb72f21b0cfe1bc9ccaa9a3b3ba63e   # GitHub's digest for that zip
-mac=1; headset=1; yes=0; check=0
+mac=1; headset=1; quest=0; yes=0; check=0
 for a in "$@"; do case $a in
-  --mac) headset=0;; --headset) mac=0;; --yes|-y) yes=1;; --check) check=1;;
-  -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+  --mac) headset=0;; --headset) mac=0;; --quest) headset=0; quest=1;; --yes|-y) yes=1;; --check) check=1;;
+  -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
   *) echo "install: unknown option $a (try --help)"; exit 2;; esac; done
 
 b=$(tput bold 2>/dev/null || true); n=$(tput sgr0 2>/dev/null || true)
@@ -218,6 +219,13 @@ if [ "$headset" = 1 ]; then
         && ok "headset apps run at 90 Hz" || say "set 90 Hz later, with SteamVR running: ssh frame '~/.local/bin/frame-vrsettings set steamvr defaultPerAppRefreshRate float 90'"
     fi
   else say "skipped the rest of the headset step: no address yet. Run ./install.sh --headset when you have it."; fi
+fi
+
+# A Quest has no use for steps 6 and 7 (its app plays no game sound; the doctor checks a Frame): quest/quest-test.sh
+# takes over from here.
+if [ "$quest" = 1 ]; then
+  [ "$check" = 1 ] && { echo; echo "   $todo thing(s) missing."; exit $([ $todo = 0 ] && echo 0 || echo 1); }
+  echo; echo "${b}Mac side ready.${n} quest/quest-test.sh goes on from here (QUEST.md)."; exit 0
 fi
 
 # ---- 6. sound -------------------------------------------------------------------------------------------------
