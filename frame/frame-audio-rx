@@ -2,18 +2,26 @@
 # frame-audio-rx - the Mac's game audio into the headset: raw 48 kHz stereo s16le over UDP (default port 9950) into
 # PipeWire. Raw PCM is 1.5 Mbit/s, nothing next to the video, and costs no codec delay. Run as a user unit:
 #   frame-audio-rx start [mac-ip] [port] | stop | status
-# The Mac side is frame-audio-tx (BlackHole 2ch -> UDP). Latency: the pulse buffer (FRAME_AUDIO_LATENCY_MS, default
-# 60) + the UDP read.
+# The Mac side is frame-audio-tx (BlackHole 2ch -> UDP). Latency: the pulse queue, held near FRAME_AUDIO_LATENCY_MS
+# (default 100), + the UDP read. 100, not 60: the Mac's sender stalls 20-100 ms a few times a run before the wire
+# (q52 10-31: one stall of 47 ms emptied a 57 ms queue, the run's only hole), and the queue is the only cover.
 # Over Wi-Fi the headset's firewall drops anything it did not ask for (inbound deny on wlan0; usb0 is open), so with a
 # mac-ip the receiver says hello to the Mac's port every second from its own port, and the Mac sends from that same
 # port: the sound arrives as the reply to a conversation the headset started. No firewall rule is changed. With a
 # mac-ip, datagrams from any other address are dropped (usb0 has no firewall, so anyone on the tether could play).
-# ffmpeg plays straight into PipeWire's pulse server: a pipe into pw-play left about 10 one-millisecond holes a
-# second, heard as crackle.
+# One Python process reads the UDP and plays it into PipeWire's pulse server through libpulse-simple, so it can read
+# the stream's real queue and keep it level: the headset received 124-3544 ppm less than the Mac sent, varying (q70,
+# 2026-11-01: packet loss on the hotspot, first read as a 270 ppm clock drift), so any fixed buffer drains and runs
+# dry, a 9 ms hole each time, heard as crackle. Numbered packets are refilled where lost (below); what is left is
+# the two clocks' real drift. When the queue is
+# low the player repeats one frame in a packet, when high it drops one: at most one per 2 packets (~1740 ppm).
+# Until 2026-10-31 the player was ffmpeg, whose ~315 ms was a startup backlog draining at that rate, and a pipe into
+# pw-play left about 10 one-millisecond holes a second (measured 2026-10-31 under Half-Life: Alyx).
 port=${3:-9950}
 # Both arguments end up inside the receiver's Python source, so take only an IPv4 address and a port number.
 [ -z "${2:-}" ] || [[ "$2" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "frame-audio-rx: mac-ip must be an IPv4 address" >&2; exit 2; }
 [[ "$port" =~ ^[0-9]{1,5}$ ]] || { echo "frame-audio-rx: port must be a number" >&2; exit 2; }
+[[ "${FRAME_AUDIO_LATENCY_MS:-100}" =~ ^[0-9]{2,3}$ ]] || { echo "frame-audio-rx: FRAME_AUDIO_LATENCY_MS must be 10-999" >&2; exit 2; }
 # FRAME_AUDIO_BIND_TO=<unit>: stop with that unit, also when it exits by itself (a streamed game quit from the SteamVR
 # dashboard ends oxrsys-client, and the receiver played on, 2026-10-29). Bound only while the unit is active, because
 # BindsTo also starts what it binds to.
@@ -23,25 +31,107 @@ if [[ "${FRAME_AUDIO_BIND_TO:-}" =~ ^[A-Za-z0-9@._-]+\.service$ ]] && systemctl 
 fi
 case "$1" in
   start)
+    self=$(readlink -f "$0")
     systemd-run --user --unit=frame-audio-rx --collect -p Slice=session.slice "${bind[@]}" \
-      bash -c "python3 -uc '
-import socket,sys,threading,time
-s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,1<<20)
-s.bind((\"0.0.0.0\",$port)); mac=\"${2:-}\"
-def hello():
-    while mac:
-        try: s.sendto(b\"hello\",(mac,$port))
-        except OSError: pass
-        time.sleep(1)
-threading.Thread(target=hello,daemon=True).start()
-out=sys.stdout.buffer
-while True:
-    d,a=s.recvfrom(65536)
-    if mac and a[0]!=mac: continue
-    out.write(d); out.flush()
-' | ffmpeg -hide_banner -loglevel warning -probesize 32 -analyzeduration 0 -f s16le -ar 48000 -ac 2 -i pipe:0 \
-        -f pulse -buffer_duration ${FRAME_AUDIO_LATENCY_MS:-60} -name 'Mac game' -stream_name frame-audio-rx default" ;;
+      bash -c "awk 'f && /^PLAYER\$/ {exit} f; /^: <<.PLAYER.\$/ {f=1}' '$self' | python3 -u - '${2:-}' $port ${FRAME_AUDIO_LATENCY_MS:-100}" ;;
   stop) systemctl --user stop frame-audio-rx ;;
   status) systemctl --user status frame-audio-rx --no-pager | head -8 ;;
   *) echo "usage: frame-audio-rx start [mac-ip] [port] | stop | status"; exit 2 ;;
 esac
+exit
+# The player: bash reads this heredoc as data and never runs it; start hands it to python3.
+: <<'PLAYER'
+import ctypes, ctypes.util, socket, sys, threading, time
+mac, port, target_ms = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+B = 192   # bytes per ms: 48 kHz, 2 channels, 16 bit
+F = 4     # bytes per frame
+lib = ctypes.CDLL(ctypes.util.find_library('pulse-simple') or 'libpulse-simple.so.0')
+class Spec(ctypes.Structure): _fields_ = [('format', ctypes.c_int), ('rate', ctypes.c_uint32), ('channels', ctypes.c_uint8)]
+class Attr(ctypes.Structure): _fields_ = [(n, ctypes.c_uint32) for n in ('maxlength', 'tlength', 'prebuf', 'minreq', 'fragsize')]
+lib.pa_simple_new.restype = ctypes.c_void_p
+lib.pa_simple_write.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
+lib.pa_simple_get_latency.restype = ctypes.c_uint64
+lib.pa_simple_get_latency.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+err = ctypes.c_int()
+spec = Spec(3, 48000, 2)   # PA_SAMPLE_S16LE
+attr = Attr(0xffffffff, target_ms * B, 0xffffffff, 0xffffffff, 0xffffffff)
+pa = lib.pa_simple_new(None, b'Mac game', 1, None, b'frame-audio-rx', ctypes.byref(spec), None, ctypes.byref(attr), ctypes.byref(err))
+if not pa: sys.exit(f'frame-audio-rx: pulse connect failed ({err.value})')
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+s.bind(('0.0.0.0', port))
+def hello():
+    while mac:
+        try: s.sendto(b'hello', (mac, port))
+        except OSError: pass
+        time.sleep(1)
+threading.Thread(target=hello, daemon=True).start()
+# A reader thread empties the socket into buf, so nothing waits where the player cannot see it: pa_simple_write
+# blocks once pulse holds its tlength (pulse granted 45 of 60 ms on 10-31), and in q50 the stretch then piled up in
+# the socket until it overflowed (337 ms, four holes). The queue the player steers is buf + pulse's latency.
+buf, cv = bytearray(), threading.Condition()
+got = [0]   # bytes received, for the supply rate in the minute line: the Mac's clock against the headset's
+# A numbered datagram ("FAU1" + big-endian uint32, frame-audio-tx since 2026-11-01) lets a lost one be filled in its
+# own place: q70 found the hotspot losing up to 0.35 % of them, which unnumbered read as a slow clock and drained the
+# queue. A short gap is filled with the packet before it repeated (6 ms of near-sound, not a 6 ms hole and not a
+# drained queue); a late one already filled is dropped; a big jump (the sender restarted) just starts counting again.
+# A datagram without the header is played as it is (the old nc sender, FRAME_AUDIO_SEQ=0).
+lost, late = [0], [0]
+def reader():
+    last, prev = None, b''
+    while True:
+        d, a = s.recvfrom(65536)
+        if mac and a[0] != mac: continue
+        fill = b''
+        if len(d) > 8 and d[:4] == b'FAU1':
+            seq = int.from_bytes(d[4:8], 'big'); d = d[8:]
+            # A numbered payload is whole frames; one that is not is no packet of ours (in a loopback test the
+            # receiver's own 5-byte hello came back), and played it would shift every sample after it. An
+            # unnumbered stream is nc's continuous bytes, cut wherever its read fell, so it is played as it comes.
+            if len(d) % F: continue
+            gap = None if last is None else ((seq - last + (1 << 31)) & 0xffffffff) - (1 << 31)
+            if gap is not None and -50 < gap <= 0: late[0] += 1; continue
+            if gap is not None and 1 < gap <= 50:
+                fill = (prev or bytes(len(d))) * (gap - 1); lost[0] += gap - 1
+            last, prev = seq, d
+        with cv:
+            buf.extend(fill); buf.extend(d); got[0] += len(d)
+            # 2 s behind: catch up at once. Whole frames only: nc's raw chunks need not be, and an odd cut here would
+            # shift every sample after it (the player's own reads and the cut below are whole frames too).
+            if len(buf) > 2000 * B: del buf[:(len(buf) - target_ms * B) // F * F]
+            cv.notify()
+threading.Thread(target=reader, daemon=True).start()
+# The queue is read every 8 writes and smoothed; below target-15 ms the player stretches, above target+40 ms it
+# shrinks, each until the queue is back at the target (the band keeps it from hunting on Wi-Fi jitter).
+lo, hi = (target_ms - 15) * 1000, (target_ms + 40) * 1000
+CHUNK = 288 * F   # 6 ms, the Mac's packet size
+# Far above the target (a stall upstream let buf fill: q53 11-01 started 870 ms behind, and dropping one frame in
+# four chunks took 9 minutes to drain it), the excess in buf is cut at once: one skip instead of minutes of late sound.
+JUMP = (target_ms + 200) * 1000
+mode, q, n, added, dropped, cut, t_log, got0 = 0, None, 0, 0, 0, 0, time.time(), 0
+while True:
+    with cv:
+        while len(buf) < CHUNK: cv.wait()
+        d = bytes(buf[:CHUNK]); del buf[:CHUNK]; held = len(buf)
+    n += 1
+    if n % 8 == 0:
+        lat = lib.pa_simple_get_latency(pa, ctypes.byref(err)) + held * 1000 // B
+        if lat > JUMP and held:
+            with cv:
+                k = min(len(buf), (lat - target_ms * 1000) * B // 1000 // F * F); del buf[:k]
+            cut += k * 1000 // B // 1000; lat -= k * 1000 // B; q = None
+        q = lat if q is None else q + 0.25 * (lat - q)
+        if mode == 0 and q < lo: mode = 1
+        elif mode == 0 and q > hi: mode = -1
+        elif (mode == 1 and q >= target_ms * 1000) or (mode == -1 and q <= target_ms * 1000): mode = 0
+    if mode and n % 2 == 0:
+        i = (len(d) // F // 2) * F   # mid-chunk, on a frame
+        if mode == 1: d = d[:i + F] + d[i:]; added += 1
+        else: d = d[:i] + d[i + F:]; dropped += 1
+    if lib.pa_simple_write(pa, d, len(d), ctypes.byref(err)) < 0: sys.exit(f'frame-audio-rx: pulse write failed ({err.value})')
+    if time.time() - t_log >= 60:
+        el = time.time() - t_log; ppm = ((got[0] - got0) / (el * 48000 * F) - 1) * 1e6
+        print(f'queue {q / 1000 if q else 0:.0f} ms, frames added {added} dropped {dropped}, cut {cut} ms, '
+              f'packets lost {lost[0]} late {late[0]}, supply {ppm:+.0f} ppm against this clock (received, '
+              f'before the fill), in the last minute', flush=True)
+        added = dropped = cut = 0; lost[0] = late[0] = 0; t_log = time.time(); got0 = got[0]
+PLAYER

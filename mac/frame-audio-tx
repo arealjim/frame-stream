@@ -6,8 +6,8 @@
 # Capturing any input needs macOS's microphone permission, so start it from Terminal (frame-audio-tx.command) once and
 # allow it; started over bare ssh it captures silence without an error.
 # Capture is sox's CoreAudio reader: ffmpeg's avfoundation input delivered only 43,000 of 48,000 samples a second with
-# Wine loading the Mac (measured on the headset, 2026-10-22), and every missing buffer is a click. The send is the
-# system nc, one datagram per 1152-byte read: ffmpeg's UDP output bunched the same stream into 85 ms bursts, and a
+# Wine loading the Mac (measured on the headset, 2026-10-22), and every missing buffer is a click. The send was the
+# system nc, one datagram per 1152-byte read (now numbered, below): ffmpeg's UDP output bunched the same stream into 85 ms bursts, and a
 # fresh Python binary's first send sat behind macOS's local-network permission prompt.
 export PATH=/opt/homebrew/bin:$HOME/.local/bin:$PATH
 # It sends from the port it sends to: over Wi-Fi the headset only lets the sound in as the reply to its own hello
@@ -29,9 +29,26 @@ HOST=${1:-${FRAME_STREAM_FRAME_IP:-$(usb_peer || true)}}
 echo "frame-audio-tx: sending to $HOST:${2:-9950}" >&2
 PATH=$PATH:/opt/homebrew/bin:/usr/local/bin   # Homebrew's sox, also when started from a non-login shell
 command -v sox >/dev/null || { echo "frame-audio-tx: needs sox (brew install sox)" >&2; exit 2; }
-# A send error (the receiver restarting, a link blip) ends the pipe, so it is restarted rather than left dead.
+# Each datagram carries a sequence number (2026-11-01, q70): the hotspot loses up to 0.35 % of them, varying minute to
+# minute, and raw PCM with no number reads at the receiver as a slow clock, so its queue drained and holed. Numbered,
+# frame-audio-rx fills a lost packet in its own place. The header is 8 bytes, "FAU1" + a big-endian uint32; a
+# receiver from before it would play them as 4 samples of noise, so FRAME_AUDIO_SEQ=0 sends raw through nc as before.
+# The numbering is the system python3 (Apple's, already allowed on the local network from Terminal).
+SEQ_TX='import socket, struct, sys
+host, port = sys.argv[1], int(sys.argv[2])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0", port))
+r, n = sys.stdin.buffer, 0
+while True:
+    d = r.read(1152)   # sox writes 1152-byte buffers: 288 frames, 6 ms
+    if not d: break
+    try: s.sendto(b"FAU1" + struct.pack(">I", n) + d, (host, port))
+    except OSError: pass   # the receiver restarting answers with ICMP: keep sending, the numbers keep counting
+    n = (n + 1) & 0xffffffff'
+# exec: the pipeline runs the function in a subshell, and the sender must be that process, so one kill stops it.
+send(){ if [ "${FRAME_AUDIO_SEQ:-1}" = 0 ]; then exec /usr/bin/nc -u -p "$2" "$1" "$2"; else exec /usr/bin/python3 -u -c "$SEQ_TX" "$1" "$2"; fi; }
+# A capture or send that ends (with nc: any send error, the receiver restarting, a link blip) is restarted.
 while :; do
   sox -q --buffer 1152 -t coreaudio "BlackHole 2ch" -r 48000 -c 2 -b 16 -e signed-integer -t raw - \
-    | /usr/bin/nc -u -p "${2:-9950}" "$HOST" "${2:-9950}"
+    | send "$HOST" "${2:-9950}"
   echo "frame-audio-tx: capture exited, restarting in 1 s" >&2; sleep 1
 done

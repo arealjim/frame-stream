@@ -216,10 +216,19 @@ Older client builds encoded the gamma twice (lifted blacks, flat contrast). Rebu
 
 ## The sound crackles
 
-Every crackle we heard was a gap in the stream, and each had a different cause. ffmpeg's avfoundation capture
-delivered 43,000 of 48,000 samples a second with a game loading the Mac, ffmpeg's UDP output sent the sound in 85 ms
-bursts, and a pipe into `pw-play` left holes. The scripts here use sox to capture, the system `nc` to send and
-ffmpeg's pulse output on the headset. To see gaps rather than guess, record what the headset actually plays:
+Every crackle we heard was a gap in the stream. The Mac captures with sox and numbers each 6 ms packet; the headset's
+`frame-audio-rx` fills a packet lost on the air with the one before it, and plays at the Mac's clock rather than its
+own. Measured over the hotspot, 15 min with a game streaming: 38 packets lost, all filled; sound 123 ms after the Mac
+captured it.
+
+- **What is left:** the Wi-Fi stopping delivery for longer than the headset's 100 ms sound queue (we saw 3 such gaps
+  of 9 ms in 15 min, in the same seconds as 100-200 ms stalls in the video). A deeper queue rides them out at the cost
+  of delay: `FRAME_AUDIO_LATENCY_MS=150 frame-audio-rx start <mac-ip>` on the headset.
+- **After updating:** update the headset (`frame/install.sh`) before or with the Mac. A receiver from before numbered
+  packets would hear them as a click every 6 ms, so `frame-stream up` sends the old, unnumbered format to it and says
+  so; unnumbered sound crackles more over Wi-Fi. `FRAME_AUDIO_SEQ=0` on the Mac forces the old format.
+
+To see gaps rather than guess, record what the headset actually plays:
 `pw-record -P stream.capture.sink=true --target $(pactl get-default-sink) out.wav` (recording the stream's own node
 gives zeros).
 
