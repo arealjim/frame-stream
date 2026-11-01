@@ -157,6 +157,10 @@ runtime patch in this repository refuses a second Wi-Fi client while one is conn
 - **Unity, after a crash or a kill:** the next launch sits at 0 % CPU behind two dialogs ("project already open",
   "recover scene backup"). `frame-stream down` removes `Temp/UnityLockfile` and `Temp/__Backupscenes` for you; after a
   crash, delete them by hand.
+- **Unity, with the Mac's display asleep:** the app submits 2 frames, reaches the XR state VISIBLE and stops there,
+  with no error. Seen on every launch of a Unity player build made while the display slept, with any settings and with
+  or without the headset connected; with the display held on, the same launch reached FOCUSED in 0.25 s. Godot and
+  Unreal are not affected. Wake the display and hold it on for the session: `caffeinate -u -d` in a Terminal.
 - **A GUI app started from ssh** spins without a window. Start it through `open` (`frame-stream` does).
 - **"Failed to bind control socket on port 9946"**: a wedged earlier process still holds UDP 9944-9946, and the
   runtime never retries a bind. `sudo lsof -nP -iUDP:9944-9946`, then `kill -9` it.

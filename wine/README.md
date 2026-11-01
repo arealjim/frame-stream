@@ -242,6 +242,10 @@ then also fails with "Need Steam Networking sockets". To recover: quit Steam, se
   song and dropped about 400 frames in 30 seconds; at 1728 it stayed under 9 ms with 8 drops in 4 minutes. 1728 is
   SteamVR's own recommendation for the Frame. It is a little softer.
 - `resolution_scale` is the encode scale, not the render size, and it turns foveated encoding off. Leave it at 1.
+- **Half-Life: Alyx: `supersampleRatio=0.81`** in an `opencomposite.ini` beside its OpenComposite dll
+  (`alyx-opencomposite.ini`, copied to `game/bin/win64/opencomposite.ini`). It draws 1399 per eye instead of 1728. On
+  the first in-world map the full size saturated the GPU and the encoder with it: 29 renders/s and 89 ms frame age.
+  At 0.81 it ran 88 renders/s with an 18 ms frame age (measured 2026-10-31, worn).
 
 ## UEVR games (flat Unreal Engine games in VR, experimental)
 

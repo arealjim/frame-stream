@@ -1,0 +1,68 @@
+From 331af8f805fa401d2eb579cf34b74f3a8cb586ac Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 10:50:45 +0000
+Subject: [PATCH] runtime: report no interaction profile before a client
+ connects
+
+With no client, GetCurrentInteractionProfileCandidates fell back to the desktop
+khr/simple_controller. Unity apps bind the first profile they see at session
+start, and a client always connects after that, so Pistol Whip kept the simple
+controller and never drew its guns once the client brought oculus/touch.
+Reporting none (XR_NULL_PATH, which the spec allows) lets the first profile the
+app sees be the real one. Confirmed off-head: with the hands appearing 40 s into
+the session, the gun was missing before this change and drawn after it.
+
+Adds a unit test for the no-client state.
+---
+ runtime/src/InputManager.cpp | 10 ++++------
+ tests/TestInputManager.cpp   | 13 +++++++++++++
+ 2 files changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/runtime/src/InputManager.cpp b/runtime/src/InputManager.cpp
+index 8d44fa0..baf6704 100644
+--- a/runtime/src/InputManager.cpp
++++ b/runtime/src/InputManager.cpp
+@@ -755,12 +755,10 @@ std::vector<std::string> InputManager::GetCurrentInteractionProfileCandidates(Ha
+         return {kHandInteractionProfile};
+     }
+ 
+-    if (IsStreaming())
+-    {
+-        return {};
+-    }
+-
+-    return {kSimpleControllerProfile};
++    // No controller is in a hand: report no profile (XR_NULL_PATH), streaming or not. A desktop fallback to
++    // khr/simple_controller here was bound by Unity apps at session start (Pistol Whip, 2026-10-31), and they never
++    // took the switch to oculus/touch when the client connected after it, so their guns were never drawn.
++    return {};
+ }
+ 
+ std::vector<std::string> InputManager::GetActiveInteractionProfiles(Hand hand) const
+diff --git a/tests/TestInputManager.cpp b/tests/TestInputManager.cpp
+index c0d469c..5640b49 100644
+--- a/tests/TestInputManager.cpp
++++ b/tests/TestInputManager.cpp
+@@ -96,6 +96,19 @@ TEST_CASE("InputManager — initial state", "[input]")
+     }
+ }
+ 
++TEST_CASE("InputManager — no profile before a client connects", "[input]")
++{
++    // Unity apps bind the first profile they see: a desktop khr/simple_controller here hid Pistol Whip's guns
++    // after the client connected with Touch (2026-10-31).
++    InputManager im;
++    for (InputManager::Hand hand : {InputManager::Hand::Left, InputManager::Hand::Right})
++    {
++        CHECK_FALSE(im.IsInputDeviceActive(hand));
++        CHECK(im.GetCurrentInteractionProfile(hand).empty());
++        CHECK(im.GetActiveInteractionProfiles(hand).empty());
++    }
++}
++
+ TEST_CASE("InputManager — hand joint generation", "[input]")
+ {
+     InputManager im;
+-- 
+2.54.0 (Apple Git-157)
+
