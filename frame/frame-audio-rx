@@ -41,7 +41,7 @@ esac
 exit
 # The player: bash reads this heredoc as data and never runs it; start hands it to python3.
 : <<'PLAYER'
-import ctypes, ctypes.util, socket, sys, threading, time
+import array, ctypes, ctypes.util, math, socket, sys, threading, time
 mac, port, target_ms = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 B = 192   # bytes per ms: 48 kHz, 2 channels, 16 bit
 F = 4     # bytes per frame
@@ -76,6 +76,22 @@ got = [0]   # bytes received, for the supply rate in the minute line: the Mac's 
 # drained queue); a late one already filled is dropped; a big jump (the sender restarted) just starts counting again.
 # A datagram without the header is played as it is (the old nc sender, FRAME_AUDIO_SEQ=0).
 lost, late = [0], [0]
+# Each seam of a fill is a jump: the repeat starts where the packet before it started, and the packet after the fill
+# continues the lost one, not the repeat (q84 11-02: a tick per seam, second difference ~6400 on a 440 Hz tone). So
+# the first K frames after a seam are faded in from the sound before the seam continued past its end, reflected
+# through its last sample, which carries on its level and slope: no step and no kink to hear. The weight is a
+# raised cosine, flat at both ends: a straight ramp left a kink where it started and stopped (seam test 11-03, 440 Hz
+# tone, 14 packets lost in 7 gaps: worst second difference 21,582 unfaded, 869 straight, 125 cosine; a clean tone 41).
+K = 48    # frames, 1 ms
+def join(before, after):
+    t, h = array.array('h', before[-(K + 1) * F:]), array.array('h', after)
+    if len(t) < 2 * (K + 1) or len(h) < 2 * K: return after
+    for j in range(K):
+        w = (1 - math.cos(math.pi * (j + 1) / (K + 1))) / 2
+        for c in (0, 1):
+            m = 2 * t[-2 + c] - t[-4 - 2 * j + c]
+            h[2 * j + c] = max(-32768, min(32767, round((1 - w) * m + w * h[2 * j + c])))
+    return h.tobytes()
 def reader():
     last, prev = None, b''
     while True:
@@ -83,7 +99,7 @@ def reader():
         if mac and a[0] != mac: continue
         fill = b''
         if len(d) > 8 and d[:4] == b'FAU1':
-            seq = int.from_bytes(d[4:8], 'big'); d = d[8:]
+            seq = int.from_bytes(d[4:8], 'big'); d = d[8:]; raw = d
             # A numbered payload is whole frames; one that is not is no packet of ours (in a loopback test the
             # receiver's own 5-byte hello came back), and played it would shift every sample after it. An
             # unnumbered stream is nc's continuous bytes, cut wherever its read fell, so it is played as it comes.
@@ -91,8 +107,11 @@ def reader():
             gap = None if last is None else ((seq - last + (1 << 31)) & 0xffffffff) - (1 << 31)
             if gap is not None and -50 < gap <= 0: late[0] += 1; continue
             if gap is not None and 1 < gap <= 50:
-                fill = (prev or bytes(len(d))) * (gap - 1); lost[0] += gap - 1
-            last, prev = seq, d
+                last_out, pieces = prev or bytes(len(d)), []
+                for _ in range(gap - 1):
+                    last_out = join(last_out, prev or bytes(len(d))); pieces.append(last_out)
+                fill = b''.join(pieces); d = join(last_out, d); lost[0] += gap - 1
+            last, prev = seq, raw   # the repeat is the packet as sent, not its faded-in copy
         with cv:
             buf.extend(fill); buf.extend(d); got[0] += len(d)
             # 2 s behind: catch up at once. Whole frames only: nc's raw chunks need not be, and an odd cut here would

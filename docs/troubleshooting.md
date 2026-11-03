@@ -217,8 +217,8 @@ Older client builds encoded the gamma twice (lifted blacks, flat contrast). Rebu
 ## The sound crackles
 
 Every crackle we heard was a gap in the stream. The Mac captures with sox and numbers each 6 ms packet; the headset's
-`frame-audio-rx` fills a packet lost on the air with the one before it, and plays at the Mac's clock rather than its
-own. Measured over the hotspot, 15 min with a game streaming: 38 packets lost, all filled; sound 123 ms after the Mac
+`frame-audio-rx` fills a packet lost on the air with the one before it, fading each join over 1 ms so the fill
+makes no click, and plays at the Mac's clock rather than its own. Measured over the hotspot, 15 min with a game streaming: 38 packets lost, all filled; sound 123 ms after the Mac
 captured it.
 
 - **What is left:** the Wi-Fi stopping delivery for longer than the headset's 100 ms sound queue (we saw 3 such gaps
