@@ -1,0 +1,417 @@
+From fba19c1d743a39c502dcd31585f8050dd4d951f1 Mon Sep 17 00:00:00 2001
+From: arealjim <6187715+arealjim@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 12:03:30 +0000
+Subject: [PATCH] runtime: report controller velocity from the streamed grip
+ poses
+
+The tracking packet carries no controller velocity, and xrLocateSpace answered every XrSpaceVelocity with zeros, while xrLocateSpaces flagged those zeros valid. Apps throw with the hand velocity at release, so in Half-Life: Alyx every thrown object dropped straight down.
+
+InputManager now keeps the recent tracked grip samples per hand and differences them on the client timestamps over about 40 ms. LocateSpace adds the lever arm to the space origin, expresses both vectors in the base space, and sets the valid bits only when it knows: a hand with two samples, or a fixed reference space, located in a fixed base. xrLocateSpaces passes on what LocateSpace gives.
+---
+ runtime/src/EntryPoint.cpp   | 14 +++---
+ runtime/src/InputManager.cpp | 85 ++++++++++++++++++++++++++++++++++++
+ runtime/src/InputManager.h   | 25 +++++++++++
+ runtime/src/Space.cpp        | 38 ++++++++++++++++
+ tests/TestInputManager.cpp   | 69 +++++++++++++++++++++++++++++
+ tests/TestRuntimeApi.cpp     | 30 ++++++++-----
+ 6 files changed, 245 insertions(+), 16 deletions(-)
+
+diff --git a/runtime/src/EntryPoint.cpp b/runtime/src/EntryPoint.cpp
+index ebb99b9..8a01ed4 100644
+--- a/runtime/src/EntryPoint.cpp
++++ b/runtime/src/EntryPoint.cpp
+@@ -1388,7 +1388,8 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrLocateSpaces(
+             return XR_ERROR_HANDLE_INVALID;
+         }
+ 
+-        XrSpaceLocation location = {XR_TYPE_SPACE_LOCATION};
++        XrSpaceVelocity velocity = {XR_TYPE_SPACE_VELOCITY};
++        XrSpaceLocation location = {XR_TYPE_SPACE_LOCATION, velocities != nullptr ? &velocity : nullptr};
+         XrResult result = space->LocateSpace(baseSpace, locateInfo->time, &location);
+         if (XR_FAILED(result))
+         {
+@@ -1397,12 +1398,13 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrLocateSpaces(
+ 
+         spaceLocations->locations[i].locationFlags = location.locationFlags;
+         spaceLocations->locations[i].pose = location.pose;
+-        if (velocities != nullptr &&
+-            (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
+-            (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0)
++        if (velocities != nullptr)
+         {
+-            velocities->velocities[i].velocityFlags =
+-                XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
++            // What LocateSpace knows, not valid-flagged zeros: an app handed a valid zero cannot even
++            // fall back to differencing the poses itself.
++            velocities->velocities[i].velocityFlags = velocity.velocityFlags;
++            velocities->velocities[i].linearVelocity = velocity.linearVelocity;
++            velocities->velocities[i].angularVelocity = velocity.angularVelocity;
+         }
+     }
+ 
+diff --git a/runtime/src/InputManager.cpp b/runtime/src/InputManager.cpp
+index baf6704..8fb5d46 100644
+--- a/runtime/src/InputManager.cpp
++++ b/runtime/src/InputManager.cpp
+@@ -283,6 +283,11 @@ void InputManager::UpdateFromStreaming()
+                                           packet.leftControllerAimRot[0],
+                                           packet.leftControllerAimRot[1],
+                                           packet.leftControllerAimRot[2]);
++        RecordControllerSample(Hand::Left, packet.timestampNs, leftControllerPos_, leftControllerRot_);
++    }
++    else
++    {
++        controllerSamples_[HandIndex(Hand::Left)].clear();
+     }
+     if (rightControllerActive)
+     {
+@@ -300,6 +305,11 @@ void InputManager::UpdateFromStreaming()
+                                            packet.rightControllerAimRot[0],
+                                            packet.rightControllerAimRot[1],
+                                            packet.rightControllerAimRot[2]);
++        RecordControllerSample(Hand::Right, packet.timestampNs, rightControllerPos_, rightControllerRot_);
++    }
++    else
++    {
++        controllerSamples_[HandIndex(Hand::Right)].clear();
+     }
+ 
+     // Apply button/trigger states
+@@ -579,6 +589,81 @@ void InputManager::GetEyeViews(XrView* views, uint32_t viewCount) const
+     }
+ }
+ 
++void InputManager::RecordControllerSample(Hand hand, int64_t timestampNs, const glm::vec3& pos,
++                                          const glm::quat& rot)
++{
++    auto& samples = controllerSamples_[HandIndex(hand)];
++    // A frame that re-reads the same packet adds nothing; a client without timestamps gives no velocity.
++    if (timestampNs <= 0 || (!samples.empty() && timestampNs <= samples.back().timestampNs))
++    {
++        return;
++    }
++    samples.push_back({timestampNs, pos, rot});
++    if (samples.size() > MaxControllerSamples)
++    {
++        samples.erase(samples.begin());
++    }
++
++    // A swing worth throwing with, at most four lines a second per hand: what the app is handed.
++    glm::vec3 linear(0.0f);
++    glm::vec3 angular(0.0f);
++    glm::vec3 grip(0.0f);
++    int64_t& lastLogNs = controllerVelocityLogNs_[HandIndex(hand)];
++    if (timestampNs - lastLogNs >= 250'000'000 && GetControllerVelocity(hand, linear, angular, grip) &&
++        glm::length(linear) >= 1.0f)
++    {
++        lastLogNs = timestampNs;
++        spdlog::info("InputManager: {} hand velocity {:.2f} m/s ({:.2f}, {:.2f}, {:.2f}), {:.1f} rad/s",
++                     hand == Hand::Left ? "left" : "right", glm::length(linear), linear.x, linear.y, linear.z,
++                     glm::length(angular));
++    }
++}
++
++bool InputManager::GetControllerVelocity(Hand hand, glm::vec3& linear, glm::vec3& angular,
++                                         glm::vec3& gripPosition) const
++{
++    const auto& samples = controllerSamples_[HandIndex(hand)];
++    if (samples.size() < 2)
++    {
++        return false;
++    }
++    const ControllerSample& newest = samples.back();
++    // The oldest sample still inside the window, and at least the one before the newest.
++    size_t oldestIndex = samples.size() - 2;
++    while (oldestIndex > 0 && newest.timestampNs - samples[oldestIndex - 1].timestampNs <= VelocityWindowNs)
++    {
++        --oldestIndex;
++    }
++    const ControllerSample& oldest = samples[oldestIndex];
++    const int64_t spanNs = newest.timestampNs - oldest.timestampNs;
++    if (spanNs <= 0 || spanNs > VelocityMaxSpanNs)
++    {
++        return false;
++    }
++    const float dt = static_cast<float>(spanNs) * 1.0e-9f;
++    linear = (newest.position - oldest.position) / dt;
++
++    // World-space angular velocity: the rotation that takes the old orientation to the new one.
++    glm::quat delta = glm::normalize(newest.rotation * glm::inverse(oldest.rotation));
++    if (delta.w < 0.0f)
++    {
++        delta = -delta;
++    }
++    const glm::vec3 axis(delta.x, delta.y, delta.z);
++    const float sinHalf = glm::length(axis);
++    if (sinHalf < 1.0e-6f)
++    {
++        angular = glm::vec3(0.0f);
++    }
++    else
++    {
++        const float angle = 2.0f * std::atan2(sinHalf, delta.w);
++        angular = axis / sinHalf * (angle / dt);
++    }
++    gripPosition = newest.position;
++    return true;
++}
++
+ XrPosef InputManager::GetControllerPose(Hand hand) const
+ {
+     const glm::vec3& pos = (hand == Hand::Left) ? leftControllerPos_ : rightControllerPos_;
+diff --git a/runtime/src/InputManager.h b/runtime/src/InputManager.h
+index 149ac04..fffa92c 100644
+--- a/runtime/src/InputManager.h
++++ b/runtime/src/InputManager.h
+@@ -6,6 +6,7 @@
+ #include <glm/glm.hpp>
+ #include <glm/gtc/quaternion.hpp>
+ #include <array>
++#include <cstdint>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -62,6 +63,14 @@ class InputManager
+     XrPosef GetControllerPose(Hand hand) const;
+     XrPosef GetControllerAimPose(Hand hand) const;
+ 
++    // Controller velocity in world space, from the streamed grip poses: the packet carries no
++    // controller velocity, and an app throws with the hand's velocity at release (Half-Life: Alyx
++    // dropped every throw while it read zero). Differenced on the client's timestamps, never on
++    // arrival times, which bunch over Wi-Fi. gripPosition is where the linear velocity applies.
++    // False until the hand has two tracked samples close enough in time.
++    bool GetControllerVelocity(Hand hand, glm::vec3& linear, glm::vec3& angular,
++                               glm::vec3& gripPosition) const;
++
+     // Hand tracking joints (26 joints, world space relative to baseSpace)
+     void GetHandJointLocations(Hand hand, XrHandJointLocationEXT* joints, uint32_t jointCount) const;
+ 
+@@ -130,6 +139,22 @@ class InputManager
+     XrPosef GetTrackedHandPose(Hand hand, const std::string& componentPath) const;
+     float GetTrackedPinchValue(Hand hand) const;
+     float GetTrackedGraspValue(Hand hand) const;
++    void RecordControllerSample(Hand hand, int64_t timestampNs, const glm::vec3& pos, const glm::quat& rot);
++
++    struct ControllerSample
++    {
++        int64_t timestampNs = 0;
++        glm::vec3 position{0.0f};
++        glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
++    };
++    // Recent tracked grip samples per hand, oldest first; cleared when the hand loses tracking.
++    std::array<std::vector<ControllerSample>, 2> controllerSamples_;
++    static constexpr size_t MaxControllerSamples = 16;
++    std::array<int64_t, 2> controllerVelocityLogNs_ = {0, 0};
++    // The velocity spans about this much of the newest samples: long enough to smooth a 72-90 Hz
++    // pose stream, short enough that a release still reads the swing rather than its wind-up.
++    static constexpr int64_t VelocityWindowNs = 40'000'000;
++    static constexpr int64_t VelocityMaxSpanNs = 100'000'000;
+ 
+     TrackingReceiver* trackingReceiver_ = nullptr;
+ 
+diff --git a/runtime/src/Space.cpp b/runtime/src/Space.cpp
+index a192ffc..626f34e 100644
+--- a/runtime/src/Space.cpp
++++ b/runtime/src/Space.cpp
+@@ -92,6 +92,11 @@ struct LocatedWorldPose
+ {
+     XrPosef pose{};
+     bool active = true;
++    // How this space moves in world: a reference space fixed in the world (LOCAL, LOCAL_FLOOR,
++    // STAGE) is still; a controller-bound space moves with its hand; anything else (VIEW) has no
++    // velocity this runtime can give.
++    enum class Motion { Static, Hand, Unknown } motion = Motion::Unknown;
++    InputManager::Hand hand = InputManager::Hand::Left;
+ };
+ 
+ // Compute world pose of a space.
+@@ -111,6 +116,7 @@ static LocatedWorldPose GetWorldPose(Space* space, const InputManager& inputMana
+             case XR_REFERENCE_SPACE_TYPE_LOCAL:
+             case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR:
+             case XR_REFERENCE_SPACE_TYPE_STAGE:
++                result.motion = LocatedWorldPose::Motion::Static;
+                 // Distinct origins per OpenXR semantics: STAGE at the physical
+                 // floor (client head pose is floor-relative), LOCAL anchored to the
+                 // HMD pose at session start (yaw-only, ~eye height), LOCAL_FLOOR =
+@@ -149,12 +155,16 @@ static LocatedWorldPose GetWorldPose(Space* space, const InputManager& inputMana
+         if (poseActive && !poseBindingPath.empty())
+         {
+             InputManager::Hand hand = HandFromBindingPath(poseBindingPath);
++            result.motion = LocatedWorldPose::Motion::Hand;
++            result.hand = hand;
+             result.pose = inputManager.GetPoseComponentForProfile(
+                 hand, ComponentFromBindingPath(poseBindingPath), poseProfilePath);
+         }
+         else
+         {
+             InputManager::Hand hand = HandFromPath(space->GetSubactionPath());
++            result.motion = LocatedWorldPose::Motion::Hand;
++            result.hand = hand;
+             result.pose = inputManager.GetControllerPose(hand);
+         }
+     }
+@@ -227,6 +237,34 @@ XrResult Space::LocateSpace(Space* baseSpace, XrTime time, XrSpaceLocation* loca
+         velocity->velocityFlags = 0;
+         velocity->linearVelocity = {0.0f, 0.0f, 0.0f};
+         velocity->angularVelocity = {0.0f, 0.0f, 0.0f};
++
++        // Velocity of this space in world. A rigid hand: the grip's linear velocity plus the
++        // rotation's sweep of the lever arm from the grip to this space's origin (aim, an offset).
++        bool known = thisPose.active && basePose.active &&
++                     basePose.motion == LocatedWorldPose::Motion::Static;
++        glm::vec3 linear(0.0f);
++        glm::vec3 angular(0.0f);
++        if (known && thisPose.motion == LocatedWorldPose::Motion::Hand)
++        {
++            glm::vec3 gripPos(0.0f);
++            known = inputManager.GetControllerVelocity(thisPose.hand, linear, angular, gripPos);
++            if (known)
++            {
++                linear += glm::cross(angular, thisPos - gripPos);
++            }
++        }
++        else if (thisPose.motion != LocatedWorldPose::Motion::Static)
++        {
++            known = false;
++        }
++
++        if (known)
++        {
++            // XrSpaceVelocity is expressed in the base space, like the pose.
++            velocity->linearVelocity = ToXr(baseRotInv * linear);
++            velocity->angularVelocity = ToXr(baseRotInv * angular);
++            velocity->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
++        }
+     }
+ 
+     return XR_SUCCESS;
+diff --git a/tests/TestInputManager.cpp b/tests/TestInputManager.cpp
+index 5640b49..13a0851 100644
+--- a/tests/TestInputManager.cpp
++++ b/tests/TestInputManager.cpp
+@@ -772,3 +772,72 @@ TEST_CASE("TrackingReceiver — measured prediction uses sample age plus post-fe
+     CHECK(receiver.GetLastPredictionTimes(sampleReceiveNs, fetchNs));
+     CHECK(fetchNs >= sampleReceiveNs);
+ }
++
++TEST_CASE("InputManager — controller velocity from streamed grip poses", "[input][velocity]")
++{
++    InputManager im;
++    TrackingReceiver receiver;
++    im.SetTrackingReceiver(&receiver);
++    im.SetStreamingClientName("Meta Quest 2");
++
++    // A throw: the right hand moves at (2, 1, -3) m/s while turning about +Y at 3 rad/s, sampled
++    // at 72 Hz. Expected values are the motion that generated the samples, not the estimator.
++    const glm::vec3 throwVelocity(2.0f, 1.0f, -3.0f);
++    const float yawRate = 3.0f;
++    const glm::vec3 start(0.30f, 1.20f, -0.40f);
++    const int64_t t0 = 5'000'000'000;
++    const int64_t stepNs = 13'888'889;
++    auto inject = [&](int i) {
++        const float t = static_cast<float>(i * stepNs) * 1.0e-9f;
++        const glm::vec3 pos = start + throwVelocity * t;
++        const glm::quat rot = glm::angleAxis(yawRate * t, glm::vec3(0.0f, 1.0f, 0.0f));
++        oxr::protocol::TrackingPacket packet = {};
++        packet.timestampNs = t0 + i * stepNs;
++        packet.headOrientation[3] = 1.0f;
++        packet.trackingFlags = oxr::protocol::TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE;
++        packet.rightControllerPos[0] = pos.x;
++        packet.rightControllerPos[1] = pos.y;
++        packet.rightControllerPos[2] = pos.z;
++        packet.rightControllerRot[0] = rot.x;
++        packet.rightControllerRot[1] = rot.y;
++        packet.rightControllerRot[2] = rot.z;
++        packet.rightControllerRot[3] = rot.w;
++        receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
++        im.Update(0.0f);
++    };
++
++    glm::vec3 linear(0.0f);
++    glm::vec3 angular(0.0f);
++    glm::vec3 grip(0.0f);
++
++    inject(0);
++    CHECK_FALSE(im.GetControllerVelocity(InputManager::Hand::Right, linear, angular, grip));
++
++    // A frame that re-reads the same packet must not count as a still sample.
++    im.Update(0.0f);
++    inject(1);
++    REQUIRE(im.GetControllerVelocity(InputManager::Hand::Right, linear, angular, grip));
++    CHECK_THAT(linear.x, WithinAbs(2.0f, 0.01f));
++    CHECK_THAT(linear.z, WithinAbs(-3.0f, 0.01f));
++
++    for (int i = 2; i < 8; ++i)
++    {
++        inject(i);
++    }
++    REQUIRE(im.GetControllerVelocity(InputManager::Hand::Right, linear, angular, grip));
++    CHECK_THAT(linear.x, WithinAbs(2.0f, 0.01f));
++    CHECK_THAT(linear.y, WithinAbs(1.0f, 0.01f));
++    CHECK_THAT(linear.z, WithinAbs(-3.0f, 0.01f));
++    CHECK_THAT(angular.x, WithinAbs(0.0f, 0.01f));
++    CHECK_THAT(angular.y, WithinAbs(3.0f, 0.01f));
++    CHECK_THAT(angular.z, WithinAbs(0.0f, 0.01f));
++    CHECK_THAT(grip.x, WithinAbs(start.x + 2.0f * 7 * stepNs * 1.0e-9f, 0.001f));
++
++    // Losing tracking forgets the hand: no stale throw on the next pickup.
++    oxr::protocol::TrackingPacket lost = {};
++    lost.timestampNs = t0 + 8 * stepNs;
++    lost.headOrientation[3] = 1.0f;
++    receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&lost), sizeof(lost));
++    im.Update(0.0f);
++    CHECK_FALSE(im.GetControllerVelocity(InputManager::Hand::Right, linear, angular, grip));
++}
+diff --git a/tests/TestRuntimeApi.cpp b/tests/TestRuntimeApi.cpp
+index e346c9d..04a1f54 100644
+--- a/tests/TestRuntimeApi.cpp
++++ b/tests/TestRuntimeApi.cpp
+@@ -956,10 +956,26 @@ TEST_CASE("Runtime validates xrLocateSpaces count and velocity invariants", "[ru
+ 
+     velocities.velocityCount = static_cast<uint32_t>(velocityData.size());
+     XR_CHECK(xrLocateSpaces(context.session, &locateInfo, &spaceLocations));
++    // The runtime has no head velocity to give, so VIEW's is not valid: a valid zero would stop an
++    // app from differencing the poses itself.
++    CHECK(velocityData[0].velocityFlags == 0);
++    CHECK(velocityData[1].velocityFlags == 0);
++
++    // A space fixed in the world, located in another, is still: a valid zero.
++    XrReferenceSpaceCreateInfo stageInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
++    stageInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
++    stageInfo.poseInReferenceSpace.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
++    XrSpace stage = XR_NULL_HANDLE;
++    XR_CHECK(xrCreateReferenceSpace(context.session, &stageInfo, &stage));
++    locateInfo.spaceCount = 1;
++    locateInfo.spaces = &stage;
++    spaceLocations.locationCount = 1;
++    velocities.velocityCount = 1;
++    XR_CHECK(xrLocateSpaces(context.session, &locateInfo, &spaceLocations));
+     CHECK((velocityData[0].velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) != 0);
+     CHECK((velocityData[0].velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) != 0);
+-    CHECK((velocityData[1].velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) != 0);
+-    CHECK((velocityData[1].velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) != 0);
++    CHECK_THAT(velocityData[0].linearVelocity.x, WithinAbs(0.0f, 0.001f));
++    XR_CHECK(xrDestroySpace(stage));
+ 
+     XR_CHECK(xrDestroySpace(spaces[1]));
+     XR_CHECK(xrDestroySpace(spaces[0]));
+@@ -2393,14 +2409,8 @@ TEST_CASE("Hand interaction pose and value inputs work through automation", "[ru
+     CHECK_THAT(locationData[0].pose.position.x, WithinAbs(0.15f, 0.001f));
+     CHECK_THAT(locationData[0].pose.position.y, WithinAbs(1.25f, 0.001f));
+     CHECK_THAT(locationData[0].pose.position.z, WithinAbs(-0.35f, 0.001f));
+-    CHECK((velocityData[0].velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) != 0);
+-    CHECK((velocityData[0].velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) != 0);
+-    CHECK_THAT(velocityData[0].linearVelocity.x, WithinAbs(0.0f, 0.001f));
+-    CHECK_THAT(velocityData[0].linearVelocity.y, WithinAbs(0.0f, 0.001f));
+-    CHECK_THAT(velocityData[0].linearVelocity.z, WithinAbs(0.0f, 0.001f));
+-    CHECK_THAT(velocityData[0].angularVelocity.x, WithinAbs(0.0f, 0.001f));
+-    CHECK_THAT(velocityData[0].angularVelocity.y, WithinAbs(0.0f, 0.001f));
+-    CHECK_THAT(velocityData[0].angularVelocity.z, WithinAbs(0.0f, 0.001f));
++    // An automation-posed hand has no tracked samples to difference: no velocity, not a valid zero.
++    CHECK(velocityData[0].velocityFlags == 0);
+ 
+     XrActionStateGetInfo valueGetInfo = {XR_TYPE_ACTION_STATE_GET_INFO};
+     valueGetInfo.action = pinchValueAction;
+-- 
+2.54.0 (Apple Git-157)
+

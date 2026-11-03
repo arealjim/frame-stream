@@ -242,10 +242,15 @@ then also fails with "Need Steam Networking sockets". To recover: quit Steam, se
   song and dropped about 400 frames in 30 seconds; at 1728 it stayed under 9 ms with 8 drops in 4 minutes. 1728 is
   SteamVR's own recommendation for the Frame. It is a little softer.
 - `resolution_scale` is the encode scale, not the render size, and it turns foveated encoding off. Leave it at 1.
-- **Half-Life: Alyx: `supersampleRatio=0.81`** in an `opencomposite.ini` beside its OpenComposite dll
-  (`alyx-opencomposite.ini`, copied to `game/bin/win64/opencomposite.ini`). It draws 1399 per eye instead of 1728. On
-  the first in-world map the full size saturated the GPU and the encoder with it: 29 renders/s and 89 ms frame age.
-  At 0.81 it ran 88 renders/s with an 18 ms frame age (measured 2026-10-31, worn).
+- **Half-Life: Alyx: full size, with OpenComposite's measured frame timing.** `build-opencomposite.sh` applies
+  `opencomposite-frametiming.patch`: stock OpenComposite reports constant frame times, so Alyx's auto-fidelity never
+  moves. With real ones it lowers its level when the GPU is full. Copy `alyx-opencomposite.ini` to
+  `game/bin/win64/opencomposite.ini` (`supersampleRatio=1.0`). On the first in-world map, worn:
+  - stock build, full size (2026-10-31): 29 renders/s and 89 ms frame age; the GPU and the encoder saturated.
+  - stock build, `supersampleRatio=0.81` (the earlier default, 1399 per eye): 88 renders/s, 18-27 ms frame age.
+  - patched build, full size (2026-11-03): 88 renders/s (p10 85), 21 ms frame age, and it was preferred to 0.81 in a
+    blind comparison.
+  An OpenComposite built without the patch (`OC_FRAMETIMING=0`) should keep `supersampleRatio=0.81`.
 
 ## UEVR games (flat Unreal Engine games in VR, experimental)
 
